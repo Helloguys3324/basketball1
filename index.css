@@ -1,0 +1,108 @@
+
+@font-face {
+    font-family: "Cursed";
+    src: url("CursedTimerUlil-Aznm.ttf") format("truetype");
+}
+.number {
+    font-family: "Cursed", sans-serif;
+    color:red;
+    font-size: 100px;
+    font-weight: bold;
+    text-shadow: 0 0 15px black;
+}
+body {
+    display: flex;
+    justify-content: center; /* ставит .wrapper в центр по горизонтали */
+    align-items: center;
+    min-height: 100vh;
+}
+
+.wrapper {
+    background-image: url("https://i.pinimg.com/originals/0b/7f/b1/0b7fb1166f2c66fadb88e536efb2b3db.jpg?nii=t");
+    width: 80vh;
+    height: 70vh;
+}
+.basketball {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    flex-direction: column;
+}
+.team {
+    display: flex;
+    flex-direction: initial;
+    align-items: center;
+    justify-content: space-around;
+}
+.score {
+    width: 25vh;
+    height: 20vh;
+    background-color: black;
+    border-radius: 15px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+.size {
+    font-size: 50px;
+    font-weight: bold;
+    text-shadow: 0 0 25px darkorange ;
+}
+.flex-btn {
+    display: flex;
+    justify-content: space-around;
+}
+.btn {
+    width: 50px;
+    height: 50px;
+    margin: 15px 5px;
+    border: 2px solid #ffffff;
+    border-radius: 10px;
+    font-family: "Cursed", sans-serif;
+    background: none;
+    font-size: 20px;
+    font-weight: bold;
+    color: orange;
+    text-shadow: 0 0 15px black;
+    cursor: pointer;
+    transition: transform 0.1s ease, background-color 0.1s ease;
+}
+button:active {
+    transform: scale(0.90);
+    background-color: rgba(255, 255, 255, 0.3);
+}
+.btn-reset {
+    width: 100px;
+    height: 100px;
+    background: none;
+    font-family: sans-serif;
+    font-size: 20px;
+    font-weight: bold;
+    border-radius: 10px;
+    border: 2px solid #ffffff;
+}
+#reset {
+    background: linear-gradient(180deg, #E60000 0%, #FF5500 100%);
+    color: whitesmoke;
+    border: 2px solid #FFFFFF;
+    border-radius: 12px;
+    font-weight: 800;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 0 10px rgba(255, 30, 30, 0.8),
+    0 0 25px rgba(255, 30, 30, 0.5),
+    0 4px 15px rgba(0, 0, 0, 0.3);
+}
+#play {
+    color: whitesmoke;
+    background: linear-gradient(green, yellow);
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 0 10px rgba(57, 255, 20, 0.8),
+    0 0 25px rgba(57, 255, 20, 0.5),
+    0 4px 15px rgba(0, 0, 0, 0.3);
+
+}
+.bottom-controls {
+    display: flex;
+    justify-content: space-around;
+    margin-top: 30px;
+}

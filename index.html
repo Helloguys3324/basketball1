@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Basketball</title>
+    <link rel="stylesheet" href="index.css">
+</head>
+<body>
+
+<div class="wrapper">
+    <div class="team">
+        <div class="basketball">
+            <h1 class="size">HOME</h1>
+            <div class="score">
+                <h1 class="number" id="count1">0</h1>
+            </div>
+
+            <div class="flex-btn">
+                <button type="button" class="btn" onclick="plus1_1()">+1</button>
+                <button type="button" class="btn" onclick="plus2_1()">+2</button>
+                <button type="button" class="btn" onclick="plus3_1()">+3</button>
+            </div>
+        </div>
+
+        <div class="basketball">
+            <h1 class="size">GUEST</h1>
+            <div class="score">
+                <h1 class="number" id="count2">0</h1>
+            </div>
+
+            <div class="flex-btn">
+                <button type="button" class="btn" onclick="plus1_2()">+1</button>
+                <button type="button" class="btn" onclick="plus2_2()">+2</button>
+                <button type="button" class="btn" onclick="plus3_2()">+3</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="bottom-controls">
+        <button type="button" class="btn-reset" id="reset" onclick="reset()">RESET</button>
+        <button type="button" class="btn-reset" id="play" onclick="reset()">PLAY AGAIN</button>
+    </div>
+</div>
+
+<script src="index.js"></script>
+</body>
+</html>
