@@ -12,6 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use lowe_sift::{
+    cluster_matches_hough, match_features, verify_hough_clusters, GrayImage, HoughConfig,
+    ModelDatabase, ObjectModel, Sift,
+};
+use rayon::prelude::*;
 use serde::Deserialize;
 use serenity::async_trait;
 use serenity::builder::EditMember;
@@ -22,8 +27,14 @@ use serenity::model::Permissions;
 use serenity::model::Timestamp;
 use serenity::prelude::*;
 
-const HAMMING_DISTANCE_MAX: u32 = 10;
-const SIMILARITY_THRESHOLD: f64 = 84.0;
+const HAMMING_DISTANCE_MAX: u32 = 12;
+const SIMILARITY_THRESHOLD: f64 = 78.0;
+
+// SIFT geometric verification thresholds:
+// Scale/tilt/lighting invariant matching via generalized Hough clustering & affine transform.
+const SIFT_RATIO_TEST: f32 = 0.8;
+const SIFT_MIN_INLIERS: usize = 15;
+const SIFT_MAX_DIMENSION: u32 = 640;
 
 const AUTO_DELETE: bool = true;
 const WARN_USER_IN_CHAT: bool = true;
@@ -274,8 +285,16 @@ struct ScamTemplate {
     dhash_uint: u64,
 }
 
+struct SiftTemplateModel {
+    name: String,
+    #[allow(dead_code)]
+    model_id: u32,
+    database: ModelDatabase,
+}
+
 struct VectorStore {
     templates: HashMap<String, ScamTemplate>,
+    sift_models: Vec<SiftTemplateModel>,
     #[allow(dead_code)]
     scanned_count: AtomicU64,
     #[allow(dead_code)]
@@ -295,6 +314,18 @@ fn resolve_vectors_path() -> PathBuf {
         }
     }
     PathBuf::from("scam_vectors.json")
+}
+
+fn resolve_templates_dir() -> PathBuf {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("scam_templates");
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("scam_templates")
 }
 
 fn init_store() -> &'static VectorStore {
@@ -322,8 +353,73 @@ fn init_store() -> &'static VectorStore {
             templates.len()
         );
 
+        // Precompute SIFT descriptors for all images in scam_templates/
+        let templates_dir = resolve_templates_dir();
+        let mut sift_models = Vec::new();
+        if templates_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&templates_dir) {
+                let sift = Sift::default();
+                let mut model_id = 1_u32;
+
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if !["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
+                        continue;
+                    }
+
+                    if let Ok(img) = image::open(&path) {
+                        let filename = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        // Downscale template if larger than SIFT_MAX_DIMENSION for speed & cache efficiency
+                        let (w, h) = (img.width(), img.height());
+                        let scaled = if w > SIFT_MAX_DIMENSION || h > SIFT_MAX_DIMENSION {
+                            img.thumbnail(SIFT_MAX_DIMENSION, SIFT_MAX_DIMENSION)
+                        } else {
+                            img
+                        };
+
+                        let gray = GrayImage::from_dynamic_image(&scaled);
+                        let features = sift.detect_and_compute(&gray);
+
+                        if !features.is_empty() {
+                            if let Ok(obj_model) = ObjectModel::new(
+                                model_id,
+                                scaled.width() as f32,
+                                scaled.height() as f32,
+                                features,
+                            ) {
+                                if let Ok(db) = ModelDatabase::new(vec![obj_model]) {
+                                    sift_models.push(SiftTemplateModel {
+                                        name: filename,
+                                        model_id,
+                                        database: db,
+                                    });
+                                    model_id += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!(
+            "[STORE] Precomputed {} SIFT invariant template models in memory",
+            sift_models.len()
+        );
+
         VectorStore {
             templates,
+            sift_models,
             scanned_count: AtomicU64::new(0),
             deleted_count: AtomicU64::new(0),
             clean_urls: RwLock::new(HashMap::new()),
@@ -335,6 +431,7 @@ struct MatchResult {
     name: String,
     similarity: f64,
     distance: u32,
+    sift_inliers: usize,
 }
 
 fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
@@ -367,6 +464,7 @@ fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
                 name: name.clone(),
                 similarity: sim,
                 distance: dist_ph,
+                sift_inliers: 0,
             });
         }
     }
@@ -381,7 +479,117 @@ fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
             name: best_name,
             similarity: best_sim,
             distance: best_dist,
+            sift_inliers: 0,
         });
+    }
+
+    None
+}
+
+/// SIFT Feature Matching with Lowe's Generalized Hough Transform & Affine Geometric Verification.
+/// Invariant to perspective tilt, camera rotation, monitor glare, and extreme color alterations.
+fn match_features_sift(img: &image::DynamicImage) -> Option<MatchResult> {
+    let store = init_store();
+    if store.sift_models.is_empty() {
+        return None;
+    }
+
+    // Downscale query image if larger than SIFT_MAX_DIMENSION to guarantee fast response
+    let (w, h) = (img.width(), img.height());
+    let query_img = if w > SIFT_MAX_DIMENSION || h > SIFT_MAX_DIMENSION {
+        img.thumbnail(SIFT_MAX_DIMENSION, SIFT_MAX_DIMENSION)
+    } else {
+        img.clone()
+    };
+
+    let gray_q = GrayImage::from_dynamic_image(&query_img);
+    let sift = Sift::default();
+    let query_features = sift.detect_and_compute(&gray_q);
+
+    if query_features.len() < 10 {
+        return None;
+    }
+
+    // Parallel multi-core evaluation across all template models
+    let hough_cfg = HoughConfig::default();
+
+    let best_match = store.sift_models.par_iter().filter_map(|model| {
+        let train_features = model.database.train_features();
+        let matches = match_features(&query_features, train_features, SIFT_RATIO_TEST);
+        if matches.len() < SIFT_MIN_INLIERS {
+            return None;
+        }
+
+        if let Ok(clusters) =
+            cluster_matches_hough(&matches, &query_features, &model.database, hough_cfg)
+        {
+            if let Ok(hypotheses) = verify_hough_clusters(
+                &matches,
+                &query_features,
+                &model.database,
+                &clusters,
+                hough_cfg,
+            ) {
+                let max_inliers = hypotheses
+                    .iter()
+                    .map(|h| h.inlier_match_indices.len())
+                    .max()
+                    .unwrap_or(0);
+
+                if max_inliers >= SIFT_MIN_INLIERS {
+                    return Some((model.name.clone(), max_inliers));
+                }
+            }
+        }
+        None
+    }).max_by_key(|(_, inliers)| *inliers);
+
+    if let Some((template_name, inliers)) = best_match {
+        println!(
+            "   [SIFT MATCH] Confirmed geometrically invariant match with '{}' ({} inliers >= {})",
+            template_name, inliers, SIFT_MIN_INLIERS
+        );
+        return Some(MatchResult {
+            name: template_name,
+            similarity: 100.0,
+            distance: 0,
+            sift_inliers: inliers,
+        });
+    }
+
+    None
+}
+
+/// Two-Tier Hybrid Matching:
+/// Tier 1: Perceptual hash + multi-crop (0.1ms POPCNT)
+/// Tier 2: SIFT + Hough clustering + Affine verification (for angled/distorted monitor photos)
+fn match_image_hybrid(img: &image::DynamicImage) -> Option<MatchResult> {
+    // 1. Tier 1: Full image perceptual hash
+    let ph_full = compute_phash(img);
+    let dh_full = compute_dhash(img);
+    if let Some(res) = match_vectors(ph_full, dh_full) {
+        return Some(res);
+    }
+
+    // 2. Tier 1 (Crop): Margin-trimmed crop (removes browser tabs, taskbar, monitor bezels)
+    let (w, h) = (img.width(), img.height());
+    if w > 60 && h > 60 {
+        let x = (w as f64 * 0.04) as u32;
+        let y = (h as f64 * 0.06) as u32;
+        let crop_w = ((w as f64 * 0.92) as u32).min(w - x);
+        let crop_h = ((h as f64 * 0.90) as u32).min(h - y);
+
+        let cropped = img.crop_imm(x, y, crop_w, crop_h);
+        let ph_crop = compute_phash(&cropped);
+        let dh_crop = compute_dhash(&cropped);
+        if let Some(res) = match_vectors(ph_crop, dh_crop) {
+            return Some(res);
+        }
+    }
+
+    // 3. Tier 2: Scale/Rotation/Perspective/Lighting invariant SIFT geometric verification
+    if let Some(res) = match_features_sift(img) {
+        return Some(res);
     }
 
     None
@@ -569,23 +777,20 @@ impl EventHandler for Handler {
                 Err(_) => continue,
             };
 
-            // Compute perceptual hashes (zero heap allocations)
-            let cand_ph = compute_phash(&img);
-            let cand_dh = compute_dhash(&img);
-
-            // Match against scam templates
-            if let Some(result) = match_vectors(cand_ph, cand_dh) {
+            // Match against scam templates with two-tier hybrid matching (pHash + SIFT)
+            if let Some(result) = match_image_hybrid(&img) {
                 store.deleted_count.fetch_add(1, Ordering::Relaxed);
 
                 println!(
-                    "\n\u{1f6a8} [SCAM DETECTED] User: {} ({}) | Channel: {}\n   Matched: '{}' | Sim: {:.1}% | Distance: {}/{}",
+                    "\n\u{1f6a8} [SCAM DETECTED] User: {} ({}) | Channel: {}\n   Matched: '{}' | Sim: {:.1}% | Distance: {}/{} | SIFT Inliers: {}",
                     msg.author.name,
                     msg.author.id,
                     msg.channel_id,
                     result.name,
                     result.similarity,
                     result.distance,
-                    HAMMING_DISTANCE_MAX
+                    HAMMING_DISTANCE_MAX,
+                    result.sift_inliers
                 );
 
                 // ── 1. Delete scam message ───────────────────────────────
@@ -674,6 +879,44 @@ impl EventHandler for Handler {
 async fn main() {
     // Initialize vector store
     init_store();
+
+    // Support offline CLI testing without running Discord bot:
+    // cargo run -- --test <path_to_image>
+    let args: Vec<String> = env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--test") {
+        if pos + 1 < args.len() {
+            let img_path = &args[pos + 1];
+            println!("\n[CLI TEST] Testing image: {}", img_path);
+            match image::open(img_path) {
+                Ok(img) => {
+                    let ph = compute_phash(&img);
+                    let dh = compute_dhash(&img);
+                    println!("Computed pHash: {:016x} | dHash: {:016x}\n", ph, dh);
+
+                    if let Some(res) = match_image_hybrid(&img) {
+                        println!("============================================================");
+                        println!("🚨 FINAL VERDICT: SCAM DETECTED (AUTO-DELETE)");
+                        println!("   Matched Template: {}", res.name);
+                        println!("   Similarity Score: {:.1}%", res.similarity);
+                        if res.sift_inliers > 0 {
+                            println!("   SIFT Affine Inliers: {} (Min: {})", res.sift_inliers, SIFT_MIN_INLIERS);
+                        } else {
+                            println!("   Hamming Distance: {} (Max: {})", res.distance, HAMMING_DISTANCE_MAX);
+                        }
+                        println!("============================================================\n");
+                    } else {
+                        println!("============================================================");
+                        println!("✓ FINAL VERDICT: CLEAN / NO SCAM DETECTED");
+                        println!("============================================================\n");
+                    }
+                }
+                Err(e) => eprintln!("[ERROR] Failed to load image '{}': {}", img_path, e),
+            }
+        } else {
+            println!("Usage: antiscambot --test <path_to_image>");
+        }
+        return;
+    }
 
     let token = get_token();
     if token.is_empty() {

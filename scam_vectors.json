@@ -46,5 +46,65 @@
     "phash": "931e6ae194d3486f",
     "dhash": "5065515c1c9c4f8b",
     "source": "json_file"
+  },
+  {
+    "name": "scam9",
+    "phash": "c1e0d5df183f0a3a",
+    "dhash": "c08a8501844440c0",
+    "source": "json_file"
+  },
+  {
+    "name": "scam1.png",
+    "phash": "dc86b1716368ce17",
+    "dhash": "053424232032b026",
+    "source": "file:scam1.png"
+  },
+  {
+    "name": "scam2.png",
+    "phash": "fecd11cc03bc6c32",
+    "dhash": "44202e2b29252c09",
+    "source": "file:scam2.png"
+  },
+  {
+    "name": "scam3.png",
+    "phash": "9366e4904b353e5b",
+    "dhash": "c0c04858515c7cd4",
+    "source": "file:scam3.png"
+  },
+  {
+    "name": "scam4.png",
+    "phash": "c478374ac4313b3f",
+    "dhash": "8cac1cc4e1854464",
+    "source": "file:scam4.png"
+  },
+  {
+    "name": "scam5.jpg",
+    "phash": "c1e1e3c65c5e5c94",
+    "dhash": "c9cbc1c0c2c2e0ce",
+    "source": "file:scam5.jpg"
+  },
+  {
+    "name": "scam6.jpg",
+    "phash": "e5de4a00bcbd5a25",
+    "dhash": "a0c1485ed659d258",
+    "source": "file:scam6.jpg"
+  },
+  {
+    "name": "scam7.jpg",
+    "phash": "946a6e964ac9b699",
+    "dhash": "c09084509c5c5a0c",
+    "source": "file:scam7.jpg"
+  },
+  {
+    "name": "scam8.jpg",
+    "phash": "931e6ae194d3486f",
+    "dhash": "5065515c1c9c4f8b",
+    "source": "file:scam8.jpg"
+  },
+  {
+    "name": "scam9.png",
+    "phash": "c1e0d5df183f0a3a",
+    "dhash": "c08a8501844440c0",
+    "source": "file:scam9.png"
   }
 ]
