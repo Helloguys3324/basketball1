@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Go artifacts (old version)
+app
+*.exe
+
+# Secrets and environment variables
+.env
+*.env

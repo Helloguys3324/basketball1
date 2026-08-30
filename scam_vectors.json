@@ -1,0 +1,50 @@
+[
+  {
+    "name": "scam1",
+    "phash": "dc86b1716368ce17",
+    "dhash": "053424232032b026",
+    "source": "json_file"
+  },
+  {
+    "name": "scam2",
+    "phash": "fecd11cc03bc6c32",
+    "dhash": "44202e2b29252c09",
+    "source": "json_file"
+  },
+  {
+    "name": "scam3",
+    "phash": "9366e4904b353e5b",
+    "dhash": "c0c04858515c7cd4",
+    "source": "json_file"
+  },
+  {
+    "name": "scam4",
+    "phash": "c478374ac4313b3f",
+    "dhash": "8cac1cc4e1854464",
+    "source": "json_file"
+  },
+  {
+    "name": "scam5",
+    "phash": "c1e1e3c65c5e5c94",
+    "dhash": "c9cbc1c0c2c2e0ce",
+    "source": "json_file"
+  },
+  {
+    "name": "scam6",
+    "phash": "e5de4a00bcbd5a25",
+    "dhash": "a0c1485ed659d258",
+    "source": "json_file"
+  },
+  {
+    "name": "scam7",
+    "phash": "946a6e964ac9b699",
+    "dhash": "c09084509c5c5a0c",
+    "source": "json_file"
+  },
+  {
+    "name": "scam8",
+    "phash": "931e6ae194d3486f",
+    "dhash": "5065515c1c9c4f8b",
+    "source": "json_file"
+  }
+]
