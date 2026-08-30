@@ -31,7 +31,7 @@ const WARN_EXPIRE_SECONDS: u64 = 6;
 const AUTO_TIMEOUT_MINUTES: u64 = 60;
 const IGNORE_BOTS: bool = true;
 const IGNORE_ADMINS: bool = true;
-const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
+const MAX_IMAGE_SIZE: u32 = 5 * 1024 * 1024; // 5 MB
 
 // Guaranteed immunity — server creator (Sasageyo)
 const SASAGEYO_ID: u64 = 612573096343240734;
@@ -407,13 +407,13 @@ async fn download_image(
 
     // Protection against oversized files
     if let Some(len) = resp.content_length() {
-        if len > MAX_IMAGE_SIZE {
+        if len > MAX_IMAGE_SIZE as u64 {
             return Err("Image too large".into());
         }
     }
 
     let bytes = resp.bytes().await?;
-    if bytes.len() as u64 > MAX_IMAGE_SIZE {
+    if bytes.len() > MAX_IMAGE_SIZE as usize {
         return Err("Image too large".into());
     }
 
@@ -487,7 +487,7 @@ impl EventHandler for Handler {
         let store = init_store();
 
         // Ignore self
-        if msg.author.id == ctx.cache.current_user_id() {
+        if msg.author.id == ctx.cache.current_user().id {
             return;
         }
 
