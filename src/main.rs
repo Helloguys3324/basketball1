@@ -44,7 +44,7 @@ const WARN_USER_IN_CHAT: bool = true;
 const WARN_EXPIRE_SECONDS: u64 = 6;
 const AUTO_TIMEOUT_MINUTES: u64 = 60;
 const IGNORE_BOTS: bool = true;
-const IGNORE_ADMINS: bool = false; // Set to false so you can test scam detection yourself!
+const IGNORE_ADMINS: bool = true; // Set to true: admins are completely ignored and never touched
 const MAX_IMAGE_SIZE: u32 = 5 * 1024 * 1024; // 5 MB
 
 // Guaranteed immunity — server creator (Sasageyo)
