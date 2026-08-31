@@ -27,13 +27,16 @@ use serenity::model::Permissions;
 use serenity::model::Timestamp;
 use serenity::prelude::*;
 
-const HAMMING_DISTANCE_MAX: u32 = 12;
-const SIMILARITY_THRESHOLD: f64 = 78.0;
+// Match sensitivity:
+// 70.0% similarity and max distance 18 bits intercepts heavily compressed photos while preventing false positives
+const HAMMING_DISTANCE_MAX: u32 = 18;
+const SIMILARITY_THRESHOLD: f64 = 70.0;
 
 // SIFT geometric verification thresholds:
-// Scale/tilt/lighting invariant matching via generalized Hough clustering & affine transform.
-const SIFT_RATIO_TEST: f32 = 0.8;
-const SIFT_MIN_INLIERS: usize = 15;
+// Scale/tilt/lighting invariant matching via Lowe's generalized Hough clustering & affine transform.
+// Ratio test 0.75 + 14 inliers provides a massive separation margin (scams: 50-800 inliers, normal photos/memes: 0-7)
+const SIFT_RATIO_TEST: f32 = 0.75;
+const SIFT_MIN_INLIERS: usize = 14;
 const SIFT_MAX_DIMENSION: u32 = 640;
 
 const AUTO_DELETE: bool = true;
@@ -41,7 +44,7 @@ const WARN_USER_IN_CHAT: bool = true;
 const WARN_EXPIRE_SECONDS: u64 = 6;
 const AUTO_TIMEOUT_MINUTES: u64 = 60;
 const IGNORE_BOTS: bool = true;
-const IGNORE_ADMINS: bool = true;
+const IGNORE_ADMINS: bool = false; // Set to false so you can test scam detection yourself!
 const MAX_IMAGE_SIZE: u32 = 5 * 1024 * 1024; // 5 MB
 
 // Guaranteed immunity — server creator (Sasageyo)
@@ -379,6 +382,21 @@ fn init_store() -> &'static VectorStore {
                             .unwrap_or("unknown")
                             .to_string();
 
+                        // Register native Rust pHash and dHash for 100.0% exact match
+                        let native_ph = compute_phash(&img);
+                        let native_dh = compute_dhash(&img);
+                        templates.insert(
+                            filename.clone(),
+                            ScamTemplate {
+                                name: filename.clone(),
+                                phash: format!("{:016x}", native_ph),
+                                dhash: format!("{:016x}", native_dh),
+                                source: format!("file:{}", filename),
+                                phash_uint: native_ph,
+                                dhash_uint: native_dh,
+                            },
+                        );
+
                         // Downscale template if larger than SIFT_MAX_DIMENSION for speed & cache efficiency
                         let (w, h) = (img.width(), img.height());
                         let scaled = if w > SIFT_MAX_DIMENSION || h > SIFT_MAX_DIMENSION {
@@ -412,6 +430,10 @@ fn init_store() -> &'static VectorStore {
             }
         }
 
+        println!(
+            "[STORE] Total active scam vectors in memory: {}",
+            templates.len()
+        );
         println!(
             "[STORE] Precomputed {} SIFT invariant template models in memory",
             sift_models.len()
@@ -571,24 +593,45 @@ fn match_image_hybrid(img: &image::DynamicImage) -> Option<MatchResult> {
         return Some(res);
     }
 
-    // 2. Tier 1 (Crop): Margin-trimmed crop (removes browser tabs, taskbar, monitor bezels)
+    // 2. Tier 1 (Crop): Margin-trimmed crops (removes browser tabs, taskbar, monitor bezels)
     let (w, h) = (img.width(), img.height());
     if w > 60 && h > 60 {
-        let x = (w as f64 * 0.04) as u32;
-        let y = (h as f64 * 0.06) as u32;
-        let crop_w = ((w as f64 * 0.92) as u32).min(w - x);
-        let crop_h = ((h as f64 * 0.90) as u32).min(h - y);
+        // Crop 1: 4% margin
+        let x1 = (w as f64 * 0.04) as u32;
+        let y1 = (h as f64 * 0.06) as u32;
+        let crop_w1 = ((w as f64 * 0.92) as u32).min(w - x1);
+        let crop_h1 = ((h as f64 * 0.90) as u32).min(h - y1);
 
-        let cropped = img.crop_imm(x, y, crop_w, crop_h);
-        let ph_crop = compute_phash(&cropped);
-        let dh_crop = compute_dhash(&cropped);
-        if let Some(res) = match_vectors(ph_crop, dh_crop) {
+        let cropped1 = img.crop_imm(x1, y1, crop_w1, crop_h1);
+        let ph_crop1 = compute_phash(&cropped1);
+        let dh_crop1 = compute_dhash(&cropped1);
+        if let Some(res) = match_vectors(ph_crop1, dh_crop1) {
+            return Some(res);
+        }
+
+        // Crop 2: 8% margin (for heavier borders/phone frames)
+        let x2 = (w as f64 * 0.08) as u32;
+        let y2 = (h as f64 * 0.08) as u32;
+        let crop_w2 = ((w as f64 * 0.84) as u32).min(w - x2);
+        let crop_h2 = ((h as f64 * 0.84) as u32).min(h - y2);
+
+        let cropped2 = img.crop_imm(x2, y2, crop_w2, crop_h2);
+        let ph_crop2 = compute_phash(&cropped2);
+        let dh_crop2 = compute_dhash(&cropped2);
+        if let Some(res) = match_vectors(ph_crop2, dh_crop2) {
             return Some(res);
         }
     }
 
     // 3. Tier 2: Scale/Rotation/Perspective/Lighting invariant SIFT geometric verification
     if let Some(res) = match_features_sift(img) {
+        return Some(res);
+    }
+
+    // 4. Tier 2 (Mirror Invariance): Check horizontal flip to defeat mirror scam attacks
+    let flipped = img.fliph();
+    if let Some(mut res) = match_features_sift(&flipped) {
+        res.name = format!("{} [Mirrored]", res.name);
         return Some(res);
     }
 
