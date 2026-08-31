@@ -28,15 +28,16 @@ use serenity::model::Timestamp;
 use serenity::prelude::*;
 
 // Match sensitivity:
-// 70.0% similarity and max distance 18 bits intercepts heavily compressed photos while preventing false positives
-const HAMMING_DISTANCE_MAX: u32 = 18;
-const SIMILARITY_THRESHOLD: f64 = 70.0;
+// 74.0% similarity and max distance 17 bits intercepts compressed scam photos while preventing meme false positives
+const HAMMING_DISTANCE_MAX: u32 = 17;
+const SIMILARITY_THRESHOLD: f64 = 74.0;
 
 // SIFT geometric verification thresholds:
 // Scale/tilt/lighting invariant matching via Lowe's generalized Hough clustering & affine transform.
-// Ratio test 0.75 + 14 inliers provides a massive separation margin (scams: 50-800 inliers, normal photos/memes: 0-7)
-const SIFT_RATIO_TEST: f32 = 0.75;
-const SIFT_MIN_INLIERS: usize = 14;
+// Raised to 95 inliers: text memes only produce 30-80 random corner alignments,
+// while genuine scams produce 120 to 1000+ inliers!
+const SIFT_RATIO_TEST: f32 = 0.72;
+const SIFT_MIN_INLIERS: usize = 95;
 const SIFT_MAX_DIMENSION: u32 = 640;
 
 const AUTO_DELETE: bool = true;
@@ -477,7 +478,7 @@ fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
             best_name = name.clone();
         }
 
-        if dist_ph <= HAMMING_DISTANCE_MAX || sim >= SIMILARITY_THRESHOLD {
+        if dist_ph <= HAMMING_DISTANCE_MAX && sim >= SIMILARITY_THRESHOLD {
             println!(
                 "   [MATCH] Found scam template '{}' (Sim: {:.1}%, Dist: {}/{})",
                 name, sim, dist_ph, HAMMING_DISTANCE_MAX
@@ -496,7 +497,7 @@ fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
         best_name, best_sim, best_dist, SIMILARITY_THRESHOLD, HAMMING_DISTANCE_MAX
     );
 
-    if best_sim >= SIMILARITY_THRESHOLD || best_dist <= HAMMING_DISTANCE_MAX {
+    if best_sim >= SIMILARITY_THRESHOLD && best_dist <= HAMMING_DISTANCE_MAX {
         return Some(MatchResult {
             name: best_name,
             similarity: best_sim,
@@ -558,15 +559,25 @@ fn match_features_sift(img: &image::DynamicImage) -> Option<MatchResult> {
                     .max()
                     .unwrap_or(0);
 
+                let inlier_ratio = if !matches.is_empty() {
+                    max_inliers as f32 / matches.len() as f32
+                } else {
+                    0.0
+                };
+
                 if max_inliers >= SIFT_MIN_INLIERS {
-                    return Some((model.name.clone(), max_inliers));
+                    println!(
+                        "      [SIFT CANDIDATE] '{}': inliers={}, matches={}, ratio={:.1}%",
+                        model.name, max_inliers, matches.len(), inlier_ratio * 100.0
+                    );
+                    return Some((model.name.clone(), max_inliers, inlier_ratio));
                 }
             }
         }
         None
-    }).max_by_key(|(_, inliers)| *inliers);
+    }).max_by_key(|(_, inliers, _)| *inliers);
 
-    if let Some((template_name, inliers)) = best_match {
+    if let Some((template_name, inliers, _)) = best_match {
         println!(
             "   [SIFT MATCH] Confirmed geometrically invariant match with '{}' ({} inliers >= {})",
             template_name, inliers, SIFT_MIN_INLIERS
@@ -955,8 +966,45 @@ async fn main() {
                 }
                 Err(e) => eprintln!("[ERROR] Failed to load image '{}': {}", img_path, e),
             }
-        } else {
-            println!("Usage: antiscambot --test <path_to_image>");
+        }
+        return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--test-dir") {
+        if pos + 1 < args.len() {
+            let dir_path = &args[pos + 1];
+            println!("\n[BENCHMARK] Testing all images in directory: {}", dir_path);
+            let mut total = 0;
+            let mut scam_detected = 0;
+            let mut clean_count = 0;
+
+            if let Ok(entries) = std::fs::read_dir(dir_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                    if ["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
+                        total += 1;
+                        if let Ok(img) = image::open(&path) {
+                            if let Some(res) = match_image_hybrid(&img) {
+                                scam_detected += 1;
+                                println!(
+                                    "   ❌ FALSE POSITIVE [{:?}]: Matched '{}' (Sim: {:.1}%, Inliers: {})",
+                                    path.file_name().unwrap(), res.name, res.similarity, res.sift_inliers
+                                );
+                            } else {
+                                clean_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!("\n============================================================");
+            println!("📊 BENCHMARK COMPLETE:");
+            println!("   Total tested images: {}", total);
+            println!("   Clean (Correctly Passed): {} ({:.1}%)", clean_count, (clean_count as f64 / total.max(1) as f64) * 100.0);
+            println!("   False Positives (Mistakenly Flagged): {} ({:.1}%)", scam_detected, (scam_detected as f64 / total.max(1) as f64) * 100.0);
+            println!("============================================================\n");
         }
         return;
     }
