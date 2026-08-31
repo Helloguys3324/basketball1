@@ -32,10 +32,10 @@ use serenity::prelude::*;
 const HAMMING_DISTANCE_MAX: u32 = 17;
 const SIMILARITY_THRESHOLD: f64 = 74.0;
 
-// SIFT geometric verification thresholds:
-// Scale/tilt/lighting invariant matching via Lowe's generalized Hough clustering & affine transform.
-// Raised to 95 inliers: text memes only produce 30-80 random corner alignments,
-// while genuine scams produce 120 to 1000+ inliers!
+// Toggle SIFT: Set to false to disable heavy keypoint matching completely and run on pure, ultra-fast multi-crop hashing
+const ENABLE_SIFT: bool = false;
+
+// SIFT geometric verification thresholds (used only if ENABLE_SIFT = true):
 const SIFT_RATIO_TEST: f32 = 0.72;
 const SIFT_MIN_INLIERS: usize = 95;
 const SIFT_MAX_DIMENSION: u32 = 640;
@@ -406,31 +406,33 @@ fn init_store() -> &'static VectorStore {
                             },
                         );
 
-                        // Downscale template if larger than SIFT_MAX_DIMENSION for speed & cache efficiency
-                        let (w, h) = (img.width(), img.height());
-                        let scaled = if w > SIFT_MAX_DIMENSION || h > SIFT_MAX_DIMENSION {
-                            img.thumbnail(SIFT_MAX_DIMENSION, SIFT_MAX_DIMENSION)
-                        } else {
-                            img
-                        };
+                        // Downscale template and compute SIFT if enabled
+                        if ENABLE_SIFT {
+                            let (w, h) = (img.width(), img.height());
+                            let scaled = if w > SIFT_MAX_DIMENSION || h > SIFT_MAX_DIMENSION {
+                                img.thumbnail(SIFT_MAX_DIMENSION, SIFT_MAX_DIMENSION)
+                            } else {
+                                img
+                            };
 
-                        let gray = GrayImage::from_dynamic_image(&scaled);
-                        let features = sift.detect_and_compute(&gray);
+                            let gray = GrayImage::from_dynamic_image(&scaled);
+                            let features = sift.detect_and_compute(&gray);
 
-                        if !features.is_empty() {
-                            if let Ok(obj_model) = ObjectModel::new(
-                                model_id,
-                                scaled.width() as f32,
-                                scaled.height() as f32,
-                                features,
-                            ) {
-                                if let Ok(db) = ModelDatabase::new(vec![obj_model]) {
-                                    sift_models.push(SiftTemplateModel {
-                                        name: filename,
-                                        model_id,
-                                        database: db,
-                                    });
-                                    model_id += 1;
+                            if !features.is_empty() {
+                                if let Ok(obj_model) = ObjectModel::new(
+                                    model_id,
+                                    scaled.width() as f32,
+                                    scaled.height() as f32,
+                                    features,
+                                ) {
+                                    if let Ok(db) = ModelDatabase::new(vec![obj_model]) {
+                                        sift_models.push(SiftTemplateModel {
+                                            name: filename,
+                                            model_id,
+                                            database: db,
+                                        });
+                                        model_id += 1;
+                                    }
                                 }
                             }
                         }
@@ -651,16 +653,18 @@ fn match_image_hybrid(img: &image::DynamicImage, is_burst: bool) -> Option<Match
         }
     }
 
-    // 3. Tier 2: Scale/Rotation/Perspective/Lighting invariant SIFT geometric verification
-    if let Some(res) = match_features_sift(img, is_burst) {
-        return Some(res);
-    }
+    // 3. Tier 2: Scale/Rotation/Perspective/Lighting invariant SIFT geometric verification (Optional)
+    if ENABLE_SIFT {
+        if let Some(res) = match_features_sift(img, is_burst) {
+            return Some(res);
+        }
 
-    // 4. Tier 2 (Mirror Invariance): Check horizontal flip to defeat mirror scam attacks
-    let flipped = img.fliph();
-    if let Some(mut res) = match_features_sift(&flipped, is_burst) {
-        res.name = format!("{} [Mirrored]", res.name);
-        return Some(res);
+        // 4. Tier 2 (Mirror Invariance): Check horizontal flip to defeat mirror scam attacks
+        let flipped = img.fliph();
+        if let Some(mut res) = match_features_sift(&flipped, is_burst) {
+            res.name = format!("{} [Mirrored]", res.name);
+            return Some(res);
+        }
     }
 
     None
