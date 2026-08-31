@@ -48,6 +48,14 @@ const IGNORE_BOTS: bool = true;
 const IGNORE_ADMINS: bool = true; // Set to true: admins are completely ignored and never touched
 const MAX_IMAGE_SIZE: u32 = 5 * 1024 * 1024; // 5 MB
 
+// ── Aggressive Multi-Image Burst Mode (Scamer Pack Detection) ────────────────
+// When a user uploads >= 4 images in a single message (typical scam raid signature),
+// we apply heightened sensitivity: lower distance threshold and relaxed SIFT requirements.
+const BURST_IMAGE_COUNT_THRESHOLD: usize = 4;
+const BURST_HAMMING_DISTANCE_MAX: u32 = 21;
+const BURST_SIMILARITY_THRESHOLD: f64 = 66.0;
+const BURST_SIFT_MIN_INLIERS: usize = 35;
+
 // Guaranteed immunity — server creator (Sasageyo)
 const SASAGEYO_ID: u64 = 612573096343240734;
 
@@ -457,8 +465,11 @@ struct MatchResult {
     sift_inliers: usize,
 }
 
-fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
+fn match_vectors(cand_phash: u64, cand_dhash: u64, is_burst: bool) -> Option<MatchResult> {
     let store = init_store();
+
+    let max_dist = if is_burst { BURST_HAMMING_DISTANCE_MAX } else { HAMMING_DISTANCE_MAX };
+    let min_sim = if is_burst { BURST_SIMILARITY_THRESHOLD } else { SIMILARITY_THRESHOLD };
 
     let mut best_sim = 0.0_f64;
     let mut best_dist = 999_u32;
@@ -478,13 +489,14 @@ fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
             best_name = name.clone();
         }
 
-        if dist_ph <= HAMMING_DISTANCE_MAX && sim >= SIMILARITY_THRESHOLD {
+        if dist_ph <= max_dist && sim >= min_sim {
             println!(
-                "   [MATCH] Found scam template '{}' (Sim: {:.1}%, Dist: {}/{})",
-                name, sim, dist_ph, HAMMING_DISTANCE_MAX
+                "   [MATCH{}] Found scam template '{}' (Sim: {:.1}%, Dist: {}/{})",
+                if is_burst { " BURST" } else { "" },
+                name, sim, dist_ph, max_dist
             );
             return Some(MatchResult {
-                name: name.clone(),
+                name: if is_burst { format!("{} [Burst Raid]", name) } else { name.clone() },
                 similarity: sim,
                 distance: dist_ph,
                 sift_inliers: 0,
@@ -493,13 +505,14 @@ fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
     }
 
     println!(
-        "   [MATCH CHECK] Best match '{}' -> Sim: {:.1}%, Dist: {} (Threshold: {:.0}%, Max: {})",
-        best_name, best_sim, best_dist, SIMILARITY_THRESHOLD, HAMMING_DISTANCE_MAX
+        "   [MATCH CHECK{}] Best match '{}' -> Sim: {:.1}%, Dist: {} (Threshold: {:.0}%, Max: {})",
+        if is_burst { " BURST" } else { "" },
+        best_name, best_sim, best_dist, min_sim, max_dist
     );
 
-    if best_sim >= SIMILARITY_THRESHOLD && best_dist <= HAMMING_DISTANCE_MAX {
+    if best_sim >= min_sim && best_dist <= max_dist {
         return Some(MatchResult {
-            name: best_name,
+            name: if is_burst { format!("{} [Burst Raid]", best_name) } else { best_name },
             similarity: best_sim,
             distance: best_dist,
             sift_inliers: 0,
@@ -511,11 +524,13 @@ fn match_vectors(cand_phash: u64, cand_dhash: u64) -> Option<MatchResult> {
 
 /// SIFT Feature Matching with Lowe's Generalized Hough Transform & Affine Geometric Verification.
 /// Invariant to perspective tilt, camera rotation, monitor glare, and extreme color alterations.
-fn match_features_sift(img: &image::DynamicImage) -> Option<MatchResult> {
+fn match_features_sift(img: &image::DynamicImage, is_burst: bool) -> Option<MatchResult> {
     let store = init_store();
     if store.sift_models.is_empty() {
         return None;
     }
+
+    let min_inliers_required = if is_burst { BURST_SIFT_MIN_INLIERS } else { SIFT_MIN_INLIERS };
 
     // Downscale query image if larger than SIFT_MAX_DIMENSION to guarantee fast response
     let (w, h) = (img.width(), img.height());
@@ -539,7 +554,7 @@ fn match_features_sift(img: &image::DynamicImage) -> Option<MatchResult> {
     let best_match = store.sift_models.par_iter().filter_map(|model| {
         let train_features = model.database.train_features();
         let matches = match_features(&query_features, train_features, SIFT_RATIO_TEST);
-        if matches.len() < SIFT_MIN_INLIERS {
+        if matches.len() < min_inliers_required {
             return None;
         }
 
@@ -565,9 +580,10 @@ fn match_features_sift(img: &image::DynamicImage) -> Option<MatchResult> {
                     0.0
                 };
 
-                if max_inliers >= SIFT_MIN_INLIERS {
+                if max_inliers >= min_inliers_required {
                     println!(
-                        "      [SIFT CANDIDATE] '{}': inliers={}, matches={}, ratio={:.1}%",
+                        "      [SIFT CANDIDATE{}] '{}': inliers={}, matches={}, ratio={:.1}%",
+                        if is_burst { " BURST" } else { "" },
                         model.name, max_inliers, matches.len(), inlier_ratio * 100.0
                     );
                     return Some((model.name.clone(), max_inliers, inlier_ratio));
@@ -579,11 +595,12 @@ fn match_features_sift(img: &image::DynamicImage) -> Option<MatchResult> {
 
     if let Some((template_name, inliers, _)) = best_match {
         println!(
-            "   [SIFT MATCH] Confirmed geometrically invariant match with '{}' ({} inliers >= {})",
-            template_name, inliers, SIFT_MIN_INLIERS
+            "   [SIFT MATCH{}] Confirmed geometrically invariant match with '{}' ({} inliers >= {})",
+            if is_burst { " BURST" } else { "" },
+            template_name, inliers, min_inliers_required
         );
         return Some(MatchResult {
-            name: template_name,
+            name: if is_burst { format!("{} [Burst Raid]", template_name) } else { template_name },
             similarity: 100.0,
             distance: 0,
             sift_inliers: inliers,
@@ -596,11 +613,11 @@ fn match_features_sift(img: &image::DynamicImage) -> Option<MatchResult> {
 /// Two-Tier Hybrid Matching:
 /// Tier 1: Perceptual hash + multi-crop (0.1ms POPCNT)
 /// Tier 2: SIFT + Hough clustering + Affine verification (for angled/distorted monitor photos)
-fn match_image_hybrid(img: &image::DynamicImage) -> Option<MatchResult> {
+fn match_image_hybrid(img: &image::DynamicImage, is_burst: bool) -> Option<MatchResult> {
     // 1. Tier 1: Full image perceptual hash
     let ph_full = compute_phash(img);
     let dh_full = compute_dhash(img);
-    if let Some(res) = match_vectors(ph_full, dh_full) {
+    if let Some(res) = match_vectors(ph_full, dh_full, is_burst) {
         return Some(res);
     }
 
@@ -616,7 +633,7 @@ fn match_image_hybrid(img: &image::DynamicImage) -> Option<MatchResult> {
         let cropped1 = img.crop_imm(x1, y1, crop_w1, crop_h1);
         let ph_crop1 = compute_phash(&cropped1);
         let dh_crop1 = compute_dhash(&cropped1);
-        if let Some(res) = match_vectors(ph_crop1, dh_crop1) {
+        if let Some(res) = match_vectors(ph_crop1, dh_crop1, is_burst) {
             return Some(res);
         }
 
@@ -629,19 +646,19 @@ fn match_image_hybrid(img: &image::DynamicImage) -> Option<MatchResult> {
         let cropped2 = img.crop_imm(x2, y2, crop_w2, crop_h2);
         let ph_crop2 = compute_phash(&cropped2);
         let dh_crop2 = compute_dhash(&cropped2);
-        if let Some(res) = match_vectors(ph_crop2, dh_crop2) {
+        if let Some(res) = match_vectors(ph_crop2, dh_crop2, is_burst) {
             return Some(res);
         }
     }
 
     // 3. Tier 2: Scale/Rotation/Perspective/Lighting invariant SIFT geometric verification
-    if let Some(res) = match_features_sift(img) {
+    if let Some(res) = match_features_sift(img, is_burst) {
         return Some(res);
     }
 
     // 4. Tier 2 (Mirror Invariance): Check horizontal flip to defeat mirror scam attacks
     let flipped = img.fliph();
-    if let Some(mut res) = match_features_sift(&flipped) {
+    if let Some(mut res) = match_features_sift(&flipped, is_burst) {
         res.name = format!("{} [Mirrored]", res.name);
         return Some(res);
     }
@@ -802,6 +819,14 @@ impl EventHandler for Handler {
             return;
         }
 
+        let is_burst = candidate_urls.len() >= BURST_IMAGE_COUNT_THRESHOLD;
+        if is_burst {
+            println!(
+                "⚡ [BURST DETECTED] User {} posted {} images at once! Activating aggressive scan...",
+                msg.author.name, candidate_urls.len()
+            );
+        }
+
         // ── Scan each image ──────────────────────────────────────────────
         for img_url in &candidate_urls {
             // Skip if already scanned as clean
@@ -814,7 +839,8 @@ impl EventHandler for Handler {
 
             store.scanned_count.fetch_add(1, Ordering::Relaxed);
             println!(
-                "[SCAN] Analyzing {}'s image against {} scam vectors...",
+                "[SCAN{}] Analyzing {}'s image against {} scam vectors...",
+                if is_burst { " BURST" } else { "" },
                 msg.author.name,
                 store.templates.len()
             );
@@ -832,7 +858,7 @@ impl EventHandler for Handler {
             };
 
             // Match against scam templates with two-tier hybrid matching (pHash + SIFT)
-            if let Some(result) = match_image_hybrid(&img) {
+            if let Some(result) = match_image_hybrid(&img, is_burst) {
                 store.deleted_count.fetch_add(1, Ordering::Relaxed);
 
                 println!(
@@ -947,7 +973,7 @@ async fn main() {
                     let dh = compute_dhash(&img);
                     println!("Computed pHash: {:016x} | dHash: {:016x}\n", ph, dh);
 
-                    if let Some(res) = match_image_hybrid(&img) {
+                    if let Some(res) = match_image_hybrid(&img, false) {
                         println!("============================================================");
                         println!("🚨 FINAL VERDICT: SCAM DETECTED (AUTO-DELETE)");
                         println!("   Matched Template: {}", res.name);
@@ -985,7 +1011,7 @@ async fn main() {
                     if ["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
                         total += 1;
                         if let Ok(img) = image::open(&path) {
-                            if let Some(res) = match_image_hybrid(&img) {
+                            if let Some(res) = match_image_hybrid(&img, false) {
                                 scam_detected += 1;
                                 println!(
                                     "   ❌ FALSE POSITIVE [{:?}]: Matched '{}' (Sim: {:.1}%, Inliers: {})",
