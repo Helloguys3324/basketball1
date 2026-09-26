@@ -232,7 +232,7 @@ impl AiModerator {
             .unwrap_or_else(|| "qwen/qwen3.8-27b".to_string());
 
         let groq_deep_model = get_env_var("GROQ_DEEP_MODEL")
-            .unwrap_or_else(|| "qwen/qwen3.8-27b".to_string());
+            .unwrap_or_else(|| "openai/gpt-oss-120b".to_string());
 
         Self {
             http_client,
@@ -371,34 +371,59 @@ impl AiModerator {
 
         let history = self.get_context_snapshot(ctx.channel_id);
 
+        // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore vs Fast Guard for Banter ──
+        let is_hardcore_or_drama = severe_score > 0.65
+            || max_score > 0.78
+            || (ctx.reply_to.is_some() && max_score > 0.55);
+
+        let preferred_model = if is_hardcore_or_drama {
+            &self.groq_deep_model // openai/gpt-oss-120b (120B reasoning model for drama & complex context)
+        } else {
+            &self.groq_fast_model // qwen/qwen3.8-27b (27B ultra-fast for quick banter & standard flags)
+        };
+
         // 1B. High Score (>0.82 or severe category >0.70) ──────────────────────
         // NEVER BLINDLY DELETE ON RAW SCORE: ALWAYS PASS TO LLM GUARD FIRST
         if severe_score > OPENAI_CATEGORY_SEVERE_THRESHOLD || max_score > OPENAI_SEVERE_THRESHOLD {
             if !self.groq_keys.is_empty() {
                 let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
 
-                match self.call_groq_failover(&self.groq_fast_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
-                    Ok(decision) => {
+                match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
+                    Ok((decision, model_used)) => {
                         if decision.verdict.contains("ALLOW") {
                             // Prevented false deletion of gaming banter!
                             return ModerationVerdict::Allow;
                         } else if decision.verdict.contains("DELETE") {
                             // Severe violation -> Auto-delete with scaled mute
+                            let model_label = if model_used.contains("120b") {
+                                format!("OpenAI + {} (120B Deep Drama Arbiter)", model_used)
+                            } else if model_used.contains("20b") {
+                                format!("OpenAI + {} (20B Safety Arbiter)", model_used)
+                            } else {
+                                format!("OpenAI + {} Guard", model_used)
+                            };
                             return ModerationVerdict::DeleteConfirmed {
                                 reason: format!("{}: {}", top_cat, decision.reason),
                                 score: max_score,
                                 category: top_cat,
-                                model_used: format!("OpenAI + {} Guard", self.groq_fast_model),
+                                model_used: model_label,
                                 rule_violated: decision.rule,
                                 mute_minutes: decision.mute_minutes,
                             };
                         } else {
                             // SUSPICIOUS -> Send interactive card to staff channel and auto-delete with scaled mute!
+                            let model_label = if model_used.contains("120b") {
+                                format!("{} (120B Deep Drama Arbiter)", model_used)
+                            } else if model_used.contains("20b") {
+                                format!("{} (20B Safety Arbiter)", model_used)
+                            } else {
+                                format!("{} (Guard Checked)", model_used)
+                            };
                             return ModerationVerdict::FlagSuspicious {
                                 reason: format!("High score ({:.2}): {}", max_score, decision.reason),
                                 score: max_score,
                                 category: top_cat,
-                                model_used: format!("{} (Guard Checked)", self.groq_fast_model),
+                                model_used: model_label,
                                 rule_violated: decision.rule,
                                 mute_minutes: decision.mute_minutes,
                             };
@@ -444,15 +469,21 @@ impl AiModerator {
         // ── 3. TIER 2: DEEP LLM FOR GREY ZONE (COMPACT PROMPT) ────────────────
         let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
 
-        match self.call_groq_failover(&self.groq_deep_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
-            Ok(decision) => {
+        match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
+            Ok((decision, model_used)) => {
                 if decision.verdict.contains("DELETE") || decision.verdict.contains("SUSPICIOUS") {
-                    // Send to mod alert with interactive buttons for 1-click execution
+                    let model_label = if model_used.contains("120b") {
+                        format!("{} (120B Deep Drama Arbiter)", model_used)
+                    } else if model_used.contains("20b") {
+                        format!("{} (20B Safety Arbiter)", model_used)
+                    } else {
+                        format!("{} (Fast Context)", model_used)
+                    };
                     ModerationVerdict::FlagSuspicious {
                         reason: decision.reason,
                         score: max_score,
                         category: top_cat,
-                        model_used: format!("{} (Deep Context)", self.groq_deep_model),
+                        model_used: model_label,
                         rule_violated: decision.rule,
                         mute_minutes: decision.mute_minutes,
                     }
@@ -599,18 +630,18 @@ impl AiModerator {
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<GroqDecision, String> {
+    ) -> Result<(GroqDecision, String), String> {
         let total_keys = self.groq_keys.len();
         if total_keys == 0 {
             return Err("No Groq keys configured".to_string());
         }
 
         let mut models_to_try = vec![model];
-        if !models_to_try.contains(&"qwen/qwen3.8-27b") {
-            models_to_try.push("qwen/qwen3.8-27b");
-        }
         if !models_to_try.contains(&"openai/gpt-oss-120b") {
             models_to_try.push("openai/gpt-oss-120b");
+        }
+        if !models_to_try.contains(&"qwen/qwen3.8-27b") {
+            models_to_try.push("qwen/qwen3.8-27b");
         }
         if !models_to_try.contains(&"openai/gpt-oss-20b") {
             models_to_try.push("openai/gpt-oss-20b");
@@ -622,7 +653,7 @@ impl AiModerator {
                 let idx = (start_idx + i) % total_keys;
                 let key = &self.groq_keys[idx];
                 match self.execute_groq_call(key, target_model, system_prompt, user_prompt).await {
-                    Ok(res) => return Ok(res),
+                    Ok(res) => return Ok((res, target_model.to_string())),
                     Err(e) => {
                         eprintln!("[GROQ FAILOVER] Key {} model '{}' error: {}", idx, target_model, e);
                         continue;
@@ -640,6 +671,7 @@ impl AiModerator {
         system_prompt: &str,
         user_prompt: &str,
     ) -> Result<GroqDecision, String> {
+        let max_tokens = if model.contains("gpt-oss") { 220 } else { 65 };
         let req_body = GroqChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -652,7 +684,7 @@ impl AiModerator {
                     content: user_prompt.to_string(),
                 },
             ],
-            max_tokens: 65,
+            max_tokens,
             temperature: 0.0,
         };
 
