@@ -14,7 +14,7 @@ const OPENAI_SAFE_THRESHOLD: f64 = 0.45;
 const OPENAI_SEVERE_THRESHOLD: f64 = 0.82;
 const OPENAI_CATEGORY_SEVERE_THRESHOLD: f64 = 0.70;
 
-const MAX_CONTEXT_HISTORY: usize = 12;
+const MAX_CONTEXT_HISTORY: usize = 5;
 const MAX_CHANNELS_TRACKED: usize = 300;
 
 // Hostility markers for gamer chat analysis
@@ -34,56 +34,18 @@ const GAMING_SAFE_SUBSTRINGS: &[&str] = &[
 ];
 
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
-You are the Supreme Server Arbiter enforcing the official server rulebook with graduated punishments:\n\n\
-SERVER RULES & PUNISHMENT SCALE:\n\
-1. MINOR (MUTE_MINUTES: 5-10, or 0 if single minor instance):\n\
-- Chaining/Spamming/Flooding (text walls, copypastas)\n\
-- Channel Misuse (bot commands in general, off topic in commands)\n\
-- Mild Toxicity (disrupting server environment, pointless arguing)\n\
-- Ghost-pinging / Shitpinging / Excessive Shitpinging\n\
-- Voice Chat Abuse\n\
-- Bot Abuse\n\n\
-2. MODERATE (MUTE_MINUTES: 15-30):\n\
-- Encouraging Members to Break Rules (baiting)\n\
-- Disruptive Behavior (escalating useless arguments beyond needed scope)\n\
-- NSFW References (oversexualisation, cropped nsfw pfp, suggestive remarks)\n\
-- XP Farming\n\
-- Bypassing (evading blocked words/phrases)\n\
-- Controversial Debates (sensitive or divisive topics)\n\n\
-3. MAJOR (MUTE_MINUTES: 60-120):\n\
-- Impersonation (staff, members, youtubers/tiktokers)\n\
-- Rapid-Rule Breaking\n\
-- Inappropriate Roleplaying (sexual, violent, offensive themes)\n\
-- Extreme Toxicity (harassment, bullying, malicious behavior)\n\
-- Advertisement (external services, macros, promo)\n\
-- Doxxing (personal info without consent)\n\
-- ToS Violations (Discord / Roblox ToS)\n\n\
-4. CRITICAL (MUTE_MINUTES: 720-1440, i.e. 12-24 hours max timeout):\n\
-- Illegal Exploitative Content (pedophilia, zoophilia)\n\
-- Hate Speech / Discriminatory Behavior (racial, homophobic slurs, bypassed slurs)\n\
-- Suicide / Death Threats ('kys', self-harm, wishing death on others like 'you should die')\n\
-- Graphic Content (pornography, gore, extreme violence)\n\
-- Punishment Evasion (alts)\n\
-- Fabricated Evidence\n\
-- Raiding\n\
-- Real-Money / Account Trading (RMT, cross-platform goods)\n\
-- Cheating / Exploits (game-breaking tools, cheats)\n\
-- Masspinging developers / members\n\n\
-CRITICAL CONSTRAINTS & BEHAVIOR:\n\
-- STRICTLY FORBIDDEN TO BAN OR KICK! You can ONLY decide MUTE_MINUTES (0, 5, 15, 30, 60, 120, 1440).\n\
-- CAREFULLY DETECT JOKES, SARCASM & GAMING BANTER: If members are joking, using sarcasm, quoting memes, or engaging in playful gaming trash talk ('im gonna obliterate you in 1v1', 'ez game', casual friendly cursing like 'fuck you' without malice):\n\
-  VERDICT: ALLOW\n\
-  RULE: None\n\
-  MUTE_MINUTES: 0\n\
-- Direct death wishes ('you should die noob', 'die idiot', 'kys'):\n\
-  VERDICT: SUSPICIOUS\n\
-  RULE: Suicide / Death Threats\n\
-  MUTE_MINUTES: 30\n\
-- Return strictly in this format:\n\
-VERDICT: [ALLOW or SUSPICIOUS or DELETE]\n\
-RULE: [Rule name or None]\n\
-MUTE_MINUTES: [number]\n\
-REASON: [under 12 words]";
+Discord Arbiter. Mutes only (NO BAN/KICK).\n\
+1.Minor(0-10m):Spam,off-topic,mild toxicity,ghost-ping,bot abuse\n\
+2.Mod(15-30m):Bait,disruptive,NSFW ref,bypass,drama\n\
+3.Major(60-120m):Impersonation,harassment,ads,doxx\n\
+4.Crit(720-1440m):Hate/slurs,death threats('kys','you should die'),gore,raid,cheats\n\
+Banter/trash-talk('im gonna destroy you in 1v1','fuck you haha')->ALLOW,RULE:None,MUTE_MINUTES:0\n\
+Death wish('you should die','kys')->SUSPICIOUS,RULE:Suicide / Death Threats,MUTE_MINUTES:30\n\
+Format strictly:\n\
+VERDICT:[ALLOW|SUSPICIOUS|DELETE]\n\
+RULE:[Rule name or None]\n\
+MUTE_MINUTES:[0|5|15|30|60|120|1440]\n\
+REASON:[<=8 words]";
 
 pub fn get_env_var(name: &str) -> Option<String> {
     let env_paths = [
@@ -354,85 +316,29 @@ impl AiModerator {
         has_pronoun || has_insult
     }
 
-    fn format_telemetry(
+    fn format_compact_prompt(
         &self,
         ctx: &MessageContext<'_>,
         history: &[ChatEntry],
         max_score: f64,
         top_cat: &str,
-        cat_breakdown: &str,
     ) -> String {
-        let mut p = String::with_capacity(3072);
-
-        p.push_str("=== 1. SERVER & CHANNEL TELEMETRY ===\n");
-        if let Some(gid) = ctx.guild_id {
-            let gname = ctx.guild_name.as_deref().unwrap_or("Server");
-            p.push_str(&format!("Server: {} (ID: {})\n", gname, gid));
-        } else {
-            p.push_str("Server: Direct Message\n");
+        let mut p = String::with_capacity(384);
+        p.push_str(&format!("Msg: @{}: \"{}\"\n", ctx.author_name, ctx.content.trim()));
+        if let Some((rep_author, _, _, rep_text)) = ctx.reply_to {
+            let short_rep = if rep_text.len() > 60 { &rep_text[..60] } else { rep_text };
+            p.push_str(&format!("Reply-To: @{}: \"{}\"\n", rep_author, short_rep.trim()));
         }
-        let cname = ctx.channel_name.as_deref().unwrap_or("general");
-        p.push_str(&format!("Channel: #{} (ID: {})\n", cname, ctx.channel_id));
+        p.push_str(&format!("Flag: {} ({:.2})\n", top_cat, max_score));
 
-        p.push_str("\n=== 2. AUTHOR IDENTITY & REPUTATION ===\n");
-        let nick_str = match &ctx.author_nick {
-            Some(n) => format!(" (Server Nickname: '{}')", n),
-            None => String::new(),
-        };
-        p.push_str(&format!("User: @{}{}, ID: {}\n", ctx.author_name, nick_str, ctx.author_id));
-
-        if let Some(age) = ctx.account_age_days {
-            let risk = if age < 7 {
-                " ⚠️ [HIGH RISK: Account created < 7 days ago!]"
-            } else if age < 30 {
-                " ⚠️ [MODERATE: New account < 30 days]"
-            } else {
-                " [Established account]"
-            };
-            p.push_str(&format!("Account Age: {} days{}\n", age, risk));
+        let recent: Vec<_> = history.iter().rev().take(3).collect();
+        if !recent.is_empty() {
+            let hist_items: Vec<String> = recent.into_iter().rev().map(|e| {
+                let short_c = if e.content.len() > 50 { &e.content[..50] } else { &e.content };
+                format!("{}: {}", e.author_name, short_c.trim())
+            }).collect();
+            p.push_str(&format!("Recent: {}", hist_items.join(" | ")));
         }
-        if let Some(joined) = ctx.server_member_days {
-            p.push_str(&format!("Server Member For: {} days (Roles count: {})\n", joined, ctx.roles_count));
-        } else if ctx.roles_count > 0 {
-            p.push_str(&format!("Roles count: {}\n", ctx.roles_count));
-        }
-
-        p.push_str("\n=== 3. TARGET MESSAGE TELEMETRY ===\n");
-        p.push_str(&format!("Message ID: {}\n", ctx.message_id));
-        p.push_str(&format!("Timestamp (Unix): {}\n", ctx.timestamp_unix));
-        p.push_str(&format!("Message Text: \"{}\"\n", ctx.content.trim()));
-
-        if let Some((rep_author, rep_id, rep_msg_id, rep_text)) = ctx.reply_to {
-            p.push_str(&format!(
-                "Replying To Message ID: {} by @{} (ID: {}): \"{}\"\n",
-                rep_msg_id, rep_author, rep_id, rep_text
-            ));
-        } else {
-            p.push_str("Replying To: (None / Standalone message)\n");
-        }
-
-        if !ctx.mentions.is_empty() {
-            let m_str: Vec<String> = ctx.mentions.iter().map(|(id, name)| format!("@{} (ID: {})", name, id)).collect();
-            p.push_str(&format!("Direct Mentions: {}\n", m_str.join(", ")));
-        } else {
-            p.push_str("Direct Mentions: (None)\n");
-        }
-
-        if !ctx.attachments_info.is_empty() {
-            p.push_str(&format!("Attached Files: {}\n", ctx.attachments_info.join(", ")));
-        } else {
-            p.push_str("Attached Files: (None)\n");
-        }
-
-        p.push_str("\n=== 4. AUTOMATED MODERATION SIGNALS (OpenAI omni-moderation) ===\n");
-        p.push_str(&format!("Highest Score: {:.2} (Top Category: '{}')\n", max_score, top_cat));
-        if !cat_breakdown.is_empty() {
-            p.push_str(&format!("Full Category Breakdown: {}\n", cat_breakdown));
-        }
-
-        p.push_str("\n=== 5. CHRONOLOGICAL RECENT CHANNEL MESSAGES ===\n");
-        p.push_str(&self.format_history(history));
-
         p
     }
 
@@ -450,7 +356,7 @@ impl AiModerator {
             None => return ModerationVerdict::Allow,
         };
 
-        let (max_score, severe_score, top_cat, cat_breakdown) = match self.call_openai_moderation(openai_key, trimmed).await {
+        let (max_score, severe_score, top_cat, _cat_breakdown) = match self.call_openai_moderation(openai_key, trimmed).await {
             Ok(scores) => scores,
             Err(_) => (0.0, 0.0, String::new(), String::new()),
         };
@@ -466,10 +372,7 @@ impl AiModerator {
         // NEVER BLINDLY DELETE ON RAW SCORE: ALWAYS PASS TO LLM GUARD FIRST
         if severe_score > OPENAI_CATEGORY_SEVERE_THRESHOLD || max_score > OPENAI_SEVERE_THRESHOLD {
             if !self.groq_keys.is_empty() {
-                let user_prompt = format!(
-                    "{}\nEvaluate against official server rules and determine: is this safe banter/quote (ALLOW), needs staff review & timeout (SUSPICIOUS), or true severe violation (DELETE)?",
-                    self.format_telemetry(ctx, &history, max_score, &top_cat, &cat_breakdown)
-                );
+                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
 
                 match self.call_groq_failover(&self.groq_fast_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
                     Ok(decision) => {
@@ -526,7 +429,7 @@ impl AiModerator {
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
         let is_directed = Self::is_directed_or_targeted(trimmed, ctx.reply_to.is_some());
-        if !is_directed && max_score < 0.60 {
+        if !is_directed && max_score < 0.65 {
             // General game frustration ("fuck this lag", "damn bug") -> ALLOW instantly
             return ModerationVerdict::Allow;
         }
@@ -535,12 +438,8 @@ impl AiModerator {
             return ModerationVerdict::Allow;
         }
 
-        // ── 3. TIER 2: DEEP LLM FOR GREY ZONE (TUNED TO THE ABSOLUTE MAXIMUM) ──
-        // Supplies LLM with full server telemetry, IDs, reply targets, mentions, and server rulebook!
-        let user_prompt = format!(
-            "{}\nAnalyze all telemetry, context, and intent according to official server rules. What is your final verdict?",
-            self.format_telemetry(ctx, &history, max_score, &top_cat, &cat_breakdown)
-        );
+        // ── 3. TIER 2: DEEP LLM FOR GREY ZONE (COMPACT PROMPT) ────────────────
+        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
 
         match self.call_groq_failover(&self.groq_deep_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
             Ok(decision) => {
@@ -560,21 +459,6 @@ impl AiModerator {
             }
             Err(_) => ModerationVerdict::Allow,
         }
-    }
-
-    fn format_history(&self, history: &[ChatEntry]) -> String {
-        let mut out = String::new();
-        if history.is_empty() {
-            out.push_str("(No recent channel messages)\n");
-            return out;
-        }
-        for entry in history {
-            out.push_str(&format!(
-                "[MsgID: {}] {} (ID: {}): {}\n",
-                entry.message_id, entry.author_name, entry.author_id, entry.content
-            ));
-        }
-        out
     }
 
     async fn call_openai_moderation(&self, api_key: &str, text: &str) -> Result<(f64, f64, String, String), reqwest::Error> {
@@ -762,7 +646,7 @@ impl AiModerator {
                     content: user_prompt.to_string(),
                 },
             ],
-            max_tokens: 120,
+            max_tokens: 65,
             temperature: 0.0,
         };
 
