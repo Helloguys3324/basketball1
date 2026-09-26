@@ -72,7 +72,7 @@ pub async fn send_mod_alert(
         .style(ButtonStyle::Success)
         .emoji('✅');
 
-    let mut action_row = CreateActionRow::Buttons(vec![btn_mute_10m, btn_mute_1h, btn_ban]);
+    let mut action_row = CreateActionRow::Buttons(vec![btn_mute_10m, btn_mute_1h, btn_ban, btn_dismiss.clone()]);
 
     if !is_auto_deleted {
         let btn_del = CreateButton::new(format!("mod_del:{}", id_prefix))

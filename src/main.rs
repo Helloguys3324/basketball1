@@ -928,7 +928,7 @@ impl EventHandler for Handler {
                     model_used,
                 } => {
                     println!(
-                        "\n⚠️ [AI MODERATOR: SUSPICIOUS] Channel: {} | User: {} ({}) | Score: {:.2} | Reason: {} | Msg: \"{}\"",
+                        "\n⚠️ [AI MODERATOR: SUSPICIOUS (AUTO-DELETED)] Channel: {} | User: {} ({}) | Score: {:.2} | Reason: {} | Msg: \"{}\"",
                         msg.channel_id, msg.author.name, msg.author.id, score, reason, msg.content
                     );
 
@@ -940,6 +940,25 @@ impl EventHandler for Handler {
                         &msg.content,
                     );
 
+                    if AUTO_DELETE {
+                        let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
+                    }
+
+                    if WARN_USER_IN_CHAT {
+                        let warn_text = format!(
+                            "🛡️ **Auto-Moderator:** <@{}>, your message was removed for review ({}).",
+                            msg.author.id, reason
+                        );
+                        if let Ok(warn_msg) = msg.channel_id.say(&ctx.http, &warn_text).await {
+                            let http = ctx.http.clone();
+                            let channel_id = msg.channel_id;
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(WARN_EXPIRE_SECONDS)).await;
+                                let _ = channel_id.delete_message(&http, warn_msg.id).await;
+                            });
+                        }
+                    }
+
                     if let Some(mod_chan) = self.config.get_mod_channel() {
                         mod_actions::send_mod_alert(
                             &ctx.http,
@@ -950,8 +969,8 @@ impl EventHandler for Handler {
                             msg.channel_id,
                             msg.id,
                             &msg.content,
-                            "⚠️ AI ALERT: SUSPICIOUS (PENDING MOD REVIEW)",
-                            false,
+                            "⚠️ AI ALERT: SUSPICIOUS (AUTO-DELETED - PENDING MOD REVIEW)",
+                            true,
                             &reason,
                             score,
                             &category,
@@ -959,6 +978,9 @@ impl EventHandler for Handler {
                         )
                         .await;
                     }
+
+                    // Message deleted, skip image checking
+                    return;
                 }
                 ModerationVerdict::Allow => {
                     self.ai_moderator.record_message(
