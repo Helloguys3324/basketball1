@@ -19,8 +19,23 @@ const MAX_CHANNELS_TRACKED: usize = 300;
 
 // Hostility markers for gamer chat analysis
 const TARGET_PRONOUNS: &[&str] = &[
+    // Second person
     "you", "u", "ur", "your", "yours", "yourself",
-    "ты", "тебя", "тебе", "тобой", "твой", "твоя", "твои", "твою", "вы", "вас", "вам"
+    "ты", "тебя", "тебе", "тобой", "твой", "твоя", "твои", "твою", "вы", "вас", "вам",
+    // Third person targeting
+    "he", "she", "they", "him", "her", "his", "hers", "them", "their", "theirs",
+    "он", "она", "они", "его", "ее", "их", "ему", "ей", "им", "него", "нее", "них",
+    // Addressing terms & gaming entities
+    "bro", "dude", "guy", "man", "kid", "buddy",
+    "чел", "чувак", "тип", "пацан", "малой", "брат", "бро"
+];
+
+const SEVERE_HARM_KEYWORDS: &[&str] = &[
+    "burn alive", "burned alive", "burn you", "burn him", "burn her", "kill", "die",
+    "murder", "stab", "shoot", "hang", "slit", "doxx", "rape", "torture", "strangle",
+    "choke", "execute", "suicide", "kys", "burn",
+    "сожгу", "сжечь", "сжечь заживо", "убью", "убить", "сдохни", "смерть", "зарезать",
+    "пристрелить", "повесить", "расчленить", "вскройся", "самоубийство"
 ];
 
 const TARGET_INSULTS: &[&str] = &[
@@ -37,13 +52,14 @@ pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
 1.Minor(0-10m):Spam,off-topic,mild toxicity,ghost-ping,bot abuse\n\
 2.Mod(15-30m):Bait,disruptive,NSFW ref,bypass,drama\n\
-3.Major(60-120m):Impersonation,harassment,ads,doxx\n\
+3.Major(60-120m):Impersonation,harassment,threats to members,ads,doxx\n\
 4.Crit(720-1440m):Hate/slurs,death threats('kys','you should die'),gore,raid,cheats\n\
 GAMING BANTER / HYPERBOLE (ALLOW, RULE:None, MUTE_MINUTES:0):\n\
-- Trash-talk & playful threats without real-world info: 'im gonna hurt you', 'im gonna destroy/smash/wreck you', 'im gonna obliterate you in 1v1', 'fuck you bro haha', 'ez game'\n\
+- Trash-talk & playful challenges: 'im gonna hurt you', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game'\n\
 REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
+- Threats naming users or with dates/methods: 'X will be burned alive', 'im gonna hunt X down' -> DELETE(120m)\n\
 - Direct death wishes/suicide: 'you should die noob', 'die idiot', 'kys' -> SUSPICIOUS(30m)\n\
-- Credible real-world threats with doxxing/stalking: 'i know where you live and im coming to hurt you' -> DELETE(120m)\n\
+- Credible real-world threats with doxxing/stalking: 'i know where you live' -> DELETE(120m)\n\
 Format strictly:\n\
 VERDICT:[ALLOW|SUSPICIOUS|DELETE]\n\
 RULE:[Rule name or None]\n\
@@ -302,21 +318,58 @@ impl AiModerator {
         false
     }
 
-    fn is_directed_or_targeted(content: &str, has_reply: bool) -> bool {
-        if has_reply || content.contains("<@") {
+    fn is_directed_or_targeted(content: &str, has_reply: bool, mentions: &[(u64, String)], history: &[ChatEntry]) -> bool {
+        if has_reply || !mentions.is_empty() || content.contains("<@") || content.contains("@") {
             return true;
         }
+
         let lower = content.to_lowercase();
+
+        // 1. Check if any participant name from recent channel history is mentioned
+        for entry in history {
+            let author_lower = entry.author_name.to_lowercase();
+            if author_lower.len() >= 3 && lower.contains(&author_lower) {
+                return true;
+            }
+        }
+
+        // 2. Check pronouns & addressing markers
         let words: Vec<&str> = lower.split_whitespace().collect();
         let has_pronoun = words.iter().any(|w| {
             let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
             TARGET_PRONOUNS.contains(&clean)
         });
+        if has_pronoun {
+            return true;
+        }
+
+        // 3. Check insult markers
         let has_insult = words.iter().any(|w| {
             let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
             TARGET_INSULTS.contains(&clean)
         });
-        has_pronoun || has_insult
+        if has_insult {
+            return true;
+        }
+
+        // 4. Check proper noun / name patterns (e.g. "Mizuri will be...", "Alex is...")
+        let orig_words: Vec<&str> = content.split_whitespace().collect();
+        for (i, word) in orig_words.iter().enumerate() {
+            let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if clean.len() >= 3 && clean.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                if i > 0 {
+                    return true;
+                }
+                if orig_words.len() > 1 {
+                    let next_clean = orig_words[1].trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                    if matches!(next_clean.as_str(), "will" | "is" | "should" | "must" | "can" | "needs" | "будет" | "должен" | "надо" | "это" | "was" | "бы") {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     fn format_compact_prompt(
@@ -369,6 +422,14 @@ impl AiModerator {
             Err(_) => (0.0, 0.0, String::new(), String::new()),
         };
 
+        let history = self.get_context_snapshot(ctx.channel_id);
+        let lower = trimmed.to_lowercase();
+        let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
+        let is_violent_category = matches!(
+            top_cat.as_str(),
+            "violence" | "violence/graphic" | "self-harm" | "self-harm/intent" | "self-harm/instructions" | "hate" | "hate/threatening" | "harassment/threatening"
+        );
+
         println!(
             "\n🔍 [AI SCANNER] Channel: #{} | Author: @{} ({}) | Text: \"{}\"",
             ctx.channel_name.as_deref().unwrap_or("unknown"),
@@ -384,21 +445,23 @@ impl AiModerator {
             cat_breakdown
         );
 
-        // 1A. Clear clean content -> Instant ALLOW
-        if max_score < OPENAI_SAFE_THRESHOLD {
+        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords)
+        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword {
             println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
             return ModerationVerdict::Allow;
         }
 
-        let history = self.get_context_snapshot(ctx.channel_id);
+        let is_directed = Self::is_directed_or_targeted(trimmed, ctx.reply_to.is_some(), ctx.mentions, &history);
 
-        // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore vs Fast Guard for Banter ──
+        // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore/Threats vs Fast Guard for Banter ──
         let is_hardcore_or_drama = severe_score > 0.65
             || max_score > 0.78
-            || (ctx.reply_to.is_some() && max_score > 0.55);
+            || (ctx.reply_to.is_some() && max_score > 0.55)
+            || has_severe_harm_keyword
+            || is_violent_category;
 
         let preferred_model = if is_hardcore_or_drama {
-            &self.groq_deep_model // openai/gpt-oss-120b (120B reasoning model for drama & complex context)
+            &self.groq_deep_model // openai/gpt-oss-120b (120B reasoning model for drama, threats & complex context)
         } else {
             &self.groq_fast_model // qwen/qwen3.8-27b (27B ultra-fast for quick banter & standard flags)
         };
@@ -487,8 +550,8 @@ impl AiModerator {
         }
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
-        let is_directed = Self::is_directed_or_targeted(trimmed, ctx.reply_to.is_some());
-        if !is_directed && max_score < 0.65 {
+        // ONLY bypass if it's general non-violent gaming frustration (e.g. "fuck this lag")
+        if !is_directed && !is_violent_category && !has_severe_harm_keyword && max_score < 0.60 {
             println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
@@ -719,7 +782,7 @@ impl AiModerator {
         user_prompt: &str,
     ) -> Result<(GroqDecision, u128), String> {
         let start_time = std::time::Instant::now();
-        let max_tokens = if model.contains("gpt-oss") { 220 } else { 65 };
+        let max_tokens = if model.contains("gpt-oss") { 320 } else { 75 };
         let req_body = GroqChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -788,13 +851,17 @@ impl AiModerator {
             }
 
             if reason.is_empty() {
-                reason = "Context telemetry evaluation".to_string();
+                if rule != "Server Guidelines" && !rule.is_empty() {
+                    reason = format!("Violated: {}", rule);
+                } else {
+                    reason = "Context telemetry evaluation".to_string();
+                }
             }
 
             // Fallback timeout scaling if model omitted MUTE_MINUTES
             if mute_minutes == 0 {
                 if verdict == "DELETE" {
-                    mute_minutes = 1440;
+                    mute_minutes = 120;
                 } else if verdict == "SUSPICIOUS" && rule != "None" {
                     mute_minutes = 30;
                 }
@@ -827,10 +894,21 @@ mod tests {
 
     #[test]
     fn test_is_directed_or_targeted() {
-        assert!(AiModerator::is_directed_or_targeted("ты клоун", false));
-        assert!(AiModerator::is_directed_or_targeted("you are trash", false));
-        assert!(AiModerator::is_directed_or_targeted("whatever man", true));
-        assert!(!AiModerator::is_directed_or_targeted("fuck this lag", false));
+        let history = vec![
+            ChatEntry {
+                message_id: 1,
+                author_id: 100,
+                author_name: "Mizuri".to_string(),
+                content: "hi".to_string(),
+            }
+        ];
+        assert!(AiModerator::is_directed_or_targeted("ты клоун", false, &[], &[]));
+        assert!(AiModerator::is_directed_or_targeted("you are trash", false, &[], &[]));
+        assert!(AiModerator::is_directed_or_targeted("whatever man", true, &[], &[]));
+        assert!(AiModerator::is_directed_or_targeted("he is so annoying", false, &[], &[]));
+        assert!(AiModerator::is_directed_or_targeted("Mizuri will be burned alive", false, &[], &history));
+        assert!(AiModerator::is_directed_or_targeted("Mizuri will be burned alive", false, &[], &[]));
+        assert!(!AiModerator::is_directed_or_targeted("fuck this lag", false, &[], &[]));
     }
 
     #[test]
@@ -869,6 +947,33 @@ mod tests {
         };
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for 'you should die noob': {:?}\n", verdict);
+        assert!(matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_check_message_burn_alive_threat() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("general".to_string()),
+            message_id: 3,
+            timestamp_unix: 1727376000,
+            author_name: "polska8635",
+            author_id: 795992869164679168,
+            author_nick: None,
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "Mizuri will be burned alive on novemeber 24 2028",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'Mizuri will be burned alive...': {:?}\n", verdict);
         assert!(matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }));
     }
 }
