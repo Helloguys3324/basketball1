@@ -57,7 +57,7 @@ Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
 GAMING BANTER / HYPERBOLE (ALLOW, RULE:None, MUTE_MINUTES:0):\n\
 - Trash-talk & playful challenges: 'im gonna hurt you', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game'\n\
 REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
-- Threats naming users or with dates/methods: 'X will be burned alive', 'im gonna hunt X down' -> DELETE(120m)\n\
+- Threats naming users (or short nicknames from chat like 'miz' for 'Mizuri') or with dates/methods: 'X will be burned alive', 'im gonna hunt X down' -> DELETE(120m)\n\
 - Direct death wishes/suicide: 'you should die noob', 'die idiot', 'kys' -> SUSPICIOUS(30m)\n\
 - Credible real-world threats with doxxing/stalking: 'i know where you live' -> DELETE(120m)\n\
 Format strictly:\n\
@@ -324,17 +324,25 @@ impl AiModerator {
         }
 
         let lower = content.to_lowercase();
+        let words: Vec<&str> = lower.split_whitespace().collect();
 
-        // 1. Check if any participant name from recent channel history is mentioned
+        // 1. Check if any participant name or abbreviation from recent channel history is mentioned
         for entry in history {
             let author_lower = entry.author_name.to_lowercase();
-            if author_lower.len() >= 3 && lower.contains(&author_lower) {
-                return true;
+            let base = author_lower.trim_end_matches(|c: char| c.is_ascii_digit());
+            if base.len() >= 3 {
+                if lower.contains(base) {
+                    return true;
+                }
+                // Check if any word is a 3+ letter prefix abbreviation (e.g. "miz" or "mizu" for "mizuri")
+                for w in &words {
+                    let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+                    if clean.len() >= 3 && base.len() > clean.len() && base.starts_with(clean) {
+                        return true;
+                    }
+                }
             }
         }
-
-        // 2. Check pronouns & addressing markers
-        let words: Vec<&str> = lower.split_whitespace().collect();
         let has_pronoun = words.iter().any(|w| {
             let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
             TARGET_PRONOUNS.contains(&clean)
@@ -907,6 +915,8 @@ mod tests {
         assert!(AiModerator::is_directed_or_targeted("whatever man", true, &[], &[]));
         assert!(AiModerator::is_directed_or_targeted("he is so annoying", false, &[], &[]));
         assert!(AiModerator::is_directed_or_targeted("Mizuri will be burned alive", false, &[], &history));
+        assert!(AiModerator::is_directed_or_targeted("miz will be burned alive", false, &[], &history));
+        assert!(AiModerator::is_directed_or_targeted("mizu should leave", false, &[], &history));
         assert!(AiModerator::is_directed_or_targeted("Mizuri will be burned alive", false, &[], &[]));
         assert!(!AiModerator::is_directed_or_targeted("fuck this lag", false, &[], &[]));
     }
