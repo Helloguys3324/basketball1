@@ -771,7 +771,7 @@ impl EventHandler for Handler {
         // ── 0. AI TEXT MODERATION (Runs before / in parallel to image scan) ──
         if !msg.content.trim().is_empty() {
             // Pre-fill channel context history from Discord if local buffer is empty (e.g. fresh reboot)
-            if self.ai_moderator.get_history_count(msg.channel_id.get()) < 3 {
+            if self.ai_moderator.get_history_count(msg.channel_id.get()) < 6 {
                 let get_msgs = serenity::builder::GetMessages::new().before(msg.id).limit(10);
                 if let Ok(recent) = msg.channel_id.messages(&ctx.http, get_msgs).await {
                     for m in recent.into_iter().rev() {
@@ -905,8 +905,10 @@ impl EventHandler for Handler {
                             }
                         }
                         if applied {
+                            println!("   🔇 [TIMEOUT APPLIED] User @{} timed out for {}m.", msg.author.name, mute_minutes);
                             format!("🔇 Timed out for {} min under rule: **{}** (AI intuition called for action!)", mute_minutes, rule_violated)
                         } else {
+                            println!("   🛡️ [TIMEOUT SKIPPED] User @{} has admin immunity.", msg.author.name);
                             format!("🗑️ Message removed under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
                         }
                     } else {
@@ -954,6 +956,7 @@ impl EventHandler for Handler {
                             &model_used,
                         )
                         .await;
+                        println!("   📬 [MOD LOGS] Incident alert sent to staff channel.");
                     }
 
                     // Message deleted for toxic text, skip image checking
@@ -1004,8 +1007,10 @@ impl EventHandler for Handler {
                             }
                         }
                         if applied {
+                            println!("   🔇 [TIMEOUT APPLIED] User @{} timed out for {}m.", msg.author.name, mute_minutes);
                             format!("🔇 Timed out for {} min under rule: **{}** (AI intuition called for action!)", mute_minutes, rule_violated)
                         } else {
+                            println!("   🛡️ [TIMEOUT SKIPPED] User @{} has admin immunity.", msg.author.name);
                             format!("🗑️ Message removed under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
                         }
                     } else {
@@ -1053,6 +1058,7 @@ impl EventHandler for Handler {
                             &model_used,
                         )
                         .await;
+                        println!("   📬 [MOD LOGS] Interactive review card sent to staff channel.");
                     }
 
                     // Message deleted, skip image checking

@@ -14,7 +14,7 @@ const OPENAI_SAFE_THRESHOLD: f64 = 0.45;
 const OPENAI_SEVERE_THRESHOLD: f64 = 0.82;
 const OPENAI_CATEGORY_SEVERE_THRESHOLD: f64 = 0.70;
 
-const MAX_CONTEXT_HISTORY: usize = 5;
+const MAX_CONTEXT_HISTORY: usize = 8;
 const MAX_CHANNELS_TRACKED: usize = 300;
 
 // Hostility markers for gamer chat analysis
@@ -326,22 +326,27 @@ impl AiModerator {
         max_score: f64,
         top_cat: &str,
     ) -> String {
-        let mut p = String::with_capacity(384);
-        p.push_str(&format!("Msg: @{}: \"{}\"\n", ctx.author_name, ctx.content.trim()));
-        if let Some((rep_author, _, _, rep_text)) = ctx.reply_to {
-            let short_rep = if rep_text.len() > 60 { &rep_text[..60] } else { rep_text };
-            p.push_str(&format!("Reply-To: @{}: \"{}\"\n", rep_author, short_rep.trim()));
-        }
-        p.push_str(&format!("Flag: {} ({:.2})\n", top_cat, max_score));
+        let mut p = String::with_capacity(512);
 
-        let recent: Vec<_> = history.iter().rev().take(3).collect();
+        // Include recent conversation context (up to 7 prior messages)
+        let recent: Vec<_> = history.iter().rev().take(7).collect();
         if !recent.is_empty() {
-            let hist_items: Vec<String> = recent.into_iter().rev().map(|e| {
-                let short_c = if e.content.len() > 50 { &e.content[..50] } else { &e.content };
-                format!("{}: {}", e.author_name, short_c.trim())
-            }).collect();
-            p.push_str(&format!("Recent: {}", hist_items.join(" | ")));
+            p.push_str("Recent chat context:\n");
+            for (idx, e) in recent.into_iter().rev().enumerate() {
+                let short_c = if e.content.len() > 90 { &e.content[..90] } else { &e.content };
+                p.push_str(&format!("{}. {}: \"{}\"\n", idx + 1, e.author_name, short_c.trim()));
+            }
+            p.push('\n');
         }
+
+        p.push_str("FLAGGED MESSAGE TO EVALUATE:\n");
+        p.push_str(&format!("Author: @{}\n", ctx.author_name));
+        p.push_str(&format!("Content: \"{}\"\n", ctx.content.trim()));
+        if let Some((rep_author, _, _, rep_text)) = ctx.reply_to {
+            let short_rep = if rep_text.len() > 90 { &rep_text[..90] } else { rep_text };
+            p.push_str(&format!("Replying to: @{}: \"{}\"\n", rep_author, short_rep.trim()));
+        }
+        p.push_str(&format!("OpenAI Flag: {} (score: {:.2})\n", top_cat, max_score));
         p
     }
 
@@ -359,13 +364,29 @@ impl AiModerator {
             None => return ModerationVerdict::Allow,
         };
 
-        let (max_score, severe_score, top_cat, _cat_breakdown) = match self.call_openai_moderation(openai_key, trimmed).await {
+        let (max_score, severe_score, top_cat, cat_breakdown) = match self.call_openai_moderation(openai_key, trimmed).await {
             Ok(scores) => scores,
             Err(_) => (0.0, 0.0, String::new(), String::new()),
         };
 
+        println!(
+            "\n🔍 [AI SCANNER] Channel: #{} | Author: @{} ({}) | Text: \"{}\"",
+            ctx.channel_name.as_deref().unwrap_or("unknown"),
+            ctx.author_name,
+            ctx.author_id,
+            trimmed
+        );
+        println!(
+            "   📊 [OPENAI] Max Score: {:.2} ({}) | Severe: {:.2} | Details: [{}]",
+            max_score,
+            if top_cat.is_empty() { "none" } else { &top_cat },
+            severe_score,
+            cat_breakdown
+        );
+
         // 1A. Clear clean content -> Instant ALLOW
         if max_score < OPENAI_SAFE_THRESHOLD {
+            println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
             return ModerationVerdict::Allow;
         }
 
@@ -386,15 +407,27 @@ impl AiModerator {
         // NEVER BLINDLY DELETE ON RAW SCORE: ALWAYS PASS TO LLM GUARD FIRST
         if severe_score > OPENAI_CATEGORY_SEVERE_THRESHOLD || max_score > OPENAI_SEVERE_THRESHOLD {
             if !self.groq_keys.is_empty() {
+                println!(
+                    "   🤖 [AI ROUTER] High severity score ({:.2})! Routing to {} (Context: {} prior msgs | Mode: {})",
+                    max_score,
+                    preferred_model,
+                    history.len(),
+                    if is_hardcore_or_drama { "120B Deep Reasoning" } else { "27B Fast Guard" }
+                );
                 let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
 
                 match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
-                    Ok((decision, model_used)) => {
+                    Ok((decision, model_used, elapsed_ms)) => {
+                        println!(
+                            "   ⚡ [AI RESPONSE] Model: {} (took {}ms) | Verdict: {} | Rule: {} | Mute: {}m | Reason: \"{}\"",
+                            model_used, elapsed_ms, decision.verdict, decision.rule, decision.mute_minutes, decision.reason
+                        );
+
                         if decision.verdict.contains("ALLOW") {
-                            // Prevented false deletion of gaming banter!
+                            println!("   ✅ [BANTER PASS] LLM verified message as safe gaming hyperbole -> ALLOW");
                             return ModerationVerdict::Allow;
                         } else if decision.verdict.contains("DELETE") {
-                            // Severe violation -> Auto-delete with scaled mute
+                            println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                             let model_label = if model_used.contains("120b") {
                                 format!("OpenAI + {} (120B Deep Drama Arbiter)", model_used)
                             } else if model_used.contains("20b") {
@@ -411,7 +444,7 @@ impl AiModerator {
                                 mute_minutes: decision.mute_minutes,
                             };
                         } else {
-                            // SUSPICIOUS -> Send interactive card to staff channel and auto-delete with scaled mute!
+                            println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged for mod review + auto-timeout: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                             let model_label = if model_used.contains("120b") {
                                 format!("{} (120B Deep Drama Arbiter)", model_used)
                             } else if model_used.contains("20b") {
@@ -430,8 +463,7 @@ impl AiModerator {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[GROQ GUARD FAILOVER] Error: {}. Falling back to FlagSuspicious.", e);
-                        // If LLM unavailable, NEVER blindly auto-delete! Send to human moderators!
+                        eprintln!("   ❌ [GROQ GUARD FAILOVER] Error: {}. Falling back to FlagSuspicious.", e);
                         return ModerationVerdict::FlagSuspicious {
                             reason: format!("High score ({:.2}), pending mod review", max_score),
                             score: max_score,
@@ -444,7 +476,6 @@ impl AiModerator {
                 }
             }
 
-            // If no Groq keys, send to mod review instead of blind deletion
             return ModerationVerdict::FlagSuspicious {
                 reason: format!("High score ({:.2}): pending staff review", max_score),
                 score: max_score,
@@ -458,20 +489,32 @@ impl AiModerator {
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
         let is_directed = Self::is_directed_or_targeted(trimmed, ctx.reply_to.is_some());
         if !is_directed && max_score < 0.65 {
-            // General game frustration ("fuck this lag", "damn bug") -> ALLOW instantly
+            println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
 
         if self.groq_keys.is_empty() {
+            println!("   ↳ [NO KEYS] Groq keys not configured -> ALLOW");
             return ModerationVerdict::Allow;
         }
 
         // ── 3. TIER 2: DEEP LLM FOR GREY ZONE (COMPACT PROMPT) ────────────────
+        println!(
+            "   🤖 [AI ROUTER] Grey-zone evaluation! Routing to {} (Context: {} prior msgs | is_directed: {})",
+            preferred_model,
+            history.len(),
+            is_directed
+        );
         let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
 
         match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
-            Ok((decision, model_used)) => {
+            Ok((decision, model_used, elapsed_ms)) => {
+                println!(
+                    "   ⚡ [AI RESPONSE] Model: {} (took {}ms) | Verdict: {} | Rule: {} | Mute: {}m | Reason: \"{}\"",
+                    model_used, elapsed_ms, decision.verdict, decision.rule, decision.mute_minutes, decision.reason
+                );
                 if decision.verdict.contains("DELETE") || decision.verdict.contains("SUSPICIOUS") {
+                    println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                     let model_label = if model_used.contains("120b") {
                         format!("{} (120B Deep Drama Arbiter)", model_used)
                     } else if model_used.contains("20b") {
@@ -488,10 +531,14 @@ impl AiModerator {
                         mute_minutes: decision.mute_minutes,
                     }
                 } else {
+                    println!("   ✅ [ALLOW] Grey-zone message allowed by LLM.");
                     ModerationVerdict::Allow
                 }
             }
-            Err(_) => ModerationVerdict::Allow,
+            Err(e) => {
+                eprintln!("   ❌ [GROQ ERROR] Grey-zone call failed: {}. Allowing.", e);
+                ModerationVerdict::Allow
+            }
         }
     }
 
@@ -630,7 +677,7 @@ impl AiModerator {
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<(GroqDecision, String), String> {
+    ) -> Result<(GroqDecision, String, u128), String> {
         let total_keys = self.groq_keys.len();
         if total_keys == 0 {
             return Err("No Groq keys configured".to_string());
@@ -653,9 +700,9 @@ impl AiModerator {
                 let idx = (start_idx + i) % total_keys;
                 let key = &self.groq_keys[idx];
                 match self.execute_groq_call(key, target_model, system_prompt, user_prompt).await {
-                    Ok(res) => return Ok((res, target_model.to_string())),
+                    Ok((res, elapsed_ms)) => return Ok((res, target_model.to_string(), elapsed_ms)),
                     Err(e) => {
-                        eprintln!("[GROQ FAILOVER] Key {} model '{}' error: {}", idx, target_model, e);
+                        eprintln!("[GROQ FAILOVER] Key {} model '{}' error: {}. Trying fallback...", idx, target_model, e);
                         continue;
                     }
                 }
@@ -670,7 +717,8 @@ impl AiModerator {
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<GroqDecision, String> {
+    ) -> Result<(GroqDecision, u128), String> {
+        let start_time = std::time::Instant::now();
         let max_tokens = if model.contains("gpt-oss") { 220 } else { 65 };
         let req_body = GroqChatRequest {
             model: model.to_string(),
@@ -705,6 +753,7 @@ impl AiModerator {
         }
 
         let body: GroqChatResponse = resp.json().await.map_err(|e| format!("JSON decode error: {}", e))?;
+        let elapsed_ms = start_time.elapsed().as_millis();
         if let Some(choice) = body.choices.first() {
             let text = &choice.message.content;
             let upper = text.to_uppercase();
@@ -751,12 +800,12 @@ impl AiModerator {
                 }
             }
 
-            Ok(GroqDecision {
+            Ok((GroqDecision {
                 verdict,
                 rule,
                 mute_minutes,
                 reason,
-            })
+            }, elapsed_ms))
         } else {
             Err("Empty choices in response".to_string())
         }
