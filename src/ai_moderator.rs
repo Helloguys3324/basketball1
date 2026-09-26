@@ -399,46 +399,66 @@ impl AiModerator {
         let history = self.get_context_snapshot(ctx.channel_id);
 
         // 1B. High Score (>0.82 or severe category >0.70) ──────────────────────
-        // RE-CHECK EVEN >85% WITH FAST GUARD LLM TO PREVENT FALSE ACCIDENTAL DELETIONS
+        // NEVER BLINDLY DELETE ON RAW SCORE: ALWAYS PASS TO LLM GUARD FIRST
         if severe_score > OPENAI_CATEGORY_SEVERE_THRESHOLD || max_score > OPENAI_SEVERE_THRESHOLD {
             if !self.groq_keys.is_empty() {
-                let double_check_prompt = "You are a Senior Discord Community Safety Arbiter & False-Positive Guard.\n\
+                let double_check_prompt = "You are a Senior Discord Community Safety Arbiter & False-Positive Guard for a gaming Discord server.\n\
                     An automated classifier flagged this message with high severity.\n\
                     Analyze all message and user telemetry (account age, reply context, channel history, roles):\n\
-                    - If this is genuine toxic hate speech, targeted harassment, threat, or severe slur that must be removed -> DELETE\n\
-                    - If this is safe context (e.g. quote, song lyrics, mutual gaming banter, self-deprecation, reporting a bug) -> ALLOW\n\
-                    - If it is borderline ambiguous requiring human staff attention -> SUSPICIOUS\n\
+                    - ALLOW: Mutual gaming banter, friendly trash talk (e.g. 'im gonna obliterate you', 'die noob', 'trash team'), casual cursing among friends ('fuck you', 'stfu'), quoting lyrics/memes, game rage.\n\
+                    - SUSPICIOUS: Borderline hostility, personal heated argument, or ambiguous intent -> send for human moderator review.\n\
+                    - DELETE: ONLY genuine toxic attacks, real-world death/physical threats, doxxing, severe racial/ethnic slurs, encouraging suicide/self-harm ('kys').\n\
                     Format strictly:\n\
-                    VERDICT: [DELETE or ALLOW or SUSPICIOUS]\n\
+                    VERDICT: [ALLOW or DELETE or SUSPICIOUS]\n\
                     REASON: [under 12 words]";
 
                 let user_prompt = format!(
-                    "{}\nEvaluate all telemetry and determine: is this a true violation (DELETE), safe banter/quote (ALLOW), or needs staff review (SUSPICIOUS)?",
+                    "{}\nEvaluate all telemetry and determine: is this safe banter/quote (ALLOW), needs staff review (SUSPICIOUS), or true severe violation (DELETE)?",
                     self.format_telemetry(ctx, &history, max_score, &top_cat, &cat_breakdown)
                 );
 
-                if let Ok((verdict, reason)) = self.call_groq_failover(&self.groq_fast_model, double_check_prompt, &user_prompt).await {
-                    if verdict.contains("ALLOW") {
-                        // Prevented false deletion!
-                        return ModerationVerdict::Allow;
-                    } else if verdict.contains("SUSPICIOUS") {
-                        // Flag for human review instead of blind deletion
+                match self.call_groq_failover(&self.groq_fast_model, double_check_prompt, &user_prompt).await {
+                    Ok((verdict, reason)) => {
+                        if verdict.contains("ALLOW") {
+                            // Prevented false deletion of gaming banter!
+                            return ModerationVerdict::Allow;
+                        } else if verdict.contains("DELETE") {
+                            // Confirmed real-world threat or severe attack
+                            return ModerationVerdict::DeleteConfirmed {
+                                reason: format!("{}: {}", top_cat, reason),
+                                score: max_score,
+                                category: top_cat,
+                                model_used: format!("OpenAI + {} Guard", self.groq_fast_model),
+                            };
+                        } else {
+                            // SUSPICIOUS -> Send interactive card to staff channel instead of blind deletion!
+                            return ModerationVerdict::FlagSuspicious {
+                                reason: format!("High score ({:.2}), pending mod review: {}", max_score, reason),
+                                score: max_score,
+                                category: top_cat,
+                                model_used: format!("{} (Guard Checked)", self.groq_fast_model),
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[GROQ GUARD FAILOVER] Error: {}. Falling back to FlagSuspicious.", e);
+                        // If LLM unavailable, NEVER blindly auto-delete! Send to human moderators!
                         return ModerationVerdict::FlagSuspicious {
-                            reason: format!("High score ({:.2}), pending mod review: {}", max_score, reason),
+                            reason: format!("High score ({:.2}), pending mod review", max_score),
                             score: max_score,
                             category: top_cat,
-                            model_used: format!("{} (Guard Checked)", self.groq_fast_model),
+                            model_used: "OpenAI Guard (Pending Review)".to_string(),
                         };
                     }
                 }
             }
 
-            // Confirmed severe violation
-            return ModerationVerdict::DeleteConfirmed {
-                reason: format!("Severe violation: {} ({:.2})", top_cat, max_score),
+            // If no Groq keys, send to mod review instead of blind deletion
+            return ModerationVerdict::FlagSuspicious {
+                reason: format!("High score ({:.2}): pending staff review", max_score),
                 score: max_score,
                 category: top_cat,
-                model_used: format!("OpenAI + {} Guard", self.groq_fast_model),
+                model_used: "OpenAI (Pending Staff Review)".to_string(),
             };
         }
 
@@ -458,8 +478,8 @@ impl AiModerator {
         let system_prompt = "You are a Supreme Community Arbiter for a high-intensity gaming Discord server.\n\
             Your task is to review grey-zone flagged messages with complete conversation, identity, and channel telemetry.\n\
             Carefully distinguish between:\n\
-            - FRIENDLY_BANTER / GAMING_FRUSTRATION (ALLOW): Mutual joking, friendly trash-talk, complaining about game mechanics, quotes.\n\
-            - TARGETED_TOXICITY (DELETE): Malicious bullying, unprovoked toxic attacks, hate harassment, or doxxing.\n\
+            - FRIENDLY_BANTER / GAMING_FRUSTRATION (ALLOW): Mutual joking, friendly trash-talk ('im gonna obliterate you', 'noob', 'ez'), complaining about game mechanics, quotes, casual swearing ('fuck you').\n\
+            - TARGETED_TOXICITY (DELETE): Malicious bullying, unprovoked toxic attacks, hate harassment, real threats, or doxxing.\n\
             - AMBIGUOUS (SUSPICIOUS): Borderline or unclear intent where human staff judgment is needed.\n\
             Return strictly in this format:\n\
             VERDICT: [ALLOW or DELETE or SUSPICIOUS]\n\
