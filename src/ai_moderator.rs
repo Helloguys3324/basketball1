@@ -14,7 +14,7 @@ const OPENAI_SAFE_THRESHOLD: f64 = 0.45;
 const OPENAI_SEVERE_THRESHOLD: f64 = 0.82;
 const OPENAI_CATEGORY_SEVERE_THRESHOLD: f64 = 0.70;
 
-const MAX_CONTEXT_HISTORY: usize = 6;
+const MAX_CONTEXT_HISTORY: usize = 12;
 const MAX_CHANNELS_TRACKED: usize = 300;
 
 // Hostility markers for gamer chat analysis
@@ -89,13 +89,21 @@ pub struct ChatEntry {
 
 pub struct MessageContext<'a> {
     pub guild_id: Option<u64>,
+    pub guild_name: Option<String>,
     pub channel_id: u64,
+    pub channel_name: Option<String>,
     pub message_id: u64,
+    pub timestamp_unix: i64,
     pub author_name: &'a str,
     pub author_id: u64,
+    pub author_nick: Option<String>,
+    pub account_age_days: Option<u64>,
+    pub server_member_days: Option<u64>,
+    pub roles_count: usize,
     pub content: &'a str,
     pub reply_to: Option<(&'a str, u64, u64, &'a str)>, // (author_name, author_id, message_id, content)
-    pub mentions: &'a [u64],
+    pub mentions: &'a [(u64, String)], // (user_id, username)
+    pub attachments_info: &'a [String],
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +120,16 @@ pub enum ModerationVerdict {
         score: f64,
         category: String,
         model_used: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ImageModerationVerdict {
+    Clean,
+    NsfwDetected {
+        category: String,
+        score: f64,
+        details: String,
     },
 }
 
@@ -221,6 +239,11 @@ impl AiModerator {
         });
     }
 
+    pub fn get_history_count(&self, channel_id: u64) -> usize {
+        let history = self.chat_history.read().unwrap();
+        history.get(&channel_id).map(|q| q.len()).unwrap_or(0)
+    }
+
     fn get_context_snapshot(&self, channel_id: u64) -> Vec<ChatEntry> {
         let history = self.chat_history.read().unwrap();
         if let Some(queue) = history.get(&channel_id) {
@@ -267,6 +290,88 @@ impl AiModerator {
         has_pronoun || has_insult
     }
 
+    fn format_telemetry(
+        &self,
+        ctx: &MessageContext<'_>,
+        history: &[ChatEntry],
+        max_score: f64,
+        top_cat: &str,
+        cat_breakdown: &str,
+    ) -> String {
+        let mut p = String::with_capacity(3072);
+
+        p.push_str("=== 1. SERVER & CHANNEL TELEMETRY ===\n");
+        if let Some(gid) = ctx.guild_id {
+            let gname = ctx.guild_name.as_deref().unwrap_or("Server");
+            p.push_str(&format!("Server: {} (ID: {})\n", gname, gid));
+        } else {
+            p.push_str("Server: Direct Message\n");
+        }
+        let cname = ctx.channel_name.as_deref().unwrap_or("general");
+        p.push_str(&format!("Channel: #{} (ID: {})\n", cname, ctx.channel_id));
+
+        p.push_str("\n=== 2. AUTHOR IDENTITY & REPUTATION ===\n");
+        let nick_str = match &ctx.author_nick {
+            Some(n) => format!(" (Server Nickname: '{}')", n),
+            None => String::new(),
+        };
+        p.push_str(&format!("User: @{}{}, ID: {}\n", ctx.author_name, nick_str, ctx.author_id));
+
+        if let Some(age) = ctx.account_age_days {
+            let risk = if age < 7 {
+                " ⚠️ [HIGH RISK: Account created < 7 days ago!]"
+            } else if age < 30 {
+                " ⚠️ [MODERATE: New account < 30 days]"
+            } else {
+                " [Established account]"
+            };
+            p.push_str(&format!("Account Age: {} days{}\n", age, risk));
+        }
+        if let Some(joined) = ctx.server_member_days {
+            p.push_str(&format!("Server Member For: {} days (Roles count: {})\n", joined, ctx.roles_count));
+        } else if ctx.roles_count > 0 {
+            p.push_str(&format!("Roles count: {}\n", ctx.roles_count));
+        }
+
+        p.push_str("\n=== 3. TARGET MESSAGE TELEMETRY ===\n");
+        p.push_str(&format!("Message ID: {}\n", ctx.message_id));
+        p.push_str(&format!("Timestamp (Unix): {}\n", ctx.timestamp_unix));
+        p.push_str(&format!("Message Text: \"{}\"\n", ctx.content.trim()));
+
+        if let Some((rep_author, rep_id, rep_msg_id, rep_text)) = ctx.reply_to {
+            p.push_str(&format!(
+                "Replying To Message ID: {} by @{} (ID: {}): \"{}\"\n",
+                rep_msg_id, rep_author, rep_id, rep_text
+            ));
+        } else {
+            p.push_str("Replying To: (None / Standalone message)\n");
+        }
+
+        if !ctx.mentions.is_empty() {
+            let m_str: Vec<String> = ctx.mentions.iter().map(|(id, name)| format!("@{} (ID: {})", name, id)).collect();
+            p.push_str(&format!("Direct Mentions: {}\n", m_str.join(", ")));
+        } else {
+            p.push_str("Direct Mentions: (None)\n");
+        }
+
+        if !ctx.attachments_info.is_empty() {
+            p.push_str(&format!("Attached Files: {}\n", ctx.attachments_info.join(", ")));
+        } else {
+            p.push_str("Attached Files: (None)\n");
+        }
+
+        p.push_str("\n=== 4. AUTOMATED MODERATION SIGNALS (OpenAI omni-moderation) ===\n");
+        p.push_str(&format!("Highest Score: {:.2} (Top Category: '{}')\n", max_score, top_cat));
+        if !cat_breakdown.is_empty() {
+            p.push_str(&format!("Full Category Breakdown: {}\n", cat_breakdown));
+        }
+
+        p.push_str("\n=== 5. CHRONOLOGICAL RECENT CHANNEL MESSAGES ===\n");
+        p.push_str(&self.format_history(history));
+
+        p
+    }
+
     pub async fn check_message(&self, ctx: &MessageContext<'_>) -> ModerationVerdict {
         let trimmed = ctx.content.trim();
 
@@ -294,28 +399,25 @@ impl AiModerator {
         let history = self.get_context_snapshot(ctx.channel_id);
 
         // 1B. High Score (>0.82 or severe category >0.70) ──────────────────────
-        // RE-CHECK EVEN >85% WITH LLAMA 8B TO PREVENT FALSE ACCIDENTAL DELETIONS
+        // RE-CHECK EVEN >85% WITH FAST GUARD LLM TO PREVENT FALSE ACCIDENTAL DELETIONS
         if severe_score > OPENAI_CATEGORY_SEVERE_THRESHOLD || max_score > OPENAI_SEVERE_THRESHOLD {
             if !self.groq_keys.is_empty() {
-                let double_check_prompt = format!(
-                    "Automated filter flagged this message as potential extreme toxicity ({:.2}, category: {}).\n\
-                    Decide if this is genuine toxic hate speech/threat/severe slur (DELETE) or safe context like song lyrics, quote, self-deprecation, or banter (ALLOW/SUSPICIOUS).\n\
-                    Format EXACTLY:\n\
+                let double_check_prompt = "You are a Senior Discord Community Safety Arbiter & False-Positive Guard.\n\
+                    An automated classifier flagged this message with high severity.\n\
+                    Analyze all message and user telemetry (account age, reply context, channel history, roles):\n\
+                    - If this is genuine toxic hate speech, targeted harassment, threat, or severe slur that must be removed -> DELETE\n\
+                    - If this is safe context (e.g. quote, song lyrics, mutual gaming banter, self-deprecation, reporting a bug) -> ALLOW\n\
+                    - If it is borderline ambiguous requiring human staff attention -> SUSPICIOUS\n\
+                    Format strictly:\n\
                     VERDICT: [DELETE or ALLOW or SUSPICIOUS]\n\
-                    REASON: [under 10 words]",
-                    max_score, top_cat
-                );
+                    REASON: [under 12 words]";
 
                 let user_prompt = format!(
-                    "Chat Context:\n{}{}[Target message from @{} (ID: {})]: \"{}\"\nVerdict?",
-                    self.format_history(&history),
-                    self.format_reply(ctx.reply_to),
-                    ctx.author_name,
-                    ctx.author_id,
-                    trimmed
+                    "{}\nEvaluate all telemetry and determine: is this a true violation (DELETE), safe banter/quote (ALLOW), or needs staff review (SUSPICIOUS)?",
+                    self.format_telemetry(ctx, &history, max_score, &top_cat, &cat_breakdown)
                 );
 
-                if let Ok((verdict, reason)) = self.call_groq_failover(&self.groq_fast_model, &double_check_prompt, &user_prompt).await {
+                if let Ok((verdict, reason)) = self.call_groq_failover(&self.groq_fast_model, double_check_prompt, &user_prompt).await {
                     if verdict.contains("ALLOW") {
                         // Prevented false deletion!
                         return ModerationVerdict::Allow;
@@ -336,7 +438,7 @@ impl AiModerator {
                 reason: format!("Severe violation: {} ({:.2})", top_cat, max_score),
                 score: max_score,
                 category: top_cat,
-                model_used: "OpenAI + Llama 8B Guard".to_string(),
+                model_used: format!("OpenAI + {} Guard", self.groq_fast_model),
             };
         }
 
@@ -351,48 +453,26 @@ impl AiModerator {
             return ModerationVerdict::Allow;
         }
 
-        // ── 3. TIER 2: LLAMA 70B FOR GREY ZONE (TUNED TO THE ABSOLUTE MAXIMUM) ─
-        // Supplies Llama 70B with all recent chat history, IDs, reply targets, and OpenAI category breakdowns!
+        // ── 3. TIER 2: DEEP LLM FOR GREY ZONE (TUNED TO THE ABSOLUTE MAXIMUM) ──
+        // Supplies LLM with full server telemetry, IDs, reply targets, mentions, and OpenAI category breakdowns!
         let system_prompt = "You are a Supreme Community Arbiter for a high-intensity gaming Discord server.\n\
-            Your task is to review grey-zone flagged messages with complete conversation context.\n\
+            Your task is to review grey-zone flagged messages with complete conversation, identity, and channel telemetry.\n\
             Carefully distinguish between:\n\
-            - FRIENDLY_BANTER / GAMING_FRUSTRATION (ALLOW): Mutual joking, friendly trash-talk, complaining about game luck, meme quotes.\n\
+            - FRIENDLY_BANTER / GAMING_FRUSTRATION (ALLOW): Mutual joking, friendly trash-talk, complaining about game mechanics, quotes.\n\
             - TARGETED_TOXICITY (DELETE): Malicious bullying, unprovoked toxic attacks, hate harassment, or doxxing.\n\
+            - AMBIGUOUS (SUSPICIOUS): Borderline or unclear intent where human staff judgment is needed.\n\
             Return strictly in this format:\n\
-            VERDICT: [ALLOW or DELETE]\n\
+            VERDICT: [ALLOW or DELETE or SUSPICIOUS]\n\
             REASON: [precise explanation under 12 words]";
 
-        let mut user_prompt = String::with_capacity(2048);
-        user_prompt.push_str("=== CHRONOLOGICAL CHAT HISTORY ===\n");
-        user_prompt.push_str(&self.format_history(&history));
-
-        user_prompt.push_str("\n=== SUSPECT MESSAGE DETAILS ===\n");
-        if let Some(gid) = ctx.guild_id {
-            user_prompt.push_str(&format!("Guild ID: {}\n", gid));
-        }
-        user_prompt.push_str(&format!("Channel ID: {}\n", ctx.channel_id));
-        user_prompt.push_str(&format!("Message ID: {}\n", ctx.message_id));
-        user_prompt.push_str(&format!("Author: {} (ID: {})\n", ctx.author_name, ctx.author_id));
-
-        if let Some((rep_author, rep_author_id, rep_msg_id, rep_text)) = ctx.reply_to {
-            user_prompt.push_str(&format!(
-                "In Reply To Message ID: {} by {} (ID: {}): \"{}\"\n",
-                rep_msg_id, rep_author, rep_author_id, rep_text
-            ));
-        }
-
-        if !ctx.mentions.is_empty() {
-            let mentions_str: Vec<String> = ctx.mentions.iter().map(|id| format!("<@{}>", id)).collect();
-            user_prompt.push_str(&format!("Tagged Users: {}\n", mentions_str.join(", ")));
-        }
-
-        user_prompt.push_str(&format!("OpenAI Toxicity Score: {:.2} | Categories: {}\n", max_score, cat_breakdown));
-        user_prompt.push_str(&format!("Message Content: \"{}\"\n", trimmed));
-        user_prompt.push_str("\nAnalyze intent and context. What is your final verdict?");
+        let user_prompt = format!(
+            "{}\nAnalyze all telemetry, context, and intent. What is your final verdict?",
+            self.format_telemetry(ctx, &history, max_score, &top_cat, &cat_breakdown)
+        );
 
         match self.call_groq_failover(&self.groq_deep_model, system_prompt, &user_prompt).await {
             Ok((verdict, reason)) => {
-                if verdict.contains("DELETE") {
+                if verdict.contains("DELETE") || verdict.contains("SUSPICIOUS") {
                     // Send to mod alert with interactive buttons for 1-click execution
                     ModerationVerdict::FlagSuspicious {
                         reason,
@@ -421,14 +501,6 @@ impl AiModerator {
             ));
         }
         out
-    }
-
-    fn format_reply(&self, reply: Option<(&str, u64, u64, &str)>) -> String {
-        if let Some((author, author_id, msg_id, text)) = reply {
-            format!("[Replying to MsgID {} from @{} (ID: {})]: \"{}\"\n", msg_id, author, author_id, text)
-        } else {
-            String::new()
-        }
     }
 
     async fn call_openai_moderation(&self, api_key: &str, text: &str) -> Result<(f64, f64, String, String), reqwest::Error> {
@@ -480,6 +552,87 @@ impl AiModerator {
         }
     }
 
+    pub async fn check_image_bytes(&self, image_bytes: &[u8], mime_type: &str) -> ImageModerationVerdict {
+        let openai_key = match &self.openai_key {
+            Some(k) => k,
+            None => return ImageModerationVerdict::Clean,
+        };
+
+        use base64::Engine;
+        let b64 = base64::prelude::BASE64_STANDARD.encode(image_bytes);
+        let data_uri = format!("data:{};base64,{}", mime_type, b64);
+
+        let req_body = serde_json::json!({
+            "model": "omni-moderation-latest",
+            "input": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": data_uri
+                    }
+                }
+            ]
+        });
+
+        let resp = match self
+            .http_client
+            .post("https://api.openai.com/v1/moderations")
+            .header("Authorization", format!("Bearer {}", openai_key))
+            .header("Content-Type", "application/json")
+            .json(&req_body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[IMAGE MODERATION ERROR] Network: {}", e);
+                return ImageModerationVerdict::Clean;
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            eprintln!("[IMAGE MODERATION ERROR] Status {}: {}", status, err_text);
+            return ImageModerationVerdict::Clean;
+        }
+
+        let body: Result<OpenAiModResponse, _> = resp.json().await;
+        if let Ok(body) = body {
+            if let Some(first) = body.results.first() {
+                let sexual_score = *first.category_scores.get("sexual").unwrap_or(&0.0);
+                let minors_score = *first.category_scores.get("sexual/minors").unwrap_or(&0.0);
+                let gore_score = *first.category_scores.get("violence/graphic").unwrap_or(&0.0);
+
+                if minors_score > 0.35 {
+                    return ImageModerationVerdict::NsfwDetected {
+                        category: "sexual/minors".to_string(),
+                        score: minors_score,
+                        details: format!("Exploitation / minor safety violation ({:.2})", minors_score),
+                    };
+                }
+
+                if sexual_score > 0.65 {
+                    return ImageModerationVerdict::NsfwDetected {
+                        category: "sexual (NSFW)".to_string(),
+                        score: sexual_score,
+                        details: format!("Pornographic / explicit nudity content ({:.2})", sexual_score),
+                    };
+                }
+
+                if gore_score > 0.70 {
+                    return ImageModerationVerdict::NsfwDetected {
+                        category: "violence/graphic (Gore)".to_string(),
+                        score: gore_score,
+                        details: format!("Graphic gore / extreme violence ({:.2})", gore_score),
+                    };
+                }
+            }
+        }
+
+        ImageModerationVerdict::Clean
+    }
+
     async fn call_groq_failover(
         &self,
         model: &str,
@@ -491,11 +644,13 @@ impl AiModerator {
             return Err("No Groq keys configured".to_string());
         }
 
-        let models_to_try = if model != "qwen/qwen3.8-27b" {
-            vec![model, "qwen/qwen3.8-27b"]
-        } else {
-            vec![model]
-        };
+        let mut models_to_try = vec![model];
+        if !models_to_try.contains(&"qwen/qwen3.8-27b") {
+            models_to_try.push("qwen/qwen3.8-27b");
+        }
+        if !models_to_try.contains(&"openai/gpt-oss-120b") {
+            models_to_try.push("openai/gpt-oss-120b");
+        }
 
         let start_idx = self.groq_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
         for target_model in models_to_try {
@@ -533,7 +688,7 @@ impl AiModerator {
                     content: user_prompt.to_string(),
                 },
             ],
-            max_tokens: 45,
+            max_tokens: 120,
             temperature: 0.0,
         };
 
@@ -556,16 +711,32 @@ impl AiModerator {
         let body: GroqChatResponse = resp.json().await.map_err(|e| format!("JSON decode error: {}", e))?;
         if let Some(choice) = body.choices.first() {
             let text = &choice.message.content;
-            let mut verdict = "ALLOW".to_string();
-            let mut reason = "Context Analysis".to_string();
+            let upper = text.to_uppercase();
+            let mut verdict = String::new();
+            let mut reason = String::new();
 
             for line in text.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("VERDICT:") {
-                    verdict = trimmed.replace("VERDICT:", "").trim().to_uppercase();
-                } else if trimmed.starts_with("REASON:") {
-                    reason = trimmed.replace("REASON:", "").trim().to_string();
+                let upper_line = trimmed.to_uppercase();
+                if upper_line.starts_with("VERDICT:") {
+                    verdict = trimmed["VERDICT:".len()..].trim().to_uppercase();
+                } else if upper_line.starts_with("REASON:") {
+                    reason = trimmed["REASON:".len()..].trim().to_string();
                 }
+            }
+
+            if verdict.is_empty() {
+                if upper.contains("DELETE") {
+                    verdict = "DELETE".to_string();
+                } else if upper.contains("SUSPICIOUS") {
+                    verdict = "SUSPICIOUS".to_string();
+                } else {
+                    verdict = "ALLOW".to_string();
+                }
+            }
+
+            if reason.is_empty() {
+                reason = "Context telemetry evaluation".to_string();
             }
 
             Ok((verdict, reason))
@@ -613,14 +784,22 @@ mod tests {
         let client = reqwest::Client::new();
         let moderator = AiModerator::new(client);
         let ctx = MessageContext {
-            guild_id: None,
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
             channel_id: 1,
+            channel_name: Some("general".to_string()),
             message_id: 2,
+            timestamp_unix: 1727376000,
             author_name: "Machi",
             author_id: 12345,
+            author_nick: Some("MachiPro".to_string()),
+            account_age_days: Some(3),
+            server_member_days: Some(1),
+            roles_count: 1,
             content: "you should die noob",
             reply_to: None,
             mentions: &[],
+            attachments_info: &[],
         };
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for 'you should die noob': {:?}\n", verdict);

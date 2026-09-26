@@ -770,6 +770,24 @@ impl EventHandler for Handler {
 
         // ── 0. AI TEXT MODERATION (Runs before / in parallel to image scan) ──
         if !msg.content.trim().is_empty() {
+            // Pre-fill channel context history from Discord if local buffer is empty (e.g. fresh reboot)
+            if self.ai_moderator.get_history_count(msg.channel_id.get()) < 3 {
+                let get_msgs = serenity::builder::GetMessages::new().before(msg.id).limit(10);
+                if let Ok(recent) = msg.channel_id.messages(&ctx.http, get_msgs).await {
+                    for m in recent.into_iter().rev() {
+                        if !m.content.trim().is_empty() {
+                            self.ai_moderator.record_message(
+                                m.channel_id.get(),
+                                m.id.get(),
+                                m.author.id.get(),
+                                &m.author.name,
+                                &m.content,
+                            );
+                        }
+                    }
+                }
+            }
+
             let reply_to = msg.referenced_message.as_ref().map(|ref_msg| {
                 (
                     ref_msg.author.name.as_str(),
@@ -779,17 +797,72 @@ impl EventHandler for Handler {
                 )
             });
 
-            let mentions: Vec<u64> = msg.mentions.iter().map(|u| u.id.get()).collect();
+            let mentions: Vec<(u64, String)> = msg
+                .mentions
+                .iter()
+                .map(|u| (u.id.get(), u.name.clone()))
+                .collect();
+
+            let attachments_info: Vec<String> = msg
+                .attachments
+                .iter()
+                .map(|a| format!("{} ({} KB, {})", a.filename, a.size / 1024, a.content_type.as_deref().unwrap_or("unknown")))
+                .collect();
+
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let created_secs = msg.author.id.created_at().unix_timestamp();
+            let account_age_days = if now_secs > created_secs {
+                Some(((now_secs - created_secs) / 86400) as u64)
+            } else {
+                Some(0)
+            };
+
+            let server_member_days = msg
+                .member
+                .as_ref()
+                .and_then(|m| m.joined_at)
+                .map(|ts| {
+                    let join_secs = ts.unix_timestamp();
+                    if now_secs > join_secs {
+                        ((now_secs - join_secs) / 86400) as u64
+                    } else {
+                        0
+                    }
+                });
+
+            let author_nick = msg.member.as_ref().and_then(|m| m.nick.clone());
+            let roles_count = msg.member.as_ref().map(|m| m.roles.len()).unwrap_or(0);
+
+            let (guild_name, channel_name) = if let Some(gid) = msg.guild_id {
+                let g = ctx.cache.guild(gid);
+                let gname = g.as_ref().map(|guild| guild.name.clone());
+                let cname = g.as_ref().and_then(|guild| guild.channels.get(&msg.channel_id).map(|c| c.name.clone()));
+                (gname, cname)
+            } else {
+                (None, None)
+            };
 
             let msg_ctx = ai_moderator::MessageContext {
                 guild_id: msg.guild_id.map(|g| g.get()),
+                guild_name,
                 channel_id: msg.channel_id.get(),
+                channel_name,
                 message_id: msg.id.get(),
+                timestamp_unix: msg.timestamp.unix_timestamp(),
                 author_name: &msg.author.name,
                 author_id: msg.author.id.get(),
+                author_nick,
+                account_age_days,
+                server_member_days,
+                roles_count,
                 content: &msg.content,
                 reply_to,
                 mentions: &mentions,
+                attachments_info: &attachments_info,
             };
 
             let verdict = self.ai_moderator.check_message(&msg_ctx).await;
@@ -965,6 +1038,84 @@ impl EventHandler for Handler {
                 Ok(d) => d,
                 Err(_) => continue,
             };
+
+            // ── AI NSFW / Porn Image Scanner (OpenAI Multimodal Moderation) ───
+            let mime_type = if img_url.ends_with(".png") {
+                "image/png"
+            } else if img_url.ends_with(".webp") {
+                "image/webp"
+            } else if img_url.ends_with(".gif") {
+                "image/gif"
+            } else {
+                "image/jpeg"
+            };
+
+            let nsfw_verdict = self.ai_moderator.check_image_bytes(&data, mime_type).await;
+            if let ai_moderator::ImageModerationVerdict::NsfwDetected { category, score, details } = nsfw_verdict {
+                println!(
+                    "\n🔞 [NSFW DETECTED] User: {} ({}) | Channel: {}\n   Category: {} | Score: {:.2} | Details: {}",
+                    msg.author.name, msg.author.id, msg.channel_id, category, score, details
+                );
+
+                if AUTO_DELETE {
+                    let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
+                }
+
+                if WARN_USER_IN_CHAT {
+                    let warn_text = format!(
+                        "🛡️ **Auto-Moderator:** <@{}>, your message was removed: NSFW / Explicit content is not allowed (`{}`).",
+                        msg.author.id, category
+                    );
+                    if let Ok(warn_msg) = msg.channel_id.say(&ctx.http, &warn_text).await {
+                        let http = ctx.http.clone();
+                        let channel_id = msg.channel_id;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(WARN_EXPIRE_SECONDS)).await;
+                            let _ = channel_id.delete_message(&http, warn_msg.id).await;
+                        });
+                    }
+                }
+
+                if let Some(mod_chan) = self.config.get_mod_channel() {
+                    mod_actions::send_mod_alert(
+                        &ctx.http,
+                        mod_chan,
+                        msg.guild_id,
+                        msg.author.id,
+                        &msg.author.name,
+                        msg.channel_id,
+                        msg.id,
+                        "[NSFW / Explicit Image Upload]",
+                        "🔞 AI ALERT: NSFW / PORN DETECTED (AUTO-DELETED)",
+                        true,
+                        &details,
+                        score,
+                        &category,
+                        "OpenAI Multimodal omni-moderation",
+                    ).await;
+                }
+
+                if AUTO_TIMEOUT_MINUTES > 0 {
+                    if let Some(guild_id) = msg.guild_id {
+                        if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                            let now_secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
+                            let until_secs = now_secs + (AUTO_TIMEOUT_MINUTES as i64 * 60);
+                            if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
+                                let builder =
+                                    EditMember::new().disable_communication_until_datetime(ts);
+                                let _ = guild_id
+                                    .edit_member(&ctx.http, msg.author.id, builder)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                break;
+            }
 
             // Decode image (PNG, JPEG, GIF)
             let img = match image::load_from_memory(&data) {
