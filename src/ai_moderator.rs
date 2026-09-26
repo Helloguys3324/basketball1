@@ -44,8 +44,15 @@ const TARGET_INSULTS: &[&str] = &[
 ];
 
 const GAMING_SAFE_SUBSTRINGS: &[&str] = &[
-    "kill boss", "kill him", "he killed me", "i died", "dead game", "headshot",
-    "killstreak", "damage", "убей его", "меня убили", "убили босса", "взорви", "задави"
+    "kill boss", "boss killed me", "he killed me in match", "i died", "dead game", "headshot",
+    "killstreak", "damage", "меня убили", "убили босса", "взорви босса"
+];
+
+const GAME_SHIELD_PATTERNS: &[&str] = &[
+    "in minecraft", "in roblox", "in game", "in-game", "ingame", "in cs", "in csgo", "in rust",
+    "in gta", "in valorant", "in fortnite", "in dota", "in tf2",
+    "в майнкрафте", "в роблоксе", "в игре", "в кс", "в расте", "в гта", "в доте",
+    "в реале а не в игре", "по игре"
 ];
 
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
@@ -54,11 +61,17 @@ Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
 2.Mod(15-30m):Bait,disruptive,NSFW ref,bypass,drama\n\
 3.Major(60-120m):Impersonation,harassment,threats to members,ads,doxx\n\
 4.Crit(720-1440m):Hate/slurs,death threats('kys','you should die'),gore,raid,cheats\n\
-GAMING BANTER / HYPERBOLE (ALLOW, RULE:None, MUTE_MINUTES:0):\n\
-- Trash-talk & playful challenges: 'im gonna hurt you', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game'\n\
+SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
+- GENUINE BANTER (ALLOW, RULE:None, MUTE:0):\n\
+  Boasting strictly about match/skill: '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash'\n\
+- FAKE-GAME SHIELD EVASION (PUNISH STRICTLY - SUSPICIOUS/DELETE):\n\
+  Trolls append game names ('in minecraft', 'in roblox', 'in game', '1v1') to disguise real toxicity, suicide incitement, or death threats.\n\
+  * Suicide / Death wishes disguised with games ('kys in minecraft', 'die in roblox', 'kill yourself in game', 'hang yourself in cs') -> SUSPICIOUS(60m) or DELETE(120m)\n\
+  * Real-world violence / doxxing disguised as game ('burn your house in rust', 'i will find where you live in game', 'Mizuri will be burned in minecraft') -> DELETE(120m)\n\
+  * Cancer / severe malice wishes ('get cancer in game', 'hope you die in cs') -> SUSPICIOUS(30m)\n\
 REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
-- Threats naming users (or short nicknames from chat like 'miz' for 'Mizuri') or with dates/methods: 'X will be burned alive', 'im gonna hunt X down' -> DELETE(120m)\n\
-- Direct death wishes/suicide: 'you should die noob', 'die idiot', 'kys' -> SUSPICIOUS(30m)\n\
+- Threats naming users (or short nicknames like 'miz' for 'Mizuri') or with dates/methods -> DELETE(120m)\n\
+- Direct death wishes/suicide: 'kys', 'you should die', 'die idiot' -> SUSPICIOUS(30m)\n\
 - Credible real-world threats with doxxing/stalking: 'i know where you live' -> DELETE(120m)\n\
 Format strictly:\n\
 VERDICT:[ALLOW|SUSPICIOUS|DELETE]\n\
@@ -304,6 +317,28 @@ impl AiModerator {
             return true;
         }
         let lower = trimmed.to_lowercase();
+
+        // Never fast-whitelist if there are insult markers, game shield patterns, or severe malice
+        if TARGET_INSULTS.iter().any(|i| lower.contains(i))
+            || GAME_SHIELD_PATTERNS.iter().any(|p| lower.contains(p))
+            || lower.contains("kys")
+            || lower.contains("burn alive")
+            || lower.contains("burned alive")
+            || lower.contains("cancer")
+            || lower.contains("doxx")
+            || lower.contains("leak")
+            || lower.contains("swat")
+            || lower.contains("hang")
+            || lower.contains("minecraft")
+            || lower.contains("roblox")
+            || lower.contains("майнкрафт")
+            || lower.contains("роблокс")
+            || lower.contains("сдохни")
+            || lower.contains("вскройся")
+        {
+            return false;
+        }
+
         let words: Vec<&str> = lower.split_whitespace().collect();
         if words.len() <= 2 && trimmed.len() <= 12 && !trimmed.contains("<@") {
             if matches!(lower.as_str(), "gg" | "ez" | "lol" | "lmao" | "bruh" | "wtf" | "no" | "yes" | "ok" | "nice" | "w" | "l" | "gl" | "hf" | "wp" | "afk" | "brb" | "o7" | "rip" | "f" | "omg" | "idk" | "kek" | "кринж" | "база" | "пон" | "лол" | "кек" | "гг" | "имба" | "хз" | "пж" | "спс" | "жесть" | "краш") {
@@ -316,6 +351,33 @@ impl AiModerator {
             }
         }
         false
+    }
+
+    fn is_game_shield_evasion(content: &str) -> bool {
+        let lower = content.to_lowercase();
+        let has_shield = GAME_SHIELD_PATTERNS.iter().any(|p| lower.contains(p))
+            || lower.contains("minecraft")
+            || lower.contains("roblox")
+            || lower.contains("майнкрафт")
+            || lower.contains("роблокс");
+        if !has_shield {
+            return false;
+        }
+        let has_hostility = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k))
+            || TARGET_INSULTS.iter().any(|i| lower.contains(i))
+            || lower.contains("kys")
+            || lower.contains("die")
+            || lower.contains("cancer")
+            || lower.contains("doxx")
+            || lower.contains("leak")
+            || lower.contains("ip")
+            || lower.contains("swat")
+            || lower.contains("hang")
+            || lower.contains("сожгу")
+            || lower.contains("сдохни")
+            || lower.contains("рак")
+            || lower.contains("вскройся");
+        has_hostility
     }
 
     fn is_directed_or_targeted(content: &str, has_reply: bool, mentions: &[(u64, String)], history: &[ChatEntry]) -> bool {
@@ -386,6 +448,7 @@ impl AiModerator {
         history: &[ChatEntry],
         max_score: f64,
         top_cat: &str,
+        is_game_shield: bool,
     ) -> String {
         let mut p = String::with_capacity(512);
 
@@ -408,6 +471,9 @@ impl AiModerator {
             p.push_str(&format!("Replying to: @{}: \"{}\"\n", rep_author, short_rep.trim()));
         }
         p.push_str(&format!("OpenAI Flag: {} (score: {:.2})\n", top_cat, max_score));
+        if is_game_shield {
+            p.push_str("⚠️ EVASION ALERT: Message uses game shield ('in minecraft/roblox/game') to disguise toxicity/threats! Do NOT excuse death wishes, suicide or harassment as banter.\n");
+        }
         p
     }
 
@@ -433,10 +499,15 @@ impl AiModerator {
         let history = self.get_context_snapshot(ctx.channel_id);
         let lower = trimmed.to_lowercase();
         let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
+        let is_game_shield = Self::is_game_shield_evasion(trimmed);
         let is_violent_category = matches!(
             top_cat.as_str(),
             "violence" | "violence/graphic" | "self-harm" | "self-harm/intent" | "self-harm/instructions" | "hate" | "hate/threatening" | "harassment/threatening"
         );
+
+        if is_game_shield {
+            println!("   🕵️ [GAME SHIELD DETECTED] Potential veiled toxicity/threat hiding behind game titles!");
+        }
 
         println!(
             "\n🔍 [AI SCANNER] Channel: #{} | Author: @{} ({}) | Text: \"{}\"",
@@ -453,23 +524,24 @@ impl AiModerator {
             cat_breakdown
         );
 
-        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords)
-        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword {
+        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords and no game shield evasion)
+        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !is_game_shield {
             println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
             return ModerationVerdict::Allow;
         }
 
         let is_directed = Self::is_directed_or_targeted(trimmed, ctx.reply_to.is_some(), ctx.mentions, &history);
 
-        // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore/Threats vs Fast Guard for Banter ──
+        // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore/Threats/Evasions vs Fast Guard for Banter ──
         let is_hardcore_or_drama = severe_score > 0.65
             || max_score > 0.78
             || (ctx.reply_to.is_some() && max_score > 0.55)
             || has_severe_harm_keyword
-            || is_violent_category;
+            || is_violent_category
+            || is_game_shield;
 
         let preferred_model = if is_hardcore_or_drama {
-            &self.groq_deep_model // openai/gpt-oss-120b (120B reasoning model for drama, threats & complex context)
+            &self.groq_deep_model // openai/gpt-oss-120b (120B reasoning model for drama, threats, evasions & complex context)
         } else {
             &self.groq_fast_model // qwen/qwen3.8-27b (27B ultra-fast for quick banter & standard flags)
         };
@@ -485,7 +557,7 @@ impl AiModerator {
                     history.len(),
                     if is_hardcore_or_drama { "120B Deep Reasoning" } else { "27B Fast Guard" }
                 );
-                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
+                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield);
 
                 match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
                     Ok((decision, model_used, elapsed_ms)) => {
@@ -559,7 +631,7 @@ impl AiModerator {
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
         // ONLY bypass if it's general non-violent gaming frustration (e.g. "fuck this lag")
-        if !is_directed && !is_violent_category && !has_severe_harm_keyword && max_score < 0.60 {
+        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !is_game_shield && max_score < 0.60 {
             println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
@@ -576,7 +648,7 @@ impl AiModerator {
             history.len(),
             is_directed
         );
-        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat);
+        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield);
 
         match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
             Ok((decision, model_used, elapsed_ms)) => {
@@ -919,6 +991,25 @@ mod tests {
         assert!(AiModerator::is_directed_or_targeted("mizu should leave", false, &[], &history));
         assert!(AiModerator::is_directed_or_targeted("Mizuri will be burned alive", false, &[], &[]));
         assert!(!AiModerator::is_directed_or_targeted("fuck this lag", false, &[], &[]));
+    }
+
+    #[test]
+    fn test_is_game_shield_evasion() {
+        // Evasions that hide behind game context:
+        assert!(AiModerator::is_game_shield_evasion("kys in minecraft"));
+        assert!(AiModerator::is_game_shield_evasion("you should die in roblox"));
+        assert!(AiModerator::is_game_shield_evasion("hang yourself in cs"));
+        assert!(AiModerator::is_game_shield_evasion("i will burn your house in rust"));
+        assert!(AiModerator::is_game_shield_evasion("сдохни в майнкрафте"));
+        assert!(AiModerator::is_game_shield_evasion("сожгу тебя в роблоксе"));
+        assert!(AiModerator::is_game_shield_evasion("вскройся в игре"));
+
+        // Genuine gaming chatter / banter should NOT be flagged as game-shield evasion:
+        assert!(!AiModerator::is_game_shield_evasion("1v1 me on mid"));
+        assert!(!AiModerator::is_game_shield_evasion("im gonna destroy you in 1v1"));
+        assert!(!AiModerator::is_game_shield_evasion("let's play minecraft together"));
+        assert!(!AiModerator::is_game_shield_evasion("gg ez game"));
+        assert!(!AiModerator::is_game_shield_evasion("kill boss in raid"));
     }
 
     #[test]
