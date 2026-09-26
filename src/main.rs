@@ -905,12 +905,12 @@ impl EventHandler for Handler {
                             }
                         }
                         if applied {
-                            format!("🔇 Выдан таймаут на {} мин. по правилу: **{}** (ИИ-чуйка подсказала наказать нарушителя!)", mute_minutes, rule_violated)
+                            format!("🔇 Timed out for {} min under rule: **{}** (AI intuition called for action!)", mute_minutes, rule_violated)
                         } else {
-                            format!("🗑️ Сообщение удалено по правилу: **{}** (Иммунитет/ошибка таймаута)", rule_violated)
+                            format!("🗑️ Message removed under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
                         }
                     } else {
-                        format!("🗑️ Сообщение удалено по правилу: **{}** (ИИ-чуйка подсказала ограничиться предупреждением без мута)", rule_violated)
+                        format!("🗑️ Message removed under rule: **{}** (AI intuition issued a warning without timeout)", rule_violated)
                     };
 
                     if WARN_USER_IN_CHAT {
@@ -1004,12 +1004,12 @@ impl EventHandler for Handler {
                             }
                         }
                         if applied {
-                            format!("🔇 Выдан таймаут на {} мин. по правилу: **{}** (ИИ-чуйка подсказала наказать нарушителя!)", mute_minutes, rule_violated)
+                            format!("🔇 Timed out for {} min under rule: **{}** (AI intuition called for action!)", mute_minutes, rule_violated)
                         } else {
-                            format!("🗑️ Сообщение удалено по правилу: **{}** (Иммунитет/ошибка таймаута)", rule_violated)
+                            format!("🗑️ Message removed under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
                         }
                     } else {
-                        format!("🗑️ Сообщение удалено по правилу: **{}** (ИИ-чуйка подсказала ограничиться предупреждением без мута)", rule_violated)
+                        format!("🗑️ Message removed under rule: **{}** (AI intuition issued a warning without timeout)", rule_violated)
                     };
 
                     if WARN_USER_IN_CHAT {
@@ -1174,7 +1174,7 @@ impl EventHandler for Handler {
                     }
                 }
 
-                let mut action_taken = "🔞 Изображение удалено (NSFW / Porn)".to_string();
+                let mut action_taken = "🔞 Image removed (NSFW / Explicit content)".to_string();
                 if AUTO_TIMEOUT_MINUTES > 0 {
                     if let Some(guild_id) = msg.guild_id {
                         if !is_administrator(&ctx, guild_id, msg.author.id).await {
@@ -1192,7 +1192,7 @@ impl EventHandler for Handler {
                                     .is_ok()
                                 {
                                     action_taken = format!(
-                                        "🔇 Выдан таймаут на {} мин. за NSFW / порнографию (ИИ-чуйка подсказала наказать нарушителя!)",
+                                        "🔇 Timed out for {} min for NSFW / explicit content (AI intuition called for action!)",
                                         AUTO_TIMEOUT_MINUTES
                                     );
                                 }
