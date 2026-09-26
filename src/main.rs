@@ -873,21 +873,58 @@ impl EventHandler for Handler {
                     score,
                     category,
                     model_used,
+                    rule_violated,
+                    mute_minutes,
                 } => {
                     println!(
-                        "\n🚨 [AI MODERATOR: DELETED] Channel: {} | User: {} ({}) | Score: {:.2} | Reason: {} | Msg: \"{}\"",
-                        msg.channel_id, msg.author.name, msg.author.id, score, reason, msg.content
+                        "\n🚨 [AI MODERATOR: DELETED] Channel: {} | User: {} ({}) | Rule: {} | Mute: {}m | Score: {:.2} | Reason: {} | Msg: \"{}\"",
+                        msg.channel_id, msg.author.name, msg.author.id, rule_violated, mute_minutes, score, reason, msg.content
                     );
 
                     if AUTO_DELETE {
                         let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
                     }
 
+                    // Apply Discord Timeout if mute_minutes > 0 (and user is not admin/creator)
+                    let action_taken = if mute_minutes > 0 {
+                        let mut applied = false;
+                        if let Some(guild_id) = msg.guild_id {
+                            if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                                let now_secs = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs() as i64;
+                                let until_secs = now_secs + (mute_minutes as i64 * 60);
+                                if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
+                                    let builder =
+                                        EditMember::new().disable_communication_until_datetime(ts);
+                                    if guild_id.edit_member(&ctx.http, msg.author.id, builder).await.is_ok() {
+                                        applied = true;
+                                    }
+                                }
+                            }
+                        }
+                        if applied {
+                            format!("🔇 Выдан таймаут на {} мин. по правилу: **{}** (ИИ-чуйка подсказала наказать нарушителя!)", mute_minutes, rule_violated)
+                        } else {
+                            format!("🗑️ Сообщение удалено по правилу: **{}** (Иммунитет/ошибка таймаута)", rule_violated)
+                        }
+                    } else {
+                        format!("🗑️ Сообщение удалено по правилу: **{}** (ИИ-чуйка подсказала ограничиться предупреждением без мута)", rule_violated)
+                    };
+
                     if WARN_USER_IN_CHAT {
-                        let warn_text = format!(
-                            "🛡️ **Auto-Moderator:** <@{}>, your message was removed ({}).",
-                            msg.author.id, reason
-                        );
+                        let warn_text = if mute_minutes > 0 {
+                            format!(
+                                "🛡️ **Auto-Moderator:** <@{}>, your message was removed and you received a {}m timeout (Rule: {}).",
+                                msg.author.id, mute_minutes, rule_violated
+                            )
+                        } else {
+                            format!(
+                                "🛡️ **Auto-Moderator:** <@{}>, your message was removed ({}).",
+                                msg.author.id, reason
+                            )
+                        };
                         if let Ok(warn_msg) = msg.channel_id.say(&ctx.http, &warn_text).await {
                             let http = ctx.http.clone();
                             let channel_id = msg.channel_id;
@@ -910,6 +947,7 @@ impl EventHandler for Handler {
                             &msg.content,
                             "🚨 AI ALERT: SEVERE VIOLATION (AUTO-DELETED)",
                             true,
+                            &action_taken,
                             &reason,
                             score,
                             &category,
@@ -926,10 +964,12 @@ impl EventHandler for Handler {
                     score,
                     category,
                     model_used,
+                    rule_violated,
+                    mute_minutes,
                 } => {
                     println!(
-                        "\n⚠️ [AI MODERATOR: SUSPICIOUS (AUTO-DELETED)] Channel: {} | User: {} ({}) | Score: {:.2} | Reason: {} | Msg: \"{}\"",
-                        msg.channel_id, msg.author.name, msg.author.id, score, reason, msg.content
+                        "\n⚠️ [AI MODERATOR: SUSPICIOUS (AUTO-DELETED)] Channel: {} | User: {} ({}) | Rule: {} | Mute: {}m | Score: {:.2} | Reason: {} | Msg: \"{}\"",
+                        msg.channel_id, msg.author.name, msg.author.id, rule_violated, mute_minutes, score, reason, msg.content
                     );
 
                     self.ai_moderator.record_message(
@@ -944,11 +984,46 @@ impl EventHandler for Handler {
                         let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
                     }
 
+                    // Apply Discord Timeout if mute_minutes > 0 (and user is not admin/creator)
+                    let action_taken = if mute_minutes > 0 {
+                        let mut applied = false;
+                        if let Some(guild_id) = msg.guild_id {
+                            if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                                let now_secs = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs() as i64;
+                                let until_secs = now_secs + (mute_minutes as i64 * 60);
+                                if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
+                                    let builder =
+                                        EditMember::new().disable_communication_until_datetime(ts);
+                                    if guild_id.edit_member(&ctx.http, msg.author.id, builder).await.is_ok() {
+                                        applied = true;
+                                    }
+                                }
+                            }
+                        }
+                        if applied {
+                            format!("🔇 Выдан таймаут на {} мин. по правилу: **{}** (ИИ-чуйка подсказала наказать нарушителя!)", mute_minutes, rule_violated)
+                        } else {
+                            format!("🗑️ Сообщение удалено по правилу: **{}** (Иммунитет/ошибка таймаута)", rule_violated)
+                        }
+                    } else {
+                        format!("🗑️ Сообщение удалено по правилу: **{}** (ИИ-чуйка подсказала ограничиться предупреждением без мута)", rule_violated)
+                    };
+
                     if WARN_USER_IN_CHAT {
-                        let warn_text = format!(
-                            "🛡️ **Auto-Moderator:** <@{}>, your message was removed for review ({}).",
-                            msg.author.id, reason
-                        );
+                        let warn_text = if mute_minutes > 0 {
+                            format!(
+                                "🛡️ **Auto-Moderator:** <@{}>, your message was removed for review and you received a {}m timeout (Rule: {}).",
+                                msg.author.id, mute_minutes, rule_violated
+                            )
+                        } else {
+                            format!(
+                                "🛡️ **Auto-Moderator:** <@{}>, your message was removed for review ({}).",
+                                msg.author.id, reason
+                            )
+                        };
                         if let Ok(warn_msg) = msg.channel_id.say(&ctx.http, &warn_text).await {
                             let http = ctx.http.clone();
                             let channel_id = msg.channel_id;
@@ -971,6 +1046,7 @@ impl EventHandler for Handler {
                             &msg.content,
                             "⚠️ AI ALERT: SUSPICIOUS (AUTO-DELETED - PENDING MOD REVIEW)",
                             true,
+                            &action_taken,
                             &reason,
                             score,
                             &category,
@@ -1098,6 +1174,33 @@ impl EventHandler for Handler {
                     }
                 }
 
+                let mut action_taken = "🔞 Изображение удалено (NSFW / Porn)".to_string();
+                if AUTO_TIMEOUT_MINUTES > 0 {
+                    if let Some(guild_id) = msg.guild_id {
+                        if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                            let now_secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
+                            let until_secs = now_secs + (AUTO_TIMEOUT_MINUTES as i64 * 60);
+                            if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
+                                let builder =
+                                    EditMember::new().disable_communication_until_datetime(ts);
+                                if guild_id
+                                    .edit_member(&ctx.http, msg.author.id, builder)
+                                    .await
+                                    .is_ok()
+                                {
+                                    action_taken = format!(
+                                        "🔇 Выдан таймаут на {} мин. за NSFW / порнографию (ИИ-чуйка подсказала наказать нарушителя!)",
+                                        AUTO_TIMEOUT_MINUTES
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(mod_chan) = self.config.get_mod_channel() {
                     mod_actions::send_mod_alert(
                         &ctx.http,
@@ -1110,30 +1213,12 @@ impl EventHandler for Handler {
                         "[NSFW / Explicit Image Upload]",
                         "🔞 AI ALERT: NSFW / PORN DETECTED (AUTO-DELETED)",
                         true,
+                        &action_taken,
                         &details,
                         score,
                         &category,
                         "OpenAI Multimodal omni-moderation",
                     ).await;
-                }
-
-                if AUTO_TIMEOUT_MINUTES > 0 {
-                    if let Some(guild_id) = msg.guild_id {
-                        if !is_administrator(&ctx, guild_id, msg.author.id).await {
-                            let now_secs = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as i64;
-                            let until_secs = now_secs + (AUTO_TIMEOUT_MINUTES as i64 * 60);
-                            if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
-                                let builder =
-                                    EditMember::new().disable_communication_until_datetime(ts);
-                                let _ = guild_id
-                                    .edit_member(&ctx.http, msg.author.id, builder)
-                                    .await;
-                            }
-                        }
-                    }
                 }
 
                 break;

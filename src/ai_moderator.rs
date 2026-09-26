@@ -33,6 +33,58 @@ const GAMING_SAFE_SUBSTRINGS: &[&str] = &[
     "killstreak", "damage", "убей его", "меня убили", "убили босса", "взорви", "задави"
 ];
 
+pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
+You are the Supreme Server Arbiter enforcing the official server rulebook with graduated punishments:\n\n\
+SERVER RULES & PUNISHMENT SCALE:\n\
+1. MINOR (MUTE_MINUTES: 5-10, or 0 if single minor instance):\n\
+- Chaining/Spamming/Flooding (text walls, copypastas)\n\
+- Channel Misuse (bot commands in general, off topic in commands)\n\
+- Mild Toxicity (disrupting server environment, pointless arguing)\n\
+- Ghost-pinging / Shitpinging / Excessive Shitpinging\n\
+- Voice Chat Abuse\n\
+- Bot Abuse\n\n\
+2. MODERATE (MUTE_MINUTES: 15-30):\n\
+- Encouraging Members to Break Rules (baiting)\n\
+- Disruptive Behavior (escalating useless arguments beyond needed scope)\n\
+- NSFW References (oversexualisation, cropped nsfw pfp, suggestive remarks)\n\
+- XP Farming\n\
+- Bypassing (evading blocked words/phrases)\n\
+- Controversial Debates (sensitive or divisive topics)\n\n\
+3. MAJOR (MUTE_MINUTES: 60-120):\n\
+- Impersonation (staff, members, youtubers/tiktokers)\n\
+- Rapid-Rule Breaking\n\
+- Inappropriate Roleplaying (sexual, violent, offensive themes)\n\
+- Extreme Toxicity (harassment, bullying, malicious behavior)\n\
+- Advertisement (external services, macros, promo)\n\
+- Doxxing (personal info without consent)\n\
+- ToS Violations (Discord / Roblox ToS)\n\n\
+4. CRITICAL (MUTE_MINUTES: 720-1440, i.e. 12-24 hours max timeout):\n\
+- Illegal Exploitative Content (pedophilia, zoophilia)\n\
+- Hate Speech / Discriminatory Behavior (racial, homophobic slurs, bypassed slurs)\n\
+- Suicide / Death Threats ('kys', self-harm, wishing death on others like 'you should die')\n\
+- Graphic Content (pornography, gore, extreme violence)\n\
+- Punishment Evasion (alts)\n\
+- Fabricated Evidence\n\
+- Raiding\n\
+- Real-Money / Account Trading (RMT, cross-platform goods)\n\
+- Cheating / Exploits (game-breaking tools, cheats)\n\
+- Masspinging developers / members\n\n\
+CRITICAL CONSTRAINTS & BEHAVIOR:\n\
+- STRICTLY FORBIDDEN TO BAN OR KICK! You can ONLY decide MUTE_MINUTES (0, 5, 15, 30, 60, 120, 1440).\n\
+- CAREFULLY DETECT JOKES, SARCASM & GAMING BANTER: If members are joking, using sarcasm, quoting memes, or engaging in playful gaming trash talk ('im gonna obliterate you in 1v1', 'ez game', casual friendly cursing like 'fuck you' without malice):\n\
+  VERDICT: ALLOW\n\
+  RULE: None\n\
+  MUTE_MINUTES: 0\n\
+- Direct death wishes ('you should die noob', 'die idiot', 'kys'):\n\
+  VERDICT: SUSPICIOUS\n\
+  RULE: Suicide / Death Threats\n\
+  MUTE_MINUTES: 30\n\
+- Return strictly in this format:\n\
+VERDICT: [ALLOW or SUSPICIOUS or DELETE]\n\
+RULE: [Rule name or None]\n\
+MUTE_MINUTES: [number]\n\
+REASON: [under 12 words]";
+
 pub fn get_env_var(name: &str) -> Option<String> {
     let env_paths = [
         PathBuf::from(".env"),
@@ -107,6 +159,14 @@ pub struct MessageContext<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct GroqDecision {
+    pub verdict: String,
+    pub rule: String,
+    pub mute_minutes: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum ModerationVerdict {
     Allow,
     DeleteConfirmed {
@@ -114,12 +174,16 @@ pub enum ModerationVerdict {
         score: f64,
         category: String,
         model_used: String,
+        rule_violated: String,
+        mute_minutes: u64,
     },
     FlagSuspicious {
         reason: String,
         score: f64,
         category: String,
         model_used: String,
+        rule_violated: String,
+        mute_minutes: u64,
     },
 }
 
@@ -402,41 +466,35 @@ impl AiModerator {
         // NEVER BLINDLY DELETE ON RAW SCORE: ALWAYS PASS TO LLM GUARD FIRST
         if severe_score > OPENAI_CATEGORY_SEVERE_THRESHOLD || max_score > OPENAI_SEVERE_THRESHOLD {
             if !self.groq_keys.is_empty() {
-                let double_check_prompt = "You are a Senior Discord Community Safety Arbiter & False-Positive Guard for a gaming Discord server.\n\
-                    An automated classifier flagged this message with high severity.\n\
-                    Analyze all message and user telemetry (account age, reply context, channel history, roles):\n\
-                    - ALLOW: Normal in-game competitive trash talk (e.g. 'im gonna obliterate you in 1v1', 'ez game', 'trash aim'), casual profanity between friends ('fuck you', 'stfu'), game frustration.\n\
-                    - SUSPICIOUS: Direct death wishes (e.g. 'you should die', 'die noob'), personal attacks, hostile provocation -> must be removed for staff review.\n\
-                    - DELETE: Severe real-world death threats, encouraging suicide/self-harm ('kys'), doxxing, extreme slurs.\n\
-                    Format strictly:\n\
-                    VERDICT: [ALLOW or DELETE or SUSPICIOUS]\n\
-                    REASON: [under 12 words]";
-
                 let user_prompt = format!(
-                    "{}\nEvaluate all telemetry and determine: is this safe banter/quote (ALLOW), needs staff review (SUSPICIOUS), or true severe violation (DELETE)?",
+                    "{}\nEvaluate against official server rules and determine: is this safe banter/quote (ALLOW), needs staff review & timeout (SUSPICIOUS), or true severe violation (DELETE)?",
                     self.format_telemetry(ctx, &history, max_score, &top_cat, &cat_breakdown)
                 );
 
-                match self.call_groq_failover(&self.groq_fast_model, double_check_prompt, &user_prompt).await {
-                    Ok((verdict, reason)) => {
-                        if verdict.contains("ALLOW") {
+                match self.call_groq_failover(&self.groq_fast_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
+                    Ok(decision) => {
+                        if decision.verdict.contains("ALLOW") {
                             // Prevented false deletion of gaming banter!
                             return ModerationVerdict::Allow;
-                        } else if verdict.contains("DELETE") {
-                            // Confirmed real-world threat or severe attack
+                        } else if decision.verdict.contains("DELETE") {
+                            // Severe violation -> Auto-delete with scaled mute
                             return ModerationVerdict::DeleteConfirmed {
-                                reason: format!("{}: {}", top_cat, reason),
+                                reason: format!("{}: {}", top_cat, decision.reason),
                                 score: max_score,
                                 category: top_cat,
                                 model_used: format!("OpenAI + {} Guard", self.groq_fast_model),
+                                rule_violated: decision.rule,
+                                mute_minutes: decision.mute_minutes,
                             };
                         } else {
-                            // SUSPICIOUS -> Send interactive card to staff channel instead of blind deletion!
+                            // SUSPICIOUS -> Send interactive card to staff channel and auto-delete with scaled mute!
                             return ModerationVerdict::FlagSuspicious {
-                                reason: format!("High score ({:.2}), pending mod review: {}", max_score, reason),
+                                reason: format!("High score ({:.2}): {}", max_score, decision.reason),
                                 score: max_score,
                                 category: top_cat,
                                 model_used: format!("{} (Guard Checked)", self.groq_fast_model),
+                                rule_violated: decision.rule,
+                                mute_minutes: decision.mute_minutes,
                             };
                         }
                     }
@@ -448,6 +506,8 @@ impl AiModerator {
                             score: max_score,
                             category: top_cat,
                             model_used: "OpenAI Guard (Pending Review)".to_string(),
+                            rule_violated: "Unreviewed High Score".to_string(),
+                            mute_minutes: 0,
                         };
                     }
                 }
@@ -459,6 +519,8 @@ impl AiModerator {
                 score: max_score,
                 category: top_cat,
                 model_used: "OpenAI (Pending Staff Review)".to_string(),
+                rule_violated: "Unreviewed High Score".to_string(),
+                mute_minutes: 0,
             };
         }
 
@@ -474,31 +536,23 @@ impl AiModerator {
         }
 
         // ── 3. TIER 2: DEEP LLM FOR GREY ZONE (TUNED TO THE ABSOLUTE MAXIMUM) ──
-        // Supplies LLM with full server telemetry, IDs, reply targets, mentions, and OpenAI category breakdowns!
-        let system_prompt = "You are a Supreme Community Arbiter for a high-intensity gaming Discord server.\n\
-            Your task is to review grey-zone flagged messages with complete conversation, identity, and channel telemetry.\n\
-            Carefully distinguish between:\n\
-            - FRIENDLY_BANTER / GAMING_FRUSTRATION (ALLOW): Mutual joking, friendly trash-talk ('im gonna obliterate you', 'ez game', 'trash aim'), casual swearing ('fuck you'), complaining about game mechanics.\n\
-            - DIRECT_DEATH_WISH / HARASSMENT (SUSPICIOUS): Direct death wishes ('you should die', 'die noob'), personal attacks, hostile provocation -> remove for staff review.\n\
-            - EXTREME_VIOLATION (DELETE): Real-world physical threats, encouraging suicide/self-harm ('kys'), doxxing, severe hate slurs.\n\
-            Return strictly in this format:\n\
-            VERDICT: [ALLOW or DELETE or SUSPICIOUS]\n\
-            REASON: [precise explanation under 12 words]";
-
+        // Supplies LLM with full server telemetry, IDs, reply targets, mentions, and server rulebook!
         let user_prompt = format!(
-            "{}\nAnalyze all telemetry, context, and intent. What is your final verdict?",
+            "{}\nAnalyze all telemetry, context, and intent according to official server rules. What is your final verdict?",
             self.format_telemetry(ctx, &history, max_score, &top_cat, &cat_breakdown)
         );
 
-        match self.call_groq_failover(&self.groq_deep_model, system_prompt, &user_prompt).await {
-            Ok((verdict, reason)) => {
-                if verdict.contains("DELETE") || verdict.contains("SUSPICIOUS") {
+        match self.call_groq_failover(&self.groq_deep_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
+            Ok(decision) => {
+                if decision.verdict.contains("DELETE") || decision.verdict.contains("SUSPICIOUS") {
                     // Send to mod alert with interactive buttons for 1-click execution
                     ModerationVerdict::FlagSuspicious {
-                        reason,
+                        reason: decision.reason,
                         score: max_score,
                         category: top_cat,
                         model_used: format!("{} (Deep Context)", self.groq_deep_model),
+                        rule_violated: decision.rule,
+                        mute_minutes: decision.mute_minutes,
                     }
                 } else {
                     ModerationVerdict::Allow
@@ -658,7 +712,7 @@ impl AiModerator {
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<GroqDecision, String> {
         let total_keys = self.groq_keys.len();
         if total_keys == 0 {
             return Err("No Groq keys configured".to_string());
@@ -695,7 +749,7 @@ impl AiModerator {
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<GroqDecision, String> {
         let req_body = GroqChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -733,6 +787,8 @@ impl AiModerator {
             let text = &choice.message.content;
             let upper = text.to_uppercase();
             let mut verdict = String::new();
+            let mut rule = "Server Guidelines".to_string();
+            let mut mute_minutes: u64 = 0;
             let mut reason = String::new();
 
             for line in text.lines() {
@@ -740,6 +796,11 @@ impl AiModerator {
                 let upper_line = trimmed.to_uppercase();
                 if upper_line.starts_with("VERDICT:") {
                     verdict = trimmed["VERDICT:".len()..].trim().to_uppercase();
+                } else if upper_line.starts_with("RULE:") {
+                    rule = trimmed["RULE:".len()..].trim().to_string();
+                } else if upper_line.starts_with("MUTE_MINUTES:") {
+                    let num_str = trimmed["MUTE_MINUTES:".len()..].trim();
+                    mute_minutes = num_str.parse::<u64>().unwrap_or(0);
                 } else if upper_line.starts_with("REASON:") {
                     reason = trimmed["REASON:".len()..].trim().to_string();
                 }
@@ -759,7 +820,21 @@ impl AiModerator {
                 reason = "Context telemetry evaluation".to_string();
             }
 
-            Ok((verdict, reason))
+            // Fallback timeout scaling if model omitted MUTE_MINUTES
+            if mute_minutes == 0 {
+                if verdict == "DELETE" {
+                    mute_minutes = 1440;
+                } else if verdict == "SUSPICIOUS" && rule != "None" {
+                    mute_minutes = 30;
+                }
+            }
+
+            Ok(GroqDecision {
+                verdict,
+                rule,
+                mute_minutes,
+                reason,
+            })
         } else {
             Err("Empty choices in response".to_string())
         }

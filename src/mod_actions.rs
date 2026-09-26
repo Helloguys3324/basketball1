@@ -29,6 +29,7 @@ pub async fn send_mod_alert(
     content: &str,
     verdict_title: &str,
     is_auto_deleted: bool,
+    action_taken: &str,
     reason: &str,
     score: f64,
     category: &str,
@@ -43,10 +44,11 @@ pub async fn send_mod_alert(
         .field("Author", format!("<@{}> (`{}` | ID: `{}`)", author_id, author_name, author_id), true)
         .field("Channel", format!("<#{}>", channel_id), true)
         .field("Toxicity Score", format!("{:.2} ({})", score, category), true)
+        .field("⚡ Action Taken", action_taken, false)
         .field("AI Detection Pipeline", model_used, false)
         .field("Message Content", format!("```\n{}\n```", if content.len() > 900 { &content[..900] } else { content }), false)
         .field("AI Flag Reason", reason, false)
-        .footer(CreateEmbedFooter::new(if is_auto_deleted { "Status: AUTO-DELETED from chat" } else { "Status: PENDING MOD REVIEW" }));
+        .footer(CreateEmbedFooter::new(if is_auto_deleted { "Status: AUTO-ACTION TAKEN | Bot never bans automatically" } else { "Status: PENDING MOD REVIEW" }));
 
     // Buttons:
     // Mute 10m, Mute 1h, Ban, Delete Msg (if not already deleted), Approve/Dismiss
