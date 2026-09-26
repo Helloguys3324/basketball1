@@ -405,9 +405,9 @@ impl AiModerator {
                 let double_check_prompt = "You are a Senior Discord Community Safety Arbiter & False-Positive Guard for a gaming Discord server.\n\
                     An automated classifier flagged this message with high severity.\n\
                     Analyze all message and user telemetry (account age, reply context, channel history, roles):\n\
-                    - ALLOW: Mutual gaming banter, friendly trash talk (e.g. 'im gonna obliterate you', 'die noob', 'trash team'), casual cursing among friends ('fuck you', 'stfu'), quoting lyrics/memes, game rage.\n\
-                    - SUSPICIOUS: Borderline hostility, personal heated argument, or ambiguous intent -> send for human moderator review.\n\
-                    - DELETE: ONLY genuine toxic attacks, real-world death/physical threats, doxxing, severe racial/ethnic slurs, encouraging suicide/self-harm ('kys').\n\
+                    - ALLOW: Normal in-game competitive trash talk (e.g. 'im gonna obliterate you in 1v1', 'ez game', 'trash aim'), casual profanity between friends ('fuck you', 'stfu'), game frustration.\n\
+                    - SUSPICIOUS: Direct death wishes (e.g. 'you should die', 'die noob'), personal attacks, hostile provocation -> must be removed for staff review.\n\
+                    - DELETE: Severe real-world death threats, encouraging suicide/self-harm ('kys'), doxxing, extreme slurs.\n\
                     Format strictly:\n\
                     VERDICT: [ALLOW or DELETE or SUSPICIOUS]\n\
                     REASON: [under 12 words]";
@@ -478,9 +478,9 @@ impl AiModerator {
         let system_prompt = "You are a Supreme Community Arbiter for a high-intensity gaming Discord server.\n\
             Your task is to review grey-zone flagged messages with complete conversation, identity, and channel telemetry.\n\
             Carefully distinguish between:\n\
-            - FRIENDLY_BANTER / GAMING_FRUSTRATION (ALLOW): Mutual joking, friendly trash-talk ('im gonna obliterate you', 'noob', 'ez'), complaining about game mechanics, quotes, casual swearing ('fuck you').\n\
-            - TARGETED_TOXICITY (DELETE): Malicious bullying, unprovoked toxic attacks, hate harassment, real threats, or doxxing.\n\
-            - AMBIGUOUS (SUSPICIOUS): Borderline or unclear intent where human staff judgment is needed.\n\
+            - FRIENDLY_BANTER / GAMING_FRUSTRATION (ALLOW): Mutual joking, friendly trash-talk ('im gonna obliterate you', 'ez game', 'trash aim'), casual swearing ('fuck you'), complaining about game mechanics.\n\
+            - DIRECT_DEATH_WISH / HARASSMENT (SUSPICIOUS): Direct death wishes ('you should die', 'die noob'), personal attacks, hostile provocation -> remove for staff review.\n\
+            - EXTREME_VIOLATION (DELETE): Real-world physical threats, encouraging suicide/self-harm ('kys'), doxxing, severe hate slurs.\n\
             Return strictly in this format:\n\
             VERDICT: [ALLOW or DELETE or SUSPICIOUS]\n\
             REASON: [precise explanation under 12 words]";
