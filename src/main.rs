@@ -9,8 +9,18 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod ai_moderator;
+use ai_moderator::{AiModerator, ModerationVerdict};
+
+mod config;
+use config::ConfigStore;
+
+mod mod_actions;
+
+use serenity::model::application::Interaction;
 
 use lowe_sift::{
     cluster_matches_hough, match_features, verify_hough_clusters, GrayImage, HoughConfig,
@@ -61,44 +71,7 @@ const SASAGEYO_ID: u64 = 612573096343240734;
 
 // Environment variable or .env file (NEVER hardcode tokens in git!)
 fn get_token() -> String {
-    // 1. First check system environment variable
-    if let Ok(token) = env::var("DISCORD_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return token;
-        }
-    }
-
-    // 2. Check .env file in current or executable directory
-    let env_paths = [
-        PathBuf::from(".env"),
-        if let Ok(exe) = env::current_exe() {
-            exe.parent().map(|p| p.join(".env")).unwrap_or_default()
-        } else {
-            PathBuf::new()
-        },
-    ];
-
-    for path in &env_paths {
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(path) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.starts_with('#') || line.is_empty() {
-                        continue;
-                    }
-                    if let Some(token) = line.strip_prefix("DISCORD_TOKEN=") {
-                        let token = token.trim().trim_matches('"').trim_matches('\'');
-                        if !token.is_empty() {
-                            return token.to_string();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    String::new()
+    ai_moderator::get_env_var("DISCORD_TOKEN").unwrap_or_default()
 }
 
 // =============================================================================
@@ -762,6 +735,8 @@ async fn is_administrator(ctx: &Context, guild_id: GuildId, user_id: UserId) -> 
 
 struct Handler {
     http_client: reqwest::Client,
+    ai_moderator: AiModerator,
+    config: Arc<ConfigStore>,
 }
 
 #[async_trait]
@@ -779,11 +754,147 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Guaranteed immunity — server creator
+        if msg.author.id.get() == SASAGEYO_ID {
+            return;
+        }
+
         // Ignore admins
         if IGNORE_ADMINS {
             if let Some(guild_id) = msg.guild_id {
                 if is_administrator(&ctx, guild_id, msg.author.id).await {
                     return;
+                }
+            }
+        }
+
+        // ── 0. AI TEXT MODERATION (Runs before / in parallel to image scan) ──
+        if !msg.content.trim().is_empty() {
+            let reply_to = msg.referenced_message.as_ref().map(|ref_msg| {
+                (
+                    ref_msg.author.name.as_str(),
+                    ref_msg.author.id.get(),
+                    ref_msg.id.get(),
+                    ref_msg.content.as_str(),
+                )
+            });
+
+            let mentions: Vec<u64> = msg.mentions.iter().map(|u| u.id.get()).collect();
+
+            let msg_ctx = ai_moderator::MessageContext {
+                guild_id: msg.guild_id.map(|g| g.get()),
+                channel_id: msg.channel_id.get(),
+                message_id: msg.id.get(),
+                author_name: &msg.author.name,
+                author_id: msg.author.id.get(),
+                content: &msg.content,
+                reply_to,
+                mentions: &mentions,
+            };
+
+            let verdict = self.ai_moderator.check_message(&msg_ctx).await;
+
+            match verdict {
+                ModerationVerdict::DeleteConfirmed {
+                    reason,
+                    score,
+                    category,
+                    model_used,
+                } => {
+                    println!(
+                        "\n🚨 [AI MODERATOR: DELETED] Channel: {} | User: {} ({}) | Score: {:.2} | Reason: {} | Msg: \"{}\"",
+                        msg.channel_id, msg.author.name, msg.author.id, score, reason, msg.content
+                    );
+
+                    if AUTO_DELETE {
+                        let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
+                    }
+
+                    if WARN_USER_IN_CHAT {
+                        let warn_text = format!(
+                            "🛡️ **Auto-Moderator:** <@{}>, your message was removed ({}).",
+                            msg.author.id, reason
+                        );
+                        if let Ok(warn_msg) = msg.channel_id.say(&ctx.http, &warn_text).await {
+                            let http = ctx.http.clone();
+                            let channel_id = msg.channel_id;
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(WARN_EXPIRE_SECONDS)).await;
+                                let _ = channel_id.delete_message(&http, warn_msg.id).await;
+                            });
+                        }
+                    }
+
+                    if let Some(mod_chan) = self.config.get_mod_channel() {
+                        mod_actions::send_mod_alert(
+                            &ctx.http,
+                            mod_chan,
+                            msg.guild_id,
+                            msg.author.id,
+                            &msg.author.name,
+                            msg.channel_id,
+                            msg.id,
+                            &msg.content,
+                            "🚨 AI ALERT: SEVERE VIOLATION (AUTO-DELETED)",
+                            true,
+                            &reason,
+                            score,
+                            &category,
+                            &model_used,
+                        )
+                        .await;
+                    }
+
+                    // Message deleted for toxic text, skip image checking
+                    return;
+                }
+                ModerationVerdict::FlagSuspicious {
+                    reason,
+                    score,
+                    category,
+                    model_used,
+                } => {
+                    println!(
+                        "\n⚠️ [AI MODERATOR: SUSPICIOUS] Channel: {} | User: {} ({}) | Score: {:.2} | Reason: {} | Msg: \"{}\"",
+                        msg.channel_id, msg.author.name, msg.author.id, score, reason, msg.content
+                    );
+
+                    self.ai_moderator.record_message(
+                        msg.channel_id.get(),
+                        msg.id.get(),
+                        msg.author.id.get(),
+                        &msg.author.name,
+                        &msg.content,
+                    );
+
+                    if let Some(mod_chan) = self.config.get_mod_channel() {
+                        mod_actions::send_mod_alert(
+                            &ctx.http,
+                            mod_chan,
+                            msg.guild_id,
+                            msg.author.id,
+                            &msg.author.name,
+                            msg.channel_id,
+                            msg.id,
+                            &msg.content,
+                            "⚠️ AI ALERT: SUSPICIOUS (PENDING MOD REVIEW)",
+                            false,
+                            &reason,
+                            score,
+                            &category,
+                            &model_used,
+                        )
+                        .await;
+                    }
+                }
+                ModerationVerdict::Allow => {
+                    self.ai_moderator.record_message(
+                        msg.channel_id.get(),
+                        msg.id.get(),
+                        msg.author.id.get(),
+                        &msg.author.name,
+                        &msg.content,
+                    );
                 }
             }
         }
@@ -935,11 +1046,11 @@ impl EventHandler for Handler {
         // Rust RAII: image data and intermediate buffers are dropped immediately
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         let store = init_store();
         println!("\n=======================================================");
         println!(
-            "\u{1f6e1}\u{fe0f}  ANTI-SCAM BOT (RUST EDITION) ACTIVE as {}",
+            "\u{1f6e1}\u{fe0f}  ANTI-SCAM & AI MODERATOR BOT ACTIVE as {}",
             ready.user.name
         );
         println!(
@@ -950,8 +1061,89 @@ impl EventHandler for Handler {
             "\u{2699}\u{fe0f}  Hamming max: {} | Sim threshold: {:.0}%",
             HAMMING_DISTANCE_MAX, SIMILARITY_THRESHOLD
         );
+        if let Some(ch) = self.config.get_mod_channel() {
+            println!("🔔 Mod alert channel active: <#{}>", ch);
+        } else {
+            println!("ℹ️  No mod alert channel set. Use /set_mod_channel in Discord.");
+        }
         println!("\u{1f4be} Memory footprint: ~4-8 MB RAM (Native Rust binary, zero GC)");
         println!("=======================================================\n");
+
+        // Register slash command /set_mod_channel globally
+        let cmd = serenity::builder::CreateCommand::new("set_mod_channel")
+            .description("Configure channel where AI suspicious messages and mod alerts are sent")
+            .default_member_permissions(Permissions::ADMINISTRATOR)
+            .add_option(
+                serenity::builder::CreateCommandOption::new(
+                    serenity::model::application::CommandOptionType::Channel,
+                    "channel",
+                    "Target channel for AI mod alerts and control cards",
+                )
+                .required(true),
+            );
+
+        if let Err(why) = serenity::model::application::Command::create_global_command(&ctx.http, cmd).await {
+            eprintln!("[WARN] Failed to register /set_mod_channel slash command: {:?}", why);
+        } else {
+            println!("✅ Registered global slash command: /set_mod_channel");
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::Command(command) => {
+                if command.data.name == "set_mod_channel" {
+                    let is_admin = command
+                        .member
+                        .as_ref()
+                        .and_then(|m| m.permissions)
+                        .map(|p| p.contains(Permissions::ADMINISTRATOR))
+                        .unwrap_or(false);
+
+                    if !is_admin {
+                        let resp = serenity::builder::CreateInteractionResponse::Message(
+                            serenity::builder::CreateInteractionResponseMessage::new()
+                                .content("❌ Only administrators can configure the moderation channel.")
+                                .ephemeral(true),
+                        );
+                        let _ = command.create_response(&ctx.http, resp).await;
+                        return;
+                    }
+
+                    let mut selected_channel = None;
+                    for opt in &command.data.options {
+                        if opt.name == "channel" {
+                            if let serenity::model::application::CommandDataOptionValue::Channel(cid) = opt.value {
+                                selected_channel = Some(cid);
+                            }
+                        }
+                    }
+
+                    if let Some(cid) = selected_channel {
+                        if let Err(e) = self.config.set_mod_channel(cid.get()) {
+                            eprintln!("[ERROR] Failed to save mod channel: {:?}", e);
+                        }
+                        let resp = serenity::builder::CreateInteractionResponse::Message(
+                            serenity::builder::CreateInteractionResponseMessage::new()
+                                .content(format!("✅ AI Moderation alert channel set to <#{}>!", cid))
+                                .ephemeral(true),
+                        );
+                        let _ = command.create_response(&ctx.http, resp).await;
+                    } else {
+                        let resp = serenity::builder::CreateInteractionResponse::Message(
+                            serenity::builder::CreateInteractionResponseMessage::new()
+                                .content("❌ Please select a valid channel.")
+                                .ephemeral(true),
+                        );
+                        let _ = command.create_response(&ctx.http, resp).await;
+                    }
+                }
+            }
+            Interaction::Component(component) => {
+                mod_actions::handle_button_interaction(&ctx, &component).await;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1054,7 +1246,13 @@ async fn main() {
         .build()
         .expect("[ERROR] Failed to build HTTP client");
 
-    let handler = Handler { http_client };
+    let ai_moderator = AiModerator::new(http_client.clone());
+    let config = Arc::new(ConfigStore::new("mod_config.json"));
+    let handler = Handler {
+        http_client,
+        ai_moderator,
+        config,
+    };
 
     // Minimal Discord Gateway intents
     let intents = GatewayIntents::GUILD_MESSAGES

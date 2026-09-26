@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Compile static Linux binary
@@ -46,3 +49,11 @@ jobs:
           name: antiscambot-linux
           path: target/x86_64-unknown-linux-musl/release/antiscambot
           retention-days: 90
+
+      - name: Publish Latest Release Asset
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: latest
+          name: "Latest Pre-compiled Binary (Linux musl)"
+          files: target/x86_64-unknown-linux-musl/release/antiscambot
