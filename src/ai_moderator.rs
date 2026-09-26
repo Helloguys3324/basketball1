@@ -34,13 +34,6 @@ const GAMING_SAFE_SUBSTRINGS: &[&str] = &[
 ];
 
 pub fn get_env_var(name: &str) -> Option<String> {
-    if let Ok(val) = env::var(name) {
-        let trimmed = val.trim().to_string();
-        if !trimmed.is_empty() {
-            return Some(trimmed);
-        }
-    }
-
     let env_paths = [
         PathBuf::from(".env"),
         if let Ok(exe) = env::current_exe() {
@@ -62,10 +55,24 @@ pub fn get_env_var(name: &str) -> Option<String> {
                     if let Some(val) = line.strip_prefix(&prefix) {
                         let cleaned = val.trim().trim_matches('"').trim_matches('\'');
                         if !cleaned.is_empty() {
+                            if name == "OPENAI_API_KEY" && cleaned.starts_with("gsk_") {
+                                continue;
+                            }
                             return Some(cleaned.to_string());
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if let Ok(val) = env::var(name) {
+        let trimmed = val.trim().to_string();
+        if !trimmed.is_empty() {
+            if name == "OPENAI_API_KEY" && trimmed.starts_with("gsk_") {
+                // Ignore mistyped Groq key in system OPENAI_API_KEY variable
+            } else {
+                return Some(trimmed);
             }
         }
     }
@@ -175,10 +182,10 @@ impl AiModerator {
             .collect();
 
         let groq_fast_model = get_env_var("GROQ_FAST_MODEL")
-            .unwrap_or_else(|| "llama-3.1-8b-instant".to_string());
+            .unwrap_or_else(|| "qwen/qwen3.8-27b".to_string());
 
         let groq_deep_model = get_env_var("GROQ_DEEP_MODEL")
-            .unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+            .unwrap_or_else(|| "qwen/qwen3.8-27b".to_string());
 
         Self {
             http_client,
@@ -439,7 +446,10 @@ impl AiModerator {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            eprintln!("[OPENAI API ERROR] Status {}: {}", status, err_text);
             return Ok((0.0, 0.0, String::new(), String::new()));
         }
 
@@ -475,23 +485,33 @@ impl AiModerator {
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<(String, String), reqwest::Error> {
+    ) -> Result<(String, String), String> {
         let total_keys = self.groq_keys.len();
         if total_keys == 0 {
-            return Ok(("ALLOW".to_string(), "No Groq keys".to_string()));
+            return Err("No Groq keys configured".to_string());
         }
 
+        let models_to_try = if model != "qwen/qwen3.8-27b" {
+            vec![model, "qwen/qwen3.8-27b"]
+        } else {
+            vec![model]
+        };
+
         let start_idx = self.groq_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
-        for i in 0..total_keys {
-            let idx = (start_idx + i) % total_keys;
-            let key = &self.groq_keys[idx];
-            match self.execute_groq_call(key, model, system_prompt, user_prompt).await {
-                Ok(res) => return Ok(res),
-                Err(_) if i + 1 < total_keys => continue,
-                Err(e) => return Err(e),
+        for target_model in models_to_try {
+            for i in 0..total_keys {
+                let idx = (start_idx + i) % total_keys;
+                let key = &self.groq_keys[idx];
+                match self.execute_groq_call(key, target_model, system_prompt, user_prompt).await {
+                    Ok(res) => return Ok(res),
+                    Err(e) => {
+                        eprintln!("[GROQ FAILOVER] Key {} model '{}' error: {}", idx, target_model, e);
+                        continue;
+                    }
+                }
             }
         }
-        Ok(("ALLOW".to_string(), "Failover exhausted".to_string()))
+        Err("All Groq keys and models exhausted".to_string())
     }
 
     async fn execute_groq_call(
@@ -500,7 +520,7 @@ impl AiModerator {
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<(String, String), reqwest::Error> {
+    ) -> Result<(String, String), String> {
         let req_body = GroqChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -524,13 +544,16 @@ impl AiModerator {
             .header("Content-Type", "application/json")
             .json(&req_body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Ok(("ALLOW".to_string(), "Status error".to_string()));
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            return Err(format!("HTTP {}: {}", status, err_text));
         }
 
-        let body: GroqChatResponse = resp.json().await?;
+        let body: GroqChatResponse = resp.json().await.map_err(|e| format!("JSON decode error: {}", e))?;
         if let Some(choice) = body.choices.first() {
             let text = &choice.message.content;
             let mut verdict = "ALLOW".to_string();
@@ -547,7 +570,7 @@ impl AiModerator {
 
             Ok((verdict, reason))
         } else {
-            Ok(("ALLOW".to_string(), "Empty choice".to_string()))
+            Err("Empty choices in response".to_string())
         }
     }
 }
@@ -583,5 +606,24 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].message_id, 1001);
         assert_eq!(history[0].author_id, 2001);
+    }
+
+    #[tokio::test]
+    async fn test_check_message_offensive() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: None,
+            channel_id: 1,
+            message_id: 2,
+            author_name: "Machi",
+            author_id: 12345,
+            content: "you should die noob",
+            reply_to: None,
+            mentions: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'you should die noob': {:?}\n", verdict);
+        assert!(matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }));
     }
 }
