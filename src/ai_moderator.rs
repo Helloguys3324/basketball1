@@ -612,6 +612,9 @@ impl AiModerator {
         if !models_to_try.contains(&"openai/gpt-oss-120b") {
             models_to_try.push("openai/gpt-oss-120b");
         }
+        if !models_to_try.contains(&"openai/gpt-oss-20b") {
+            models_to_try.push("openai/gpt-oss-20b");
+        }
 
         let start_idx = self.groq_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
         for target_model in models_to_try {
