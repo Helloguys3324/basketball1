@@ -55,12 +55,26 @@ const GAME_SHIELD_PATTERNS: &[&str] = &[
     "в реале а не в игре", "по игре"
 ];
 
+const COMMON_NON_NAMES: &[&str] = &[
+    "ill", "i'll", "im", "i'm", "ive", "i've", "id", "i'd",
+    "someone", "somone", "somebody", "something", "nobody", "anyone", "anything",
+    "minecraft", "roblox", "rust", "discord", "game", "steam", "valve", "dota", "csgo",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "what", "where", "when", "why", "how", "who", "which",
+    "yes", "yeah", "nope", "okay", "sure", "well", "look", "wait", "please", "thanks", "thank"
+];
+
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
 1.Minor(0-10m):Spam,off-topic,mild toxicity,ghost-ping,bot abuse\n\
 2.Mod(15-30m):Bait,disruptive,NSFW ref,bypass,drama\n\
 3.Major(60-120m):Impersonation,harassment,threats to members,ads,doxx\n\
 4.Crit(720-1440m):Hate/slurs,death threats('kys','you should die'),gore,raid,cheats\n\
+QUOTES, META-TALK & HYPOTHETICAL EXAMPLES (ALLOW, RULE:None, MUTE:0):\n\
+- Discussing server rules, testing bot triggers, quoting past messages, or explaining what caused a mute: 'Say I'll kill ... (Somone)', 'U said kill something ig', 'he got muted for saying die', 'the bot bans for kys'\n\
+- Abstract placeholders & sentence templates ('...', '(someone)', '[user]', '<person>', 'кого-то', 'кто-то'): These are grammatical examples/templates, NOT real threats or harassment against members.\n\
+- Only punish genuine direct malice/threats targeting real people. If demonstrating, quoting, explaining, or testing -> ALWAYS ALLOW.\n\
 SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
 - GENUINE BANTER (ALLOW, RULE:None, MUTE:0):\n\
   Boasting strictly about match/skill: '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash'\n\
@@ -380,6 +394,53 @@ impl AiModerator {
         has_hostility
     }
 
+    fn is_abstract_placeholder(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        const PLACEHOLDERS: &[&str] = &[
+            "(someone)", "(somone)", "(somebody)", "(person)", "(user)", "(target)", "(anyone)",
+            "[someone]", "[somone]", "[somebody]", "[person]", "[user]", "[name]", "[target]",
+            "<someone>", "<user>", "<person>", "<name>",
+            "(кого-то)", "(кого то)", "(человека)", "(юзера)", "[кого-то]", "[человека]",
+            "... someone", "... somone", "... somebody", "... person", "... user",
+            "... кого-то", "... кого то", "... человека"
+        ];
+        PLACEHOLDERS.iter().any(|p| lower.contains(p))
+    }
+
+    fn is_meta_or_quote(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        let trimmed_lower = lower.trim();
+
+        if Self::is_abstract_placeholder(trimmed_lower) {
+            return true;
+        }
+
+        const META_PREFIXES: &[&str] = &[
+            "say ", "saying ", "say: ", "say '", "say \"",
+            "if you say ", "if u say ", "if i say ", "if someone says ",
+            "like saying ", "like when you say ",
+            "u said ", "you said ", "he said ", "she said ", "they said ",
+            "i said ", "we said ",
+            "got muted for ", "muted for saying ", "timed out for ", "triggers on ",
+            "bot triggers on ", "banned for saying ", "ban for saying ",
+            "он сказал ", "ты сказал ", "я сказал ", "мутит за ",
+            "типа если сказать ", "типа сказать ", "типа '", "типа \""
+        ];
+
+        if META_PREFIXES.iter().any(|prefix| trimmed_lower.starts_with(prefix)) {
+            return true;
+        }
+
+        if (trimmed_lower.starts_with('"') && trimmed_lower.ends_with('"'))
+            || (trimmed_lower.starts_with('\'') && trimmed_lower.ends_with('\''))
+            || (trimmed_lower.starts_with('«') && trimmed_lower.ends_with('»'))
+        {
+            return true;
+        }
+
+        false
+    }
+
     fn is_directed_or_targeted(content: &str, has_reply: bool, mentions: &[(u64, String)], history: &[ChatEntry]) -> bool {
         if has_reply || !mentions.is_empty() || content.contains("<@") || content.contains("@") {
             return true;
@@ -424,22 +485,48 @@ impl AiModerator {
 
         // 4. Check proper noun / name patterns (e.g. "Mizuri will be...", "Alex is...")
         let orig_words: Vec<&str> = content.split_whitespace().collect();
-        for (i, word) in orig_words.iter().enumerate() {
-            let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
-            if clean.len() >= 3 && clean.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-                if i > 0 {
+        if orig_words.len() > 1 {
+            let first_word = orig_words[0];
+            let clean_first = first_word.trim_matches(|c: char| !c.is_alphanumeric());
+            let clean_first_lower = clean_first.to_lowercase();
+            if clean_first.len() >= 3
+                && clean_first.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !COMMON_NON_NAMES.contains(&clean_first_lower.as_str())
+            {
+                let next_clean = orig_words[1].trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                if matches!(next_clean.as_str(), "will" | "is" | "should" | "must" | "can" | "needs" | "будет" | "должен" | "надо" | "это" | "was" | "бы" | "has") {
                     return true;
                 }
-                if orig_words.len() > 1 {
-                    let next_clean = orig_words[1].trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
-                    if matches!(next_clean.as_str(), "will" | "is" | "should" | "must" | "can" | "needs" | "будет" | "должен" | "надо" | "это" | "was" | "бы") {
-                        return true;
-                    }
+            }
+        }
+
+        // Check for direct action verb targeting a capitalized name (e.g. "kill Alex", "burn Mizuri")
+        for i in 1..orig_words.len() {
+            let word = orig_words[i];
+            if word.starts_with('(') || word.starts_with('[') || word.ends_with(')') || word.ends_with(']') {
+                continue;
+            }
+            let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+            let clean_lower = clean.to_lowercase();
+            if clean.len() >= 3
+                && clean.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !COMMON_NON_NAMES.contains(&clean_lower.as_str())
+            {
+                let prev = orig_words[i - 1].trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                if matches!(prev.as_str(), "kill" | "burn" | "destroy" | "smash" | "hurt" | "to" | "at" | "убить" | "сожечь" | "зарезать") {
+                    return true;
                 }
             }
         }
 
         false
+    }
+
+    fn safe_truncate(s: &str, max_chars: usize) -> &str {
+        match s.char_indices().nth(max_chars) {
+            Some((idx, _)) => &s[..idx],
+            None => s,
+        }
     }
 
     fn format_compact_prompt(
@@ -449,6 +536,7 @@ impl AiModerator {
         max_score: f64,
         top_cat: &str,
         is_game_shield: bool,
+        is_meta: bool,
     ) -> String {
         let mut p = String::with_capacity(512);
 
@@ -457,7 +545,7 @@ impl AiModerator {
         if !recent.is_empty() {
             p.push_str("Recent chat context:\n");
             for (idx, e) in recent.into_iter().rev().enumerate() {
-                let short_c = if e.content.len() > 90 { &e.content[..90] } else { &e.content };
+                let short_c = Self::safe_truncate(&e.content, 90);
                 p.push_str(&format!("{}. {}: \"{}\"\n", idx + 1, e.author_name, short_c.trim()));
             }
             p.push('\n');
@@ -467,12 +555,15 @@ impl AiModerator {
         p.push_str(&format!("Author: @{}\n", ctx.author_name));
         p.push_str(&format!("Content: \"{}\"\n", ctx.content.trim()));
         if let Some((rep_author, _, _, rep_text)) = ctx.reply_to {
-            let short_rep = if rep_text.len() > 90 { &rep_text[..90] } else { rep_text };
+            let short_rep = Self::safe_truncate(rep_text, 90);
             p.push_str(&format!("Replying to: @{}: \"{}\"\n", rep_author, short_rep.trim()));
         }
         p.push_str(&format!("OpenAI Flag: {} (score: {:.2})\n", top_cat, max_score));
         if is_game_shield {
             p.push_str("⚠️ EVASION ALERT: Message uses game shield ('in minecraft/roblox/game') to disguise toxicity/threats! Do NOT excuse death wishes, suicide or harassment as banter.\n");
+        }
+        if is_meta {
+            p.push_str("ℹ️ META CONTEXT NOTE: Message appears to be a meta-discussion, quote, rule discussion, or hypothetical placeholder example (e.g. discussing what words trigger the bot or using '(someone)'). Do NOT punish users for quoting, discussing bot rules, or hypothetical templates. Only punish genuine threats directed at real people.\n");
         }
         p
     }
@@ -531,6 +622,13 @@ impl AiModerator {
         }
 
         let is_directed = Self::is_directed_or_targeted(trimmed, ctx.reply_to.is_some(), ctx.mentions, &history);
+        let is_meta = Self::is_meta_or_quote(trimmed);
+        let is_abstract_placeholder = Self::is_abstract_placeholder(trimmed);
+
+        if is_abstract_placeholder && !is_directed {
+            println!("   ↳ [META-PLACEHOLDER] Abstract hypothetical example detected with (someone)/(user) -> ALLOW (0 tokens spent)");
+            return ModerationVerdict::Allow;
+        }
 
         // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore/Threats/Evasions vs Fast Guard for Banter ──
         let is_hardcore_or_drama = severe_score > 0.65
@@ -557,7 +655,7 @@ impl AiModerator {
                     history.len(),
                     if is_hardcore_or_drama { "120B Deep Reasoning" } else { "27B Fast Guard" }
                 );
-                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield);
+                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta);
 
                 match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
                     Ok((decision, model_used, elapsed_ms)) => {
@@ -568,6 +666,9 @@ impl AiModerator {
 
                         if decision.verdict.contains("ALLOW") {
                             println!("   ✅ [BANTER PASS] LLM verified message as safe gaming hyperbole -> ALLOW");
+                            return ModerationVerdict::Allow;
+                        } else if is_meta && !is_directed {
+                            println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                             return ModerationVerdict::Allow;
                         } else if decision.verdict.contains("DELETE") {
                             println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
@@ -648,7 +749,7 @@ impl AiModerator {
             history.len(),
             is_directed
         );
-        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield);
+        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta);
 
         match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
             Ok((decision, model_used, elapsed_ms)) => {
@@ -657,6 +758,10 @@ impl AiModerator {
                     model_used, elapsed_ms, decision.verdict, decision.rule, decision.mute_minutes, decision.reason
                 );
                 if decision.verdict.contains("DELETE") || decision.verdict.contains("SUSPICIOUS") {
+                    if is_meta && !is_directed {
+                        println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
+                        return ModerationVerdict::Allow;
+                    }
                     println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                     let model_label = if model_used.contains("120b") {
                         format!("{} (120B Deep Drama Arbiter)", model_used)
@@ -906,17 +1011,19 @@ impl AiModerator {
             let mut reason = String::new();
 
             for line in text.lines() {
-                let trimmed = line.trim();
-                let upper_line = trimmed.to_uppercase();
-                if upper_line.starts_with("VERDICT:") {
-                    verdict = trimmed["VERDICT:".len()..].trim().to_uppercase();
-                } else if upper_line.starts_with("RULE:") {
-                    rule = trimmed["RULE:".len()..].trim().to_string();
-                } else if upper_line.starts_with("MUTE_MINUTES:") {
-                    let num_str = trimmed["MUTE_MINUTES:".len()..].trim();
+                let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
+                let upper = normalized.to_uppercase();
+                if let Some(rest) = upper.strip_prefix("VERDICT:") {
+                    verdict = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'').to_uppercase();
+                } else if let Some(_rest) = upper.strip_prefix("RULE:") {
+                    let val = normalized["RULE:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                    rule = val.to_string();
+                } else if let Some(rest) = upper.strip_prefix("MUTE_MINUTES:") {
+                    let num_str = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
                     mute_minutes = num_str.parse::<u64>().unwrap_or(0);
-                } else if upper_line.starts_with("REASON:") {
-                    reason = trimmed["REASON:".len()..].trim().to_string();
+                } else if let Some(_rest) = upper.strip_prefix("REASON:") {
+                    let val = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                    reason = val.to_string();
                 }
             }
 
@@ -990,7 +1097,30 @@ mod tests {
         assert!(AiModerator::is_directed_or_targeted("miz will be burned alive", false, &[], &history));
         assert!(AiModerator::is_directed_or_targeted("mizu should leave", false, &[], &history));
         assert!(AiModerator::is_directed_or_targeted("Mizuri will be burned alive", false, &[], &[]));
+        assert!(AiModerator::is_directed_or_targeted("kill Alex", false, &[], &[]));
+        assert!(!AiModerator::is_directed_or_targeted("Say I'll kill ... (Somone)", false, &[], &[]));
+        assert!(!AiModerator::is_directed_or_targeted("kill in Minecraft", false, &[], &[]));
+        assert!(!AiModerator::is_directed_or_targeted("I love Rust", false, &[], &[]));
         assert!(!AiModerator::is_directed_or_targeted("fuck this lag", false, &[], &[]));
+    }
+
+    #[test]
+    fn test_is_abstract_placeholder() {
+        assert!(AiModerator::is_abstract_placeholder("Say I'll kill ... (Somone)"));
+        assert!(AiModerator::is_abstract_placeholder("what if I say die to (user)"));
+        assert!(AiModerator::is_abstract_placeholder("saying kys to (someone)"));
+        assert!(AiModerator::is_abstract_placeholder("kill ... somone"));
+        assert!(!AiModerator::is_abstract_placeholder("kill Alex"));
+        assert!(!AiModerator::is_abstract_placeholder("you should die"));
+    }
+
+    #[test]
+    fn test_safe_truncate() {
+        let s = "So crazy slots and bandit n few others  isn’t gonna b in game next week. What else isn’t gonna b in game?😔";
+        let truncated = AiModerator::safe_truncate(s, 40);
+        assert!(truncated.chars().count() <= 40);
+        let truncated_full = AiModerator::safe_truncate(s, 500);
+        assert_eq!(truncated_full, s);
     }
 
     #[test]
@@ -1076,5 +1206,32 @@ mod tests {
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for 'Mizuri will be burned alive...': {:?}\n", verdict);
         assert!(matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_check_message_say_ill_kill_placeholder() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 4,
+            timestamp_unix: 1727376000,
+            author_name: "yphn",
+            author_id: 1018290809835094016,
+            author_nick: Some("Mizuri | tester".to_string()),
+            account_age_days: Some(300),
+            server_member_days: Some(200),
+            roles_count: 3,
+            content: "Say I'll kill ... (Somone)",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'Say I\\'ll kill ... (Somone)': {:?}\n", verdict);
+        assert!(matches!(verdict, ModerationVerdict::Allow));
     }
 }

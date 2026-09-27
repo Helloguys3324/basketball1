@@ -180,7 +180,16 @@ pub async fn handle_button_interaction(ctx: &Context, component: &ComponentInter
             }
         }
         "mod_ok" => {
-            action_status = format!("✅ Approved as false positive / dismissed by <@{}>.", mod_user.id);
+            let mut unmuted_note = "";
+            if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
+                if let Ok(ts_past) = Timestamp::from_unix_timestamp(0) {
+                    let builder = EditMember::new().disable_communication_until_datetime(ts_past);
+                    if gid.edit_member(&ctx.http, uid, builder).await.is_ok() {
+                        unmuted_note = " (Timeout lifted)";
+                    }
+                }
+            }
+            action_status = format!("✅ Approved as false positive / dismissed by <@{}>{}.", mod_user.id, unmuted_note);
         }
         _ => {}
     }
