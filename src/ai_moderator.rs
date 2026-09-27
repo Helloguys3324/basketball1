@@ -222,6 +222,10 @@ pub struct GroqDecision {
 #[derive(Debug, Clone)]
 pub enum ModerationVerdict {
     Allow,
+    WarnOnly {
+        reason: String,
+        warning_text: String,
+    },
     DeleteConfirmed {
         reason: String,
         score: f64,
@@ -591,6 +595,75 @@ impl AiModerator {
         false
     }
 
+    pub fn is_shut_up_or_silencing(text: &str) -> bool {
+        let clean = text
+            .trim()
+            .trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace() && c != '?')
+            .to_lowercase();
+
+        let word_count = clean.split_whitespace().count();
+        if word_count == 0 || word_count > 15 {
+            return false;
+        }
+
+        // Self-referential statements (e.g. "ok i will shut up", "я заткнусь")
+        const SELF_REFERENTIAL: &[&str] = &[
+            "i will shut up", "ill shut up", "i'll shut up", "im gonna shut up",
+            "i should shut up", "i'm shutting up", "im shutting up", "let me shut up",
+            "я заткнусь", "я помолчу", "я замолчу", "я лучше заткнусь", "я лучше помолчу"
+        ];
+        if SELF_REFERENTIAL.iter().any(|&s| clean.contains(s)) {
+            return false;
+        }
+
+        // Question asking why or what about shutting up (e.g. "why should i shut up?", "зачем мне затыкаться?")
+        if clean.contains('?')
+            && (clean.contains("why ")
+                || clean.contains("did ")
+                || clean.contains("how ")
+                || clean.contains("почему ")
+                || clean.contains("зачем "))
+        {
+            return false;
+        }
+
+        // Severe forbidden keywords (slurs/doxx/kys should NOT be excused as shut up)
+        const FORBIDDEN: &[&str] = &[
+            "kys", "kill", "die", "suicide", "doxx", "leak", "address", "ip",
+            "сдохни", "убью", "сожгу", "вскройся", "деанон"
+        ];
+        if FORBIDDEN.iter().any(|&f| clean.contains(f)) {
+            return false;
+        }
+
+        const SILENCING_PATTERNS: &[&str] = &[
+            // English
+            "shut up", "shutup", "shut ur mouth", "shut your mouth", "shut the fuck up",
+            "shut the hell up", "shut it", "stfu", "stfu already", "shut up already",
+            "shut ur face", "shut your face", "pipe down", "zip it", "be quiet", "quiet down",
+            // Russian
+            "заткнись", "заткнитесь", "закрой рот", "закрой свой рот", "заткни рот",
+            "заткни пасть", "закрой пасть", "завали пасть", "завали рот",
+            "завали ебало", "завали хлебало", "завались", "закройся", "рот закрой",
+            "рот офф", "помолчи", "помолчите", "замолчи", "замолчите", "замолкни",
+            "замолкните", "не вякай", "не отсвечивай", "хватит вякать", "хватит пиздеть",
+            "схлопнись"
+        ];
+
+        SILENCING_PATTERNS.iter().any(|&p| {
+            clean == p
+                || clean.starts_with(&format!("{} ", p))
+                || clean.ends_with(&format!(" {}", p))
+                || clean.contains(&format!(" {} ", p))
+                || (p.contains(' ') && clean.contains(p))
+                || (!p.contains(' ')
+                    && clean.split_whitespace().any(|w| {
+                        let w_clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+                        w_clean == p || (p.len() >= 6 && w_clean.starts_with(p))
+                    }))
+        })
+    }
+
     pub fn contains_slur(text: &str) -> bool {
         let lower = text.to_lowercase();
         // Check exact words split by non-alphanumeric characters
@@ -770,6 +843,7 @@ impl AiModerator {
         let has_slur = Self::contains_slur(trimmed);
         let is_game_shield = Self::is_game_shield_evasion(trimmed);
         let is_pvp_callout = Self::is_gaming_pvp_callout(trimmed);
+        let is_shut_up = Self::is_shut_up_or_silencing(trimmed);
         let is_violent_category = matches!(
             top_cat.as_str(),
             "violence" | "violence/graphic" | "self-harm" | "self-harm/intent" | "self-harm/instructions" | "hate" | "hate/threatening" | "harassment/threatening"
@@ -783,6 +857,9 @@ impl AiModerator {
         }
         if is_pvp_callout {
             println!("   🎮 [PVP CALLOUT DETECTED] Tactical in-game callout ('{}')", trimmed);
+        }
+        if is_shut_up {
+            println!("   💬 [SHUT UP / SILENCING DETECTED] Telling others to shut up ('{}')", trimmed);
         }
         if has_slur {
             println!("   🚨 [SLUR DETECTED] Racial/hate slur or masked evasion detected in message!");
@@ -803,18 +880,32 @@ impl AiModerator {
             cat_breakdown
         );
 
-        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait, no dox threats, no slurs and no game shield evasion)
-        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !has_dox_threat && !has_slur && !is_game_shield {
-            println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
-            return ModerationVerdict::Allow;
-        }
-
         let is_directed = Self::is_directed_or_targeted(trimmed, ctx.reply_to.is_some(), ctx.mentions, &history);
         let is_meta = Self::is_meta_or_quote(trimmed);
         let is_abstract_placeholder = Self::is_abstract_placeholder(trimmed);
 
         if is_abstract_placeholder && !is_directed {
             println!("   ↳ [META-PLACEHOLDER] Abstract hypothetical example detected with (someone)/(user) -> ALLOW (0 tokens spent)");
+            return ModerationVerdict::Allow;
+        }
+
+        if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield && !is_meta {
+            let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+            let warning_text = if is_russian {
+                "пожалуйста, будьте спокойнее и общайтесь уважительно. Не стоит затыкать других участников!".to_string()
+            } else {
+                "please stay calm and keep the chat civil. Let everyone speak without telling them to shut up!".to_string()
+            };
+            println!("   💬 [SHUT UP ACTION] Issuing WarnOnly in chat (NO MUTE, no delete)");
+            return ModerationVerdict::WarnOnly {
+                reason: "Telling others to shut up / silencing users".to_string(),
+                warning_text,
+            };
+        }
+
+        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait, no dox threats, no slurs, no game shield evasion, and not shut up)
+        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !has_dox_threat && !has_slur && !is_game_shield && !is_shut_up {
+            println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
             return ModerationVerdict::Allow;
         }
 
@@ -893,6 +984,18 @@ impl AiModerator {
                         } else if is_meta && !is_directed {
                             println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                             return ModerationVerdict::Allow;
+                        } else if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
+                            let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+                            let warning_text = if is_russian {
+                                "пожалуйста, будьте спокойнее и общайтесь уважительно. Не стоит затыкать других участников!".to_string()
+                            } else {
+                                "please stay calm and keep the chat civil. Let everyone speak without telling them to shut up!".to_string()
+                            };
+                            println!("   💬 [SHUT UP GUARD] Overriding LLM {} on silencing directive ('{}') -> WarnOnly in chat (NO MUTE)", decision.verdict, trimmed);
+                            return ModerationVerdict::WarnOnly {
+                                reason: "Telling others to shut up / silencing users".to_string(),
+                                warning_text,
+                            };
                         } else if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                             println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM {} on tactical in-game callout ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
@@ -940,6 +1043,19 @@ impl AiModerator {
                     }
                     Err(e) => {
                         eprintln!("   ❌ [GROQ GUARD FAILOVER] Error: {}. Falling back to FlagSuspicious.", e);
+                        if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
+                            let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+                            let warning_text = if is_russian {
+                                "пожалуйста, будьте спокойнее и общайтесь уважительно. Не стоит затыкать других участников!".to_string()
+                            } else {
+                                "please stay calm and keep the chat civil. Let everyone speak without telling them to shut up!".to_string()
+                            };
+                            println!("   💬 [SHUT UP GUARD] Failover fallback: silencing directive ('{}') -> WarnOnly in chat (NO MUTE)", trimmed);
+                            return ModerationVerdict::WarnOnly {
+                                reason: "Telling others to shut up / silencing users".to_string(),
+                                warning_text,
+                            };
+                        }
                         if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                             println!("   🎮 [PVP CALLOUT GUARD] Failover fallback: tactical in-game callout ('{}') -> ALLOW.", trimmed);
                             return ModerationVerdict::Allow;
@@ -976,6 +1092,20 @@ impl AiModerator {
                         };
                     }
                 }
+            }
+
+            if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
+                let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+                let warning_text = if is_russian {
+                    "пожалуйста, будьте спокойнее и общайтесь уважительно. Не стоит затыкать других участников!".to_string()
+                } else {
+                    "please stay calm and keep the chat civil. Let everyone speak without telling them to shut up!".to_string()
+                };
+                println!("   💬 [SHUT UP GUARD] High score fallback: silencing directive ('{}') -> WarnOnly in chat (NO MUTE)", trimmed);
+                return ModerationVerdict::WarnOnly {
+                    reason: "Telling others to shut up / silencing users".to_string(),
+                    warning_text,
+                };
             }
 
             if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
@@ -1058,6 +1188,19 @@ impl AiModerator {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                         return ModerationVerdict::Allow;
                     }
+                    if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
+                        let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+                        let warning_text = if is_russian {
+                            "пожалуйста, будьте спокойнее и общайтесь уважительно. Не стоит затыкать других участников!".to_string()
+                        } else {
+                            "please stay calm and keep the chat civil. Let everyone speak without telling them to shut up!".to_string()
+                        };
+                        println!("   💬 [SHUT UP GUARD] Overriding LLM DELETE on silencing directive ('{}') -> WarnOnly in chat (NO MUTE)", trimmed);
+                        return ModerationVerdict::WarnOnly {
+                            reason: "Telling others to shut up / silencing users".to_string(),
+                            warning_text,
+                        };
+                    }
                     if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                         println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM DELETE on tactical in-game callout ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
@@ -1093,6 +1236,19 @@ impl AiModerator {
                     if is_meta && !is_directed {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                         return ModerationVerdict::Allow;
+                    }
+                    if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
+                        let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+                        let warning_text = if is_russian {
+                            "пожалуйста, будьте спокойнее и общайтесь уважительно. Не стоит затыкать других участников!".to_string()
+                        } else {
+                            "please stay calm and keep the chat civil. Let everyone speak without telling them to shut up!".to_string()
+                        };
+                        println!("   💬 [SHUT UP GUARD] Overriding LLM SUSPICIOUS on silencing directive ('{}') -> WarnOnly in chat (NO MUTE)", trimmed);
+                        return ModerationVerdict::WarnOnly {
+                            reason: "Telling others to shut up / silencing users".to_string(),
+                            warning_text,
+                        };
                     }
                     if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                         println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM SUSPICIOUS on tactical in-game callout ('{}') to ALLOW.", trimmed);
@@ -1151,6 +1307,19 @@ impl AiModerator {
             }
             Err(e) => {
                 eprintln!("   ❌ [GROQ ERROR] Grey-zone call failed: {}. Checking Slur Guard.", e);
+                if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
+                    let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+                    let warning_text = if is_russian {
+                        "пожалуйста, будьте спокойнее и общайтесь уважительно. Не стоит затыкать других участников!".to_string()
+                    } else {
+                        "please stay calm and keep the chat civil. Let everyone speak without telling them to shut up!".to_string()
+                    };
+                    println!("   💬 [SHUT UP GUARD] Failover fallback on silencing directive ('{}') -> WarnOnly in chat (NO MUTE)", trimmed);
+                    return ModerationVerdict::WarnOnly {
+                        reason: "Telling others to shut up / silencing users".to_string(),
+                        warning_text,
+                    };
+                }
                 if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                     println!("   🎮 [PVP CALLOUT GUARD] Grey-zone failover fallback on tactical in-game callout ('{}') -> ALLOW.", trimmed);
                     return ModerationVerdict::Allow;
@@ -2017,6 +2186,92 @@ mod tests {
         assert!(
             matches!(verdict, ModerationVerdict::Allow),
             "Expected 'kill him' (PvP callout) to be ALLOW, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn test_is_shut_up_or_silencing_unit() {
+        assert!(AiModerator::is_shut_up_or_silencing("SHUT UP"));
+        assert!(AiModerator::is_shut_up_or_silencing("shut up!"));
+        assert!(AiModerator::is_shut_up_or_silencing("stfu"));
+        assert!(AiModerator::is_shut_up_or_silencing("stfu noob"));
+        assert!(AiModerator::is_shut_up_or_silencing("shut your mouth"));
+        assert!(AiModerator::is_shut_up_or_silencing("заткнись"));
+        assert!(AiModerator::is_shut_up_or_silencing("закрой рот"));
+        assert!(AiModerator::is_shut_up_or_silencing("завали ебало"));
+        assert!(AiModerator::is_shut_up_or_silencing("да заткнись уже"));
+        assert!(AiModerator::is_shut_up_or_silencing("замолчи"));
+
+        // Negative cases (self-referential or questions)
+        assert!(!AiModerator::is_shut_up_or_silencing("ok i will shut up"));
+        assert!(!AiModerator::is_shut_up_or_silencing("я заткнусь"));
+        assert!(!AiModerator::is_shut_up_or_silencing("why should i shut up?"));
+        assert!(!AiModerator::is_shut_up_or_silencing("hello guys"));
+
+        // Severe forbidden cases (must not be treated as mere silencing)
+        assert!(!AiModerator::is_shut_up_or_silencing("shut up kys"));
+        assert!(!AiModerator::is_shut_up_or_silencing("заткнись и сдохни"));
+    }
+
+    #[tokio::test]
+    async fn test_check_message_shut_up() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 107,
+            timestamp_unix: 1727376000,
+            author_name: "Gamer1",
+            author_id: 11111,
+            author_nick: Some("Gamer1".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "SHUT UP",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'SHUT UP': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::WarnOnly { .. }),
+            "Expected 'SHUT UP' to be WarnOnly, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_zatknis() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 108,
+            timestamp_unix: 1727376000,
+            author_name: "Gamer2",
+            author_id: 22222,
+            author_nick: Some("Gamer2".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "да заткнись уже",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'да заткнись уже': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::WarnOnly { .. }),
+            "Expected 'да заткнись уже' to be WarnOnly, got {:?}",
             verdict
         );
     }

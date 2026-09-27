@@ -737,6 +737,7 @@ struct Handler {
     http_client: reqwest::Client,
     ai_moderator: AiModerator,
     config: Arc<ConfigStore>,
+    warn_cooldowns: Arc<RwLock<HashMap<u64, Instant>>>,
 }
 
 #[async_trait]
@@ -1063,6 +1064,52 @@ impl EventHandler for Handler {
 
                     // Message deleted, skip image checking
                     return;
+                }
+                ModerationVerdict::WarnOnly { reason, warning_text } => {
+                    println!(
+                        "\n💬 [AI MODERATOR: WARN ONLY] Channel: {} | User: {} ({}) | Reason: {} | Msg: \"{}\"",
+                        msg.channel_id, msg.author.name, msg.author.id, reason, msg.content
+                    );
+
+                    self.ai_moderator.record_message(
+                        msg.channel_id.get(),
+                        msg.id.get(),
+                        msg.author.id.get(),
+                        &msg.author.name,
+                        &msg.content,
+                    );
+
+                    // Check cooldown per user (15 seconds) so repeated silencing doesn't spam the chat
+                    let should_warn = {
+                        let mut cooldowns = self.warn_cooldowns.write().unwrap();
+                        let now = Instant::now();
+                        let key = msg.author.id.get();
+                        if let Some(last_time) = cooldowns.get(&key) {
+                            if now.duration_since(*last_time) < Duration::from_secs(15) {
+                                false
+                            } else {
+                                cooldowns.insert(key, now);
+                                true
+                            }
+                        } else {
+                            cooldowns.insert(key, now);
+                            true
+                        }
+                    };
+
+                    if should_warn {
+                        let warn_msg_text = format!("💬 **Reminder:** <@{}>, {}", msg.author.id, warning_text);
+                        if let Ok(warn_msg) = msg.channel_id.say(&ctx.http, &warn_msg_text).await {
+                            let http = ctx.http.clone();
+                            let channel_id = msg.channel_id;
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(12)).await;
+                                let _ = channel_id.delete_message(&http, warn_msg.id).await;
+                            });
+                        }
+                    }
+
+                    // DO NOT DELETE message, DO NOT TIMEOUT user
                 }
                 ModerationVerdict::Allow => {
                     self.ai_moderator.record_message(
@@ -1516,6 +1563,7 @@ async fn main() {
         http_client,
         ai_moderator,
         config,
+        warn_cooldowns: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Minimal Discord Gateway intents
