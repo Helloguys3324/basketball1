@@ -65,9 +65,13 @@ const COMMON_NON_NAMES: &[&str] = &[
     "yes", "yeah", "nope", "okay", "sure", "well", "look", "wait", "please", "thanks", "thank"
 ];
 
+const PROVOCATIVE_BAIT_KEYWORDS: &[&str] = &[
+    "sexism", "misogyny", "misogynist", "misogynistic", "сексизм", "мизогини", "женоненавист"
+];
+
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
-1.Minor(0-10m):Spam,off-topic,mild toxicity,ghost-ping,bot abuse\n\
+1.Minor/Mild(1m):Spam,off-topic,mild toxicity,edgy bait('i love sexism','i love misogyny'),ghost-ping,bot abuse\n\
 2.Mod(15-30m):Bait,disruptive,NSFW ref,bypass,drama\n\
 3.Major(60-120m):Impersonation,harassment,threats to members,ads,doxx\n\
 4.Crit(720-1440m):Hate/slurs,death threats('kys','you should die'),gore,raid,cheats\n\
@@ -85,13 +89,14 @@ SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
   * Cancer / severe malice wishes ('get cancer in game', 'hope you die in cs') -> SUSPICIOUS(30m)\n\
 REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
 - Hate speech, racism, slurs, calls to kill or exterminate protected racial/ethnic/religious groups ('kill all blacks', 'kill all X', slurs) -> DELETE(1440m). NEVER ALLOW as banter under any pretext.\n\
+- Edgy baiting or trolling on gender/protected topics ('i love sexism', 'i love misogyny', 'i live misogyny') -> SUSPICIOUS(1m) under Minor/Mild.\n\
 - Threats naming users (or short nicknames like 'miz' for 'Mizuri') or with dates/methods -> DELETE(120m)\n\
 - Direct death wishes/suicide: 'kys', 'you should die', 'die idiot' -> SUSPICIOUS(30m)\n\
 - Credible real-world threats with doxxing/stalking: 'i know where you live' -> DELETE(120m)\n\
 Format strictly:\n\
 VERDICT:[ALLOW|SUSPICIOUS|DELETE]\n\
 RULE:[Rule name or None]\n\
-MUTE_MINUTES:[0|5|15|30|60|120|1440]\n\
+MUTE_MINUTES:[0|1|15|30|60|120|1440]\n\
 REASON:[<=8 words]";
 
 pub fn get_env_var(name: &str) -> Option<String> {
@@ -594,6 +599,7 @@ impl AiModerator {
         let history = self.get_context_snapshot(ctx.channel_id);
         let lower = trimmed.to_lowercase();
         let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
+        let has_provocative_bait = PROVOCATIVE_BAIT_KEYWORDS.iter().any(|k| lower.contains(k));
         let is_game_shield = Self::is_game_shield_evasion(trimmed);
         let is_violent_category = matches!(
             top_cat.as_str(),
@@ -619,8 +625,8 @@ impl AiModerator {
             cat_breakdown
         );
 
-        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords and no game shield evasion)
-        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !is_game_shield {
+        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait and no game shield evasion)
+        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !is_game_shield {
             println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
             return ModerationVerdict::Allow;
         }
@@ -768,7 +774,7 @@ impl AiModerator {
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
         // ONLY bypass if it's general non-violent gaming frustration (e.g. "fuck this lag")
-        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !is_game_shield && max_score < 0.60 {
+        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !has_provocative_bait && !is_game_shield && max_score < 0.60 {
             println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
@@ -1121,8 +1127,17 @@ impl AiModerator {
                 if verdict == "DELETE" {
                     mute_minutes = 120;
                 } else if verdict == "SUSPICIOUS" && rule != "None" {
-                    mute_minutes = 30;
+                    if rule.to_lowercase().contains("minor") || rule.to_lowercase().contains("mild") {
+                        mute_minutes = 1;
+                    } else {
+                        mute_minutes = 30;
+                    }
                 }
+            }
+
+            // Enforce 1 minute for Minor / Mild violations instead of 5
+            if mute_minutes == 5 || (mute_minutes > 1 && mute_minutes <= 10 && (rule.to_lowercase().contains("minor") || rule.to_lowercase().contains("mild"))) {
+                mute_minutes = 1;
             }
 
             Ok((GroqDecision {
@@ -1332,4 +1347,37 @@ mod tests {
         println!("\n>>> LIVE TEST VERDICT for hate speech: {:?}\n", verdict);
         assert!(matches!(verdict, ModerationVerdict::DeleteConfirmed { .. }));
     }
+
+    #[tokio::test]
+    async fn test_check_message_mild_bait() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("general".to_string()),
+            message_id: 6,
+            timestamp_unix: 1727376000,
+            author_name: "tahyr2",
+            author_id: 1226577641247735931,
+            author_nick: None,
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "I love sexism",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for mild bait ('I love sexism'): {:?}\n", verdict);
+        match verdict {
+            ModerationVerdict::FlagSuspicious { mute_minutes, .. } => {
+                assert_eq!(mute_minutes, 1, "Expected mild violation to mute for exactly 1 minute, got {}m", mute_minutes);
+            }
+            other => panic!("Expected FlagSuspicious with 1m mute, got {:?}", other),
+        }
+    }
 }
+
