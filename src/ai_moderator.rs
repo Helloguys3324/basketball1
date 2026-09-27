@@ -84,6 +84,7 @@ SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
   * Real-world violence / doxxing disguised as game ('burn your house in rust', 'i will find where you live in game', 'Mizuri will be burned in minecraft') -> DELETE(120m)\n\
   * Cancer / severe malice wishes ('get cancer in game', 'hope you die in cs') -> SUSPICIOUS(30m)\n\
 REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
+- Hate speech, racism, slurs, calls to kill or exterminate protected racial/ethnic/religious groups ('kill all blacks', 'kill all X', slurs) -> DELETE(1440m). NEVER ALLOW as banter under any pretext.\n\
 - Threats naming users (or short nicknames like 'miz' for 'Mizuri') or with dates/methods -> DELETE(120m)\n\
 - Direct death wishes/suicide: 'kys', 'you should die', 'die idiot' -> SUSPICIOUS(30m)\n\
 - Credible real-world threats with doxxing/stalking: 'i know where you live' -> DELETE(120m)\n\
@@ -247,7 +248,10 @@ struct GroqChoice {
 
 #[derive(Deserialize)]
 struct GroqMessageContent {
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 pub struct AiModerator {
@@ -665,6 +669,17 @@ impl AiModerator {
                         );
 
                         if decision.verdict.contains("ALLOW") {
+                            if (top_cat == "hate" || top_cat == "hate/threatening" || cat_breakdown.contains("hate: 0.8") || cat_breakdown.contains("hate: 0.9") || cat_breakdown.contains("hate: 1.0") || cat_breakdown.contains("hate/threatening: 0.8") || cat_breakdown.contains("hate/threatening: 0.9") || cat_breakdown.contains("hate/threatening: 1.0")) && max_score > 0.80 && !is_meta {
+                                println!("   🚨 [HATE SPEECH GUARD] Overriding LLM ALLOW for severe hate speech/hate-threatening violation (score {:.2}) -> DELETE(1440m)", max_score);
+                                return ModerationVerdict::DeleteConfirmed {
+                                    reason: format!("{}: Hate speech inciting violence or racial hatred", top_cat),
+                                    score: max_score,
+                                    category: top_cat,
+                                    model_used: format!("OpenAI Omni-Mod Guard ({})", model_used),
+                                    rule_violated: "Crit (Hate Speech)".to_string(),
+                                    mute_minutes: 1440,
+                                };
+                            }
                             println!("   ✅ [BANTER PASS] LLM verified message as safe gaming hyperbole -> ALLOW");
                             return ModerationVerdict::Allow;
                         } else if is_meta && !is_directed {
@@ -708,6 +723,16 @@ impl AiModerator {
                     }
                     Err(e) => {
                         eprintln!("   ❌ [GROQ GUARD FAILOVER] Error: {}. Falling back to FlagSuspicious.", e);
+                        if (top_cat == "hate" || top_cat == "hate/threatening") && max_score > 0.80 && !is_meta {
+                            return ModerationVerdict::DeleteConfirmed {
+                                reason: format!("{}: Severe hate speech / threatening violation", top_cat),
+                                score: max_score,
+                                category: top_cat,
+                                model_used: "OpenAI Omni-Mod (Crit Guard)".to_string(),
+                                rule_violated: "Crit (Hate Speech)".to_string(),
+                                mute_minutes: 1440,
+                            };
+                        }
                         return ModerationVerdict::FlagSuspicious {
                             reason: format!("High score ({:.2}), pending mod review", max_score),
                             score: max_score,
@@ -718,6 +743,17 @@ impl AiModerator {
                         };
                     }
                 }
+            }
+
+            if (top_cat == "hate" || top_cat == "hate/threatening") && max_score > 0.80 && !is_meta {
+                return ModerationVerdict::DeleteConfirmed {
+                    reason: format!("{}: Severe hate speech / threatening violation", top_cat),
+                    score: max_score,
+                    category: top_cat,
+                    model_used: "OpenAI Omni-Mod (Crit Guard)".to_string(),
+                    rule_violated: "Crit (Hate Speech)".to_string(),
+                    mute_minutes: 1440,
+                };
             }
 
             return ModerationVerdict::FlagSuspicious {
@@ -967,7 +1003,7 @@ impl AiModerator {
         user_prompt: &str,
     ) -> Result<(GroqDecision, u128), String> {
         let start_time = std::time::Instant::now();
-        let max_tokens = if model.contains("gpt-oss") { 320 } else { 75 };
+        let max_tokens = if model.contains("gpt-oss") { 1024 } else { 85 };
         let req_body = GroqChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -1000,7 +1036,8 @@ impl AiModerator {
             return Err(format!("HTTP {}: {}", status, err_text));
         }
 
-        let body: GroqChatResponse = resp.json().await.map_err(|e| format!("JSON decode error: {}", e))?;
+        let raw_json = resp.text().await.map_err(|e| format!("Network error: {}", e))?;
+        let body: GroqChatResponse = serde_json::from_str(&raw_json).map_err(|e| format!("JSON decode error: {}", e))?;
         let elapsed_ms = start_time.elapsed().as_millis();
         if let Some(choice) = body.choices.first() {
             let text = &choice.message.content;
@@ -1012,18 +1049,49 @@ impl AiModerator {
 
             for line in text.lines() {
                 let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
-                let upper = normalized.to_uppercase();
-                if let Some(rest) = upper.strip_prefix("VERDICT:") {
+                let upper_l = normalized.to_uppercase();
+                if let Some(rest) = upper_l.strip_prefix("VERDICT:") {
                     verdict = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'').to_uppercase();
-                } else if let Some(_rest) = upper.strip_prefix("RULE:") {
+                } else if let Some(_rest) = upper_l.strip_prefix("RULE:") {
                     let val = normalized["RULE:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
                     rule = val.to_string();
-                } else if let Some(rest) = upper.strip_prefix("MUTE_MINUTES:") {
+                } else if let Some(rest) = upper_l.strip_prefix("MUTE_MINUTES:") {
                     let num_str = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
                     mute_minutes = num_str.parse::<u64>().unwrap_or(0);
-                } else if let Some(_rest) = upper.strip_prefix("REASON:") {
+                } else if let Some(_rest) = upper_l.strip_prefix("REASON:") {
                     let val = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
                     reason = val.to_string();
+                }
+            }
+
+            // If content was empty or didn't contain VERDICT, also try reasoning if available
+            if verdict.is_empty() {
+                if let Some(ref r) = choice.message.reasoning {
+                    for line in r.lines() {
+                        let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
+                        let upper_l = normalized.to_uppercase();
+                        if let Some(rest) = upper_l.strip_prefix("VERDICT:") {
+                            verdict = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'').to_uppercase();
+                        } else if let Some(_rest) = upper_l.strip_prefix("RULE:") {
+                            let val = normalized["RULE:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                            rule = val.to_string();
+                        } else if let Some(rest) = upper_l.strip_prefix("MUTE_MINUTES:") {
+                            let num_str = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                            mute_minutes = num_str.parse::<u64>().unwrap_or(0);
+                        } else if let Some(_rest) = upper_l.strip_prefix("REASON:") {
+                            let val = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                            reason = val.to_string();
+                        }
+                    }
+                    if verdict.is_empty() {
+                        let r_upper = r.to_uppercase();
+                        if r_upper.contains("DELETE") || r_upper.contains("CRIT") || r_upper.contains("HATE SPEECH") || r_upper.contains("GENOCIDE") {
+                            verdict = "DELETE".to_string();
+                            rule = "Crit".to_string();
+                            mute_minutes = 1440;
+                            reason = "Severe violation identified in evaluation".to_string();
+                        }
+                    }
                 }
             }
 
@@ -1032,6 +1100,9 @@ impl AiModerator {
                     verdict = "DELETE".to_string();
                 } else if upper.contains("SUSPICIOUS") {
                     verdict = "SUSPICIOUS".to_string();
+                } else if text.trim().is_empty() {
+                    // LLM ran out of tokens or returned empty completion - do NOT guess ALLOW!
+                    return Err("LLM returned empty completion (ran out of tokens or filtered)".to_string());
                 } else {
                     verdict = "ALLOW".to_string();
                 }
@@ -1233,5 +1304,32 @@ mod tests {
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for 'Say I\\'ll kill ... (Somone)': {:?}\n", verdict);
         assert!(matches!(verdict, ModerationVerdict::Allow));
+    }
+
+    #[tokio::test]
+    async fn test_check_message_hate_speech() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("general".to_string()),
+            message_id: 5,
+            timestamp_unix: 1727376000,
+            author_name: "ilikeclassics",
+            author_id: 1542942068736000154,
+            author_nick: None,
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "My opinion is, we should kill all blacks",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for hate speech: {:?}\n", verdict);
+        assert!(matches!(verdict, ModerationVerdict::DeleteConfirmed { .. }));
     }
 }
