@@ -1224,13 +1224,11 @@ impl AiModerator {
                 }
             }
 
-            // Correction if model assigned a violation rule or explicitly identified hate/slur, but output ALLOW
+            // Correction only if model explicitly assigned a punishment RULE other than None but output ALLOW
             if verdict == "ALLOW" {
-                let lower_r = reason.to_lowercase();
                 let lower_rule = rule.to_lowercase();
-                if lower_r.contains("slur") || lower_r.contains("hate speech") || lower_rule.contains("crit") {
+                if lower_rule.contains("crit") {
                     verdict = "DELETE".to_string();
-                    rule = "Crit (Slurs/Hate)".to_string();
                     mute_minutes = 1440;
                 } else if (lower_rule.contains("minor") || lower_rule.contains("mild") || lower_rule.contains("mod") || lower_rule.contains("major")) && lower_rule != "none" {
                     verdict = "SUSPICIOUS".to_string();
@@ -1565,6 +1563,33 @@ mod tests {
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for 'They would think your dumb': {:?}\n", verdict);
         assert!(matches!(verdict, ModerationVerdict::Allow), "Expected ALLOW for 'They would think your dumb', got {:?}", verdict);
+    }
+
+    #[tokio::test]
+    async fn test_check_message_fuck_you() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 9,
+            timestamp_unix: 1727376000,
+            author_name: "polska8635",
+            author_id: 795992869164679168,
+            author_nick: Some("BN Meowing cat".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "Fuck you",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'Fuck you': {:?}\n", verdict);
+        assert!(!matches!(verdict, ModerationVerdict::DeleteConfirmed { .. }), "Expected 'Fuck you' NOT to be DeleteConfirmed(1440m Crit Slurs/Hate), got {:?}", verdict);
     }
 }
 
