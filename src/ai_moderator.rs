@@ -69,12 +69,28 @@ const PROVOCATIVE_BAIT_KEYWORDS: &[&str] = &[
     "sexism", "misogyny", "misogynist", "misogynistic", "сексизм", "мизогини", "женоненавист"
 ];
 
+const SLUR_WORDS: &[&str] = &[
+    // N-word and common evasion spellings
+    "nga", "ngas", "ngga", "nggas", "niga", "nigas", "nigga", "niggas", "nigg", "niggers", "nigger", "n1gga", "n1gger", "niqqa", "niqqas",
+    // Homophobic slurs
+    "fag", "fags", "faggot", "faggots", "fagg", "f@g",
+    // Antisemitic slurs
+    "kike", "kikes",
+    // Anti-Asian slurs
+    "chink", "chinks",
+    // Transphobic slurs
+    "tranny", "trannies",
+    // Russian ethnic/homophobic slurs
+    "нигер", "нигеры", "ниггер", "ниггеры", "чурка", "чурки", "хач", "хачи", "пидор", "пидоры", "пидорас", "пидорасы", "хохол", "хохлы"
+];
+
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
-1.Minor/Mild(1m):Spam,off-topic,mild toxicity,edgy bait('i love sexism','i love misogyny'),ghost-ping,bot abuse\n\
-2.Mod(15-30m):Bait,disruptive,NSFW ref,bypass,drama\n\
-3.Major(60-120m):Impersonation,harassment,threats to members,ads,doxx\n\
-4.Crit(720-1440m):Hate/slurs,death threats('kys','you should die'),gore,raid,cheats\n\
+PUNISHMENT TIERS (SUSPICIOUS/DELETE):\n\
+1. Minor/Mild -> SUSPICIOUS(1m): Spam, off-topic, mild toxicity, insults ('dumb ...'), edgy bait ('i love sexism'), ghost-ping, bot abuse\n\
+2. Mod -> SUSPICIOUS(15-30m): Bait, disruptive, NSFW ref, bypass, drama\n\
+3. Major -> SUSPICIOUS(60m) or DELETE(120m): Impersonation, harassment, threats to members, ads, doxx\n\
+4. Crit -> DELETE(1440m): Racial/hate slurs ('nga','ngga','nigga','nigger','fag','faggot'), death threats('kys','you should die'), gore, raid, cheats\n\
 QUOTES, META-TALK & HYPOTHETICAL EXAMPLES (ALLOW, RULE:None, MUTE:0):\n\
 - Discussing server rules, testing bot triggers, quoting past messages, or explaining what caused a mute: 'Say I'll kill ... (Somone)', 'U said kill something ig', 'he got muted for saying die', 'the bot bans for kys'\n\
 - Abstract placeholders & sentence templates ('...', '(someone)', '[user]', '<person>', 'кого-то', 'кто-то'): These are grammatical examples/templates, NOT real threats or harassment against members.\n\
@@ -82,13 +98,15 @@ QUOTES, META-TALK & HYPOTHETICAL EXAMPLES (ALLOW, RULE:None, MUTE:0):\n\
 SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
 - GENUINE BANTER (ALLOW, RULE:None, MUTE:0):\n\
   Boasting strictly about match/skill: '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash'\n\
+  Banter NEVER includes racial slurs or evasive abbreviations like 'nga'. Calling someone 'dumb nga' is a SLUR, NOT banter!\n\
 - FAKE-GAME SHIELD EVASION (PUNISH STRICTLY - SUSPICIOUS/DELETE):\n\
   Trolls append game names ('in minecraft', 'in roblox', 'in game', '1v1') to disguise real toxicity, suicide incitement, or death threats.\n\
   * Suicide / Death wishes disguised with games ('kys in minecraft', 'die in roblox', 'kill yourself in game', 'hang yourself in cs') -> SUSPICIOUS(60m) or DELETE(120m)\n\
   * Real-world violence / doxxing disguised as game ('burn your house in rust', 'i will find where you live in game', 'Mizuri will be burned in minecraft') -> DELETE(120m)\n\
   * Cancer / severe malice wishes ('get cancer in game', 'hope you die in cs') -> SUSPICIOUS(30m)\n\
 REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
-- Hate speech, racism, slurs, calls to kill or exterminate protected racial/ethnic/religious groups ('kill all blacks', 'kill all X', slurs) -> DELETE(1440m). NEVER ALLOW as banter under any pretext.\n\
+- Racial slurs & slur abbreviations ('nga', 'ngga', 'niga', 'nigga', 'nigger', 'fag', 'kike', etc.): Calling someone 'dumb nga', 'nga', etc. -> DELETE(1440m) under Crit (Slurs/Hate). NEVER ALLOW as casual slang or banter under any pretext.\n\
+- Hate speech, racism, calls to kill or exterminate protected groups ('kill all blacks') -> DELETE(1440m). NEVER ALLOW as banter.\n\
 - Edgy baiting or trolling on gender/protected topics ('i love sexism', 'i love misogyny', 'i live misogyny') -> SUSPICIOUS(1m) under Minor/Mild.\n\
 - Threats naming users (or short nicknames like 'miz' for 'Mizuri') or with dates/methods -> DELETE(120m)\n\
 - Direct death wishes/suicide: 'kys', 'you should die', 'die idiot' -> SUSPICIOUS(30m)\n\
@@ -450,6 +468,27 @@ impl AiModerator {
         false
     }
 
+    pub fn contains_slur(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        // Check exact words split by non-alphanumeric characters
+        for word in lower.split(|c: char| !c.is_alphanumeric()) {
+            if word.is_empty() {
+                continue;
+            }
+            if SLUR_WORDS.iter().any(|&s| word == s) {
+                return true;
+            }
+        }
+        // Also check with punctuation removed (e.g. "n.g.a" or "*nga*")
+        let stripped = lower.replace(['.', '-', '_', '*', '`', '~', '/', '\\'], "");
+        for word in stripped.split_whitespace() {
+            if SLUR_WORDS.iter().any(|&s| word == s) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn is_directed_or_targeted(content: &str, has_reply: bool, mentions: &[(u64, String)], history: &[ChatEntry]) -> bool {
         if has_reply || !mentions.is_empty() || content.contains("<@") || content.contains("@") {
             return true;
@@ -600,6 +639,7 @@ impl AiModerator {
         let lower = trimmed.to_lowercase();
         let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
         let has_provocative_bait = PROVOCATIVE_BAIT_KEYWORDS.iter().any(|k| lower.contains(k));
+        let has_slur = Self::contains_slur(trimmed);
         let is_game_shield = Self::is_game_shield_evasion(trimmed);
         let is_violent_category = matches!(
             top_cat.as_str(),
@@ -608,6 +648,9 @@ impl AiModerator {
 
         if is_game_shield {
             println!("   🕵️ [GAME SHIELD DETECTED] Potential veiled toxicity/threat hiding behind game titles!");
+        }
+        if has_slur {
+            println!("   🚨 [SLUR DETECTED] Racial/hate slur or masked evasion detected in message!");
         }
 
         println!(
@@ -625,8 +668,8 @@ impl AiModerator {
             cat_breakdown
         );
 
-        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait and no game shield evasion)
-        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !is_game_shield {
+        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait, no slurs and no game shield evasion)
+        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !has_slur && !is_game_shield {
             println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
             return ModerationVerdict::Allow;
         }
@@ -640,11 +683,12 @@ impl AiModerator {
             return ModerationVerdict::Allow;
         }
 
-        // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore/Threats/Evasions vs Fast Guard for Banter ──
+        // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore/Threats/Slurs vs Fast Guard for Banter ──
         let is_hardcore_or_drama = severe_score > 0.65
             || max_score > 0.78
             || (ctx.reply_to.is_some() && max_score > 0.55)
             || has_severe_harm_keyword
+            || has_slur
             || is_violent_category
             || is_game_shield;
 
@@ -675,6 +719,17 @@ impl AiModerator {
                         );
 
                         if decision.verdict.contains("ALLOW") {
+                            if has_slur && !is_meta {
+                                println!("   🚨 [SLUR GUARD] Overriding LLM ALLOW for detected slur/evasion in message ('{}') -> DELETE(1440m)", trimmed);
+                                return ModerationVerdict::DeleteConfirmed {
+                                    reason: format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed),
+                                    score: if max_score > 0.5 { max_score } else { 0.99 },
+                                    category: "hate".to_string(),
+                                    model_used: format!("Slur Guard ({})", model_used),
+                                    rule_violated: "Crit (Slurs)".to_string(),
+                                    mute_minutes: 1440,
+                                };
+                            }
                             if (top_cat == "hate" || top_cat == "hate/threatening" || cat_breakdown.contains("hate: 0.8") || cat_breakdown.contains("hate: 0.9") || cat_breakdown.contains("hate: 1.0") || cat_breakdown.contains("hate/threatening: 0.8") || cat_breakdown.contains("hate/threatening: 0.9") || cat_breakdown.contains("hate/threatening: 1.0")) && max_score > 0.80 && !is_meta {
                                 println!("   🚨 [HATE SPEECH GUARD] Overriding LLM ALLOW for severe hate speech/hate-threatening violation (score {:.2}) -> DELETE(1440m)", max_score);
                                 return ModerationVerdict::DeleteConfirmed {
@@ -774,7 +829,7 @@ impl AiModerator {
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
         // ONLY bypass if it's general non-violent gaming frustration (e.g. "fuck this lag")
-        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !has_provocative_bait && !is_game_shield && max_score < 0.60 {
+        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !has_provocative_bait && !has_slur && !is_game_shield && max_score < 0.60 {
             println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
@@ -799,7 +854,31 @@ impl AiModerator {
                     "   ⚡ [AI RESPONSE] Model: {} (took {}ms) | Verdict: {} | Rule: {} | Mute: {}m | Reason: \"{}\"",
                     model_used, elapsed_ms, decision.verdict, decision.rule, decision.mute_minutes, decision.reason
                 );
-                if decision.verdict.contains("DELETE") || decision.verdict.contains("SUSPICIOUS") {
+                if decision.verdict.contains("DELETE") || (has_slur && !is_meta) {
+                    if is_meta && !is_directed {
+                        println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
+                        return ModerationVerdict::Allow;
+                    }
+                    let effective_mute = if has_slur { 1440 } else { decision.mute_minutes };
+                    let effective_rule = if has_slur { "Crit (Slurs)".to_string() } else { decision.rule };
+                    let effective_reason = if has_slur { format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed) } else { decision.reason };
+                    println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation in grey zone! Mute: {}m (Rule: {})", effective_mute, effective_rule);
+                    let model_label = if model_used.contains("120b") {
+                        format!("OpenAI + {} (120B Deep Drama Arbiter)", model_used)
+                    } else if model_used.contains("20b") {
+                        format!("OpenAI + {} (20B Safety Arbiter)", model_used)
+                    } else {
+                        format!("OpenAI + {} Guard", model_used)
+                    };
+                    return ModerationVerdict::DeleteConfirmed {
+                        reason: effective_reason,
+                        score: max_score,
+                        category: if has_slur { "hate".to_string() } else { top_cat },
+                        model_used: model_label,
+                        rule_violated: effective_rule,
+                        mute_minutes: effective_mute,
+                    };
+                } else if decision.verdict.contains("SUSPICIOUS") {
                     if is_meta && !is_directed {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                         return ModerationVerdict::Allow;
@@ -821,12 +900,33 @@ impl AiModerator {
                         mute_minutes: decision.mute_minutes,
                     }
                 } else {
+                    if has_slur && !is_meta {
+                        println!("   🚨 [SLUR GUARD] Overriding LLM ALLOW for detected slur in grey zone ('{}') -> DELETE(1440m)", trimmed);
+                        return ModerationVerdict::DeleteConfirmed {
+                            reason: format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed),
+                            score: if max_score > 0.5 { max_score } else { 0.99 },
+                            category: "hate".to_string(),
+                            model_used: format!("Slur Guard ({})", model_used),
+                            rule_violated: "Crit (Slurs)".to_string(),
+                            mute_minutes: 1440,
+                        };
+                    }
                     println!("   ✅ [ALLOW] Grey-zone message allowed by LLM.");
                     ModerationVerdict::Allow
                 }
             }
             Err(e) => {
-                eprintln!("   ❌ [GROQ ERROR] Grey-zone call failed: {}. Allowing.", e);
+                eprintln!("   ❌ [GROQ ERROR] Grey-zone call failed: {}. Checking Slur Guard.", e);
+                if has_slur && !is_meta {
+                    return ModerationVerdict::DeleteConfirmed {
+                        reason: format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed),
+                        score: if max_score > 0.5 { max_score } else { 0.99 },
+                        category: "hate".to_string(),
+                        model_used: "Slur Guard (Failover)".to_string(),
+                        rule_violated: "Crit (Slurs)".to_string(),
+                        mute_minutes: 1440,
+                    };
+                }
                 ModerationVerdict::Allow
             }
         }
@@ -1122,6 +1222,21 @@ impl AiModerator {
                 }
             }
 
+            // Correction if model evaluated text as a violation or toxicity in REASON or RULE but output ALLOW
+            if verdict == "ALLOW" {
+                let lower_r = reason.to_lowercase();
+                let lower_rule = rule.to_lowercase();
+                if lower_r.contains("slur") || lower_r.contains("hate") || lower_rule.contains("crit") {
+                    verdict = "DELETE".to_string();
+                    rule = "Crit (Slurs/Hate)".to_string();
+                    mute_minutes = 1440;
+                } else if lower_r.contains("minor") || lower_r.contains("mild") || lower_r.contains("toxicity") || lower_r.contains("toxic") || lower_rule.contains("minor") || lower_rule.contains("mild") {
+                    verdict = "SUSPICIOUS".to_string();
+                    rule = "Minor/Mild".to_string();
+                    mute_minutes = 1;
+                }
+            }
+
             // Fallback timeout scaling if model omitted MUTE_MINUTES
             if mute_minutes == 0 {
                 if verdict == "DELETE" {
@@ -1377,6 +1492,50 @@ mod tests {
                 assert_eq!(mute_minutes, 1, "Expected mild violation to mute for exactly 1 minute, got {}m", mute_minutes);
             }
             other => panic!("Expected FlagSuspicious with 1m mute, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_contains_slur() {
+        assert!(AiModerator::contains_slur("Like dumb nga"));
+        assert!(AiModerator::contains_slur("nga"));
+        assert!(AiModerator::contains_slur("DUMB NGA!"));
+        assert!(AiModerator::contains_slur("n.g.a"));
+        assert!(!AiModerator::contains_slur("manga"));
+        assert!(!AiModerator::contains_slur("conga"));
+        assert!(!AiModerator::contains_slur("gg ez"));
+    }
+
+    #[tokio::test]
+    async fn test_check_message_slur_evasion() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("general".to_string()),
+            message_id: 7,
+            timestamp_unix: 1727376000,
+            author_name: "gusherz38269547",
+            author_id: 1233954009862377552,
+            author_nick: None,
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "Like dumb nga",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for slur evasion ('Like dumb nga'): {:?}\n", verdict);
+        match verdict {
+            ModerationVerdict::DeleteConfirmed { mute_minutes, rule_violated, .. } => {
+                assert_eq!(mute_minutes, 1440, "Expected 1440m timeout for slur, got {}m", mute_minutes);
+                assert!(rule_violated.contains("Crit"), "Expected Crit rule, got {}", rule_violated);
+            }
+            other => panic!("Expected DeleteConfirmed, got {:?}", other),
         }
     }
 }
