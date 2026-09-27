@@ -51,47 +51,66 @@ pub async fn send_mod_alert(
         .footer(CreateEmbedFooter::new(if is_auto_deleted { "Status: AUTO-ACTION TAKEN | Bot never bans automatically" } else { "Status: PENDING MOD REVIEW" }));
 
     // Buttons:
-    // Mute 10m, Mute 1h, Ban, Delete Msg (if not already deleted), Approve/Dismiss
+    // Row 1: Timeouts & Dismiss (1m, 10m, 1h, 24h, Approve/Dismiss)
+    // Row 2: Moderation & Escalation (Kick, Softban, Ban, [Delete Msg if !is_auto_deleted])
     let id_prefix = format!("{}:{}:{}:{}", gid_str, author_id.get(), channel_id.get(), msg_id.get());
 
-    let btn_mute_10m = CreateButton::new(format!("mod_m10:{}", id_prefix))
-        .label("Mute 10m")
+    let btn_m1m = CreateButton::new(format!("mod_m1m:{}", id_prefix))
+        .label("1m")
+        .style(ButtonStyle::Secondary)
+        .emoji('🔇');
+
+    let btn_m10m = CreateButton::new(format!("mod_m10:{}", id_prefix))
+        .label("10m")
         .style(ButtonStyle::Primary)
         .emoji('🔇');
 
-    let btn_mute_1h = CreateButton::new(format!("mod_m1h:{}", id_prefix))
-        .label("Mute 1h")
+    let btn_m1h = CreateButton::new(format!("mod_m1h:{}", id_prefix))
+        .label("1h")
         .style(ButtonStyle::Primary)
         .emoji('⏳');
 
-    let btn_ban = CreateButton::new(format!("mod_ban:{}", id_prefix))
-        .label("Ban")
-        .style(ButtonStyle::Danger)
-        .emoji('🔨');
+    let btn_m1d = CreateButton::new(format!("mod_m1d:{}", id_prefix))
+        .label("24h")
+        .style(ButtonStyle::Primary)
+        .emoji('🛑');
 
     let btn_dismiss = CreateButton::new(format!("mod_ok:{}", id_prefix))
         .label("Approve / Dismiss")
         .style(ButtonStyle::Success)
         .emoji('✅');
 
-    let mut action_row = CreateActionRow::Buttons(vec![btn_mute_10m, btn_mute_1h, btn_ban, btn_dismiss.clone()]);
+    let row1 = CreateActionRow::Buttons(vec![btn_m1m, btn_m10m, btn_m1h, btn_m1d, btn_dismiss]);
+
+    let btn_kick = CreateButton::new(format!("mod_kick:{}", id_prefix))
+        .label("Kick")
+        .style(ButtonStyle::Danger)
+        .emoji('👢');
+
+    let btn_softban = CreateButton::new(format!("mod_softban:{}", id_prefix))
+        .label("Softban")
+        .style(ButtonStyle::Danger)
+        .emoji('🧹');
+
+    let btn_ban = CreateButton::new(format!("mod_ban:{}", id_prefix))
+        .label("Ban")
+        .style(ButtonStyle::Danger)
+        .emoji('🔨');
+
+    let mut row2_buttons = vec![btn_kick, btn_softban, btn_ban];
 
     if !is_auto_deleted {
         let btn_del = CreateButton::new(format!("mod_del:{}", id_prefix))
             .label("Delete Msg")
             .style(ButtonStyle::Secondary)
             .emoji('🗑');
-        action_row = CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("mod_m10:{}", id_prefix)).label("Mute 10m").style(ButtonStyle::Primary).emoji('🔇'),
-            CreateButton::new(format!("mod_m1h:{}", id_prefix)).label("Mute 1h").style(ButtonStyle::Primary).emoji('⏳'),
-            CreateButton::new(format!("mod_ban:{}", id_prefix)).label("Ban").style(ButtonStyle::Danger).emoji('🔨'),
-            btn_del,
-            btn_dismiss,
-        ]);
+        row2_buttons.push(btn_del);
     }
 
+    let row2 = CreateActionRow::Buttons(row2_buttons);
+
     let target_channel = ChannelId::new(mod_channel_id);
-    let msg_builder = CreateMessage::new().embed(embed).components(vec![action_row]);
+    let msg_builder = CreateMessage::new().embed(embed).components(vec![row1, row2]);
 
     let _ = target_channel.send_message(http, msg_builder).await;
 }
@@ -107,6 +126,7 @@ pub async fn handle_button_interaction(ctx: &Context, component: &ComponentInter
         p.contains(Permissions::ADMINISTRATOR)
             || p.contains(Permissions::MANAGE_MESSAGES)
             || p.contains(Permissions::MODERATE_MEMBERS)
+            || p.contains(Permissions::KICK_MEMBERS)
             || p.contains(Permissions::BAN_MEMBERS)
     }).unwrap_or(false);
 
@@ -135,63 +155,79 @@ pub async fn handle_button_interaction(ctx: &Context, component: &ComponentInter
     let mod_user = &component.user;
     let mut action_status = String::new();
 
-    match action {
-        "mod_m10" => {
-            if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
-                let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                let until_secs = now_secs + 600; // 10 minutes
-                if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
-                    let builder = EditMember::new().disable_communication_until_datetime(ts);
-                    if gid.edit_member(&ctx.http, uid, builder).await.is_ok() {
-                        action_status = format!("🔇 User timed out for 10 minutes by <@{}>.", mod_user.id);
-                    } else {
-                        action_status = "❌ Failed to time out user (missing bot permissions).".to_string();
-                    }
-                }
-            }
-        }
-        "mod_m1h" => {
-            if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
-                let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                let until_secs = now_secs + 3600; // 1 hour
-                if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
-                    let builder = EditMember::new().disable_communication_until_datetime(ts);
-                    if gid.edit_member(&ctx.http, uid, builder).await.is_ok() {
-                        action_status = format!("⏳ User timed out for 1 hour by <@{}>.", mod_user.id);
-                    } else {
-                        action_status = "❌ Failed to time out user (missing bot permissions).".to_string();
-                    }
-                }
-            }
-        }
-        "mod_ban" => {
-            if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
-                if gid.ban_with_reason(&ctx.http, uid, 0, "Banned via AI Mod Alert Button").await.is_ok() {
-                    action_status = format!("🔨 User was banned by <@{}>.", mod_user.id);
+    // Check if action is a timeout
+    let (timeout_dur, timeout_label) = match action {
+        "mod_m1m" => (Some(60), "1 minute"),
+        "mod_m10" => (Some(600), "10 minutes"),
+        "mod_m1h" => (Some(3600), "1 hour"),
+        "mod_m1d" => (Some(86400), "24 hours"),
+        _ => (None, ""),
+    };
+
+    if let Some(dur) = timeout_dur {
+        if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
+            let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let until_secs = now_secs + dur;
+            if let Ok(ts) = Timestamp::from_unix_timestamp(until_secs) {
+                let builder = EditMember::new().disable_communication_until_datetime(ts);
+                if gid.edit_member(&ctx.http, uid, builder).await.is_ok() {
+                    action_status = format!("🔇 User timed out for {} by <@{}>.", timeout_label, mod_user.id);
                 } else {
-                    action_status = "❌ Failed to ban user (missing bot permissions or user has higher role).".to_string();
+                    action_status = "❌ Failed to time out user (missing bot permissions).".to_string();
                 }
             }
         }
-        "mod_del" => {
-            if let (Some(cid), Some(mid)) = (target_channel_id, target_msg_id) {
-                let _ = cid.delete_message(&ctx.http, mid).await;
-                action_status = format!("🗑️ Message deleted from chat by <@{}>.", mod_user.id);
-            }
-        }
-        "mod_ok" => {
-            let mut unmuted_note = "";
-            if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
-                if let Ok(ts_past) = Timestamp::from_unix_timestamp(0) {
-                    let builder = EditMember::new().disable_communication_until_datetime(ts_past);
-                    if gid.edit_member(&ctx.http, uid, builder).await.is_ok() {
-                        unmuted_note = " (Timeout lifted)";
+    } else {
+        match action {
+            "mod_kick" => {
+                if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
+                    if gid.kick_with_reason(&ctx.http, uid, "Kicked via AI Mod Alert Button").await.is_ok() {
+                        action_status = format!("👢 User was kicked by <@{}>.", mod_user.id);
+                    } else {
+                        action_status = "❌ Failed to kick user (missing bot permissions or user has higher role).".to_string();
                     }
                 }
             }
-            action_status = format!("✅ Approved as false positive / dismissed by <@{}>{}.", mod_user.id, unmuted_note);
+            "mod_softban" => {
+                if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
+                    // Softban = ban with 1 day message purge, then immediately unban
+                    if gid.ban_with_reason(&ctx.http, uid, 1, "Softbanned via AI Mod Alert Button (Purge 1d)").await.is_ok() {
+                        let _ = gid.unban(&ctx.http, uid).await;
+                        action_status = format!("🧹 User was softbanned (kicked + messages purged) by <@{}>.", mod_user.id);
+                    } else {
+                        action_status = "❌ Failed to softban user (missing bot permissions or user has higher role).".to_string();
+                    }
+                }
+            }
+            "mod_ban" => {
+                if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
+                    if gid.ban_with_reason(&ctx.http, uid, 1, "Banned via AI Mod Alert Button").await.is_ok() {
+                        action_status = format!("🔨 User was banned by <@{}>.", mod_user.id);
+                    } else {
+                        action_status = "❌ Failed to ban user (missing bot permissions or user has higher role).".to_string();
+                    }
+                }
+            }
+            "mod_del" => {
+                if let (Some(cid), Some(mid)) = (target_channel_id, target_msg_id) {
+                    let _ = cid.delete_message(&ctx.http, mid).await;
+                    action_status = format!("🗑️ Message deleted from chat by <@{}>.", mod_user.id);
+                }
+            }
+            "mod_ok" => {
+                let mut unmuted_note = "";
+                if let (Some(gid), Some(uid)) = (guild_id, target_user_id) {
+                    if let Ok(ts_past) = Timestamp::from_unix_timestamp(0) {
+                        let builder = EditMember::new().disable_communication_until_datetime(ts_past);
+                        if gid.edit_member(&ctx.http, uid, builder).await.is_ok() {
+                            unmuted_note = " (Timeout lifted)";
+                        }
+                    }
+                }
+                action_status = format!("✅ Approved as false positive / dismissed by <@{}>{}.", mod_user.id, unmuted_note);
+            }
+            _ => {}
         }
-        _ => {}
     }
 
     // Update the embed and disable buttons
@@ -200,7 +236,11 @@ pub async fn handle_button_interaction(ctx: &Context, component: &ComponentInter
         if let Some(ref title) = orig_embed.title {
             updated_embed = updated_embed.title(title);
         }
-        let color = if action == "mod_ok" { COLOR_GREEN } else { COLOR_RED };
+        let color = match action {
+            "mod_ok" => COLOR_GREEN,
+            "mod_m1m" | "mod_m10" | "mod_m1h" | "mod_m1d" | "mod_del" => COLOR_ORANGE,
+            _ => COLOR_RED, // kick, softban, ban
+        };
         updated_embed = updated_embed.color(color);
 
         for field in &orig_embed.fields {
