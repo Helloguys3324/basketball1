@@ -69,6 +69,20 @@ const PROVOCATIVE_BAIT_KEYWORDS: &[&str] = &[
     "sexism", "misogyny", "misogynist", "misogynistic", "сексизм", "мизогини", "женоненавист"
 ];
 
+const DOX_AND_EXTORTION_KEYWORDS: &[&str] = &[
+    "spread all your information", "spread your information", "spread your info",
+    "leak your info", "leak your information", "leak your data", "leak your face",
+    "leak your address", "leak your photos", "leak your pics", "post your info",
+    "post your address", "post your face", "post your photos", "expose you", "expose your",
+    "doxx you", "dox you", "doxxed you", "doxed you", "i will doxx", "i will dox",
+    "grabbed your ip", "got your ip", "have your ip", "know where you live", "find where you live",
+    "send swat", "swat you", "swatting",
+    "солью инфу", "солью твои фото", "солью твой адрес", "солью твои данные", "солью в сеть",
+    "слив инфы", "слив фото", "слив данных", "деанон", "сдеаноню", "пробью тебя", "пробил тебя",
+    "знаю где ты живешь", "знаю твой адрес", "распространю твои данные", "выложу твои данные",
+    "выложу твой адрес", "выложу твой номер"
+];
+
 const SLUR_WORDS: &[&str] = &[
     // N-word and common evasion spellings
     "nga", "ngas", "ngga", "nggas", "niga", "nigas", "nigga", "niggas", "nigg", "niggers", "nigger", "n1gga", "n1gger", "niqqa", "niqqas",
@@ -103,6 +117,7 @@ SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
   Standalone casual profanity and common gaming insults ('fuck you', 'fuck u', 'stfu', 'fuck off', 'screw you', 'bitch', 'asshole', 'idiot', 'dumb') WITHOUT death wishes (kys/die) and WITHOUT slurs -> ALWAYS ALLOW (RULE: None, MUTE: 0). NEVER classify standalone 'fuck you' or 'stfu' as Harassment or Minor/Mild!\n\
   POST-IRONY, THEATRICAL HYPERBOLE & DRAMATIC TRASHTALK ('i will eviscerate you', 'i will obliterate you', 'im gonna demolish/annihilate/vaporize you', 'i will tear you to pieces', 'я тебя расщеплю на атомы/разорву/сотру в порошок'): These are 100% POST-IRONIC JOKES and comic gaming exaggeration between members, NOT credible real-world violence! Real threats involve real-world stalking, doxxing, addresses, weapons, or dates. NEVER punish cartoonish/fantasy threats like 'i will eviscerate you'! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
   IN-GAME 'KILL' & PVP TRASHTALK ('i will kill you', 'im gonna kill you', 'let me kill you', 'i will kill you if you throw', 'i will kill you in 1v1'): When the conversation context involves games, matches, ranks, characters, PvP, gameplay, anime, or gaming banter ('stop stealing my kills', 'one match till rankup', '1v1 me', 'playing together'): These refer to IN-GAME CHARACTER DEATH or gaming frustration between players, NOT real-world murder! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). Only punish 'kill' if it threatens REAL-WORLD physical harm (e.g. 'i know where you live and will kill you', real-life stalking, weapons, dates).\n\
+  THIRD-PERSON GAMING CALLOUTS & PVP DIRECTIVES ('kill him', 'kill her', 'kill them', 'kill it', 'shoot him', 'get him', 'focus him', 'finish him', 'убей его', 'добивай', 'завали его'): These are standard tactical PvP/gaming callouts, spectator banter, or stream clip reactions referring to opponents, in-game characters, bosses, or enemies! They are NEVER real-world death threats! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). NEVER classify 'kill him/her/them' as Direct death threat, Harassment, or Violence!\n\
   Banter NEVER includes racial slurs or evasive abbreviations like 'nga'. Calling someone 'dumb nga' is a SLUR, NOT banter!\n\
 - FAKE-GAME SHIELD EVASION (PUNISH STRICTLY - SUSPICIOUS/DELETE):\n\
   Trolls append game names ('in minecraft', 'in roblox', 'in game', '1v1') to disguise real toxicity, suicide incitement, or death threats.\n\
@@ -116,6 +131,7 @@ REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
 - Threats naming users (or short nicknames like 'miz' for 'Mizuri') or with dates/methods -> DELETE(120m)\n\
 - Direct death wishes/suicide: 'kys', 'you should die', 'die idiot' -> SUSPICIOUS(30m)\n\
 - Credible real-world threats with doxxing/stalking: 'i know where you live' -> DELETE(120m)\n\
+- Doxxing, blackmail, extortion & leaking personal info ('I will spread all your information', 'leak your info/photos', 'expose your address', 'doxx you', 'солью инфу', 'деанон') -> DELETE(120m) under Major (Threats/Doxx). Blackmail and spreading private information is a severe violation. NEVER ALLOW under any pretext!\n\
 Format strictly:\n\
 VERDICT:[ALLOW|SUSPICIOUS|DELETE]\n\
 RULE:[Rule name or None]\n\
@@ -535,6 +551,46 @@ impl AiModerator {
         !REAL_WORLD_MALICE.iter().any(|&m| lower.contains(m))
     }
 
+    pub fn is_gaming_pvp_callout(text: &str) -> bool {
+        let clean = text
+            .trim()
+            .trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace())
+            .to_lowercase();
+
+        let word_count = clean.split_whitespace().count();
+        if word_count == 0 || word_count > 8 {
+            return false;
+        }
+
+        const CALLOUTS: &[&str] = &[
+            "kill him", "kill her", "kill them", "kill it", "kill this guy", "kill that guy",
+            "go kill him", "just kill him", "please kill him", "kill him bro", "kill him now",
+            "kill him first", "kill them all", "shoot him", "shoot her", "shoot them",
+            "get him", "get her", "get them", "focus him", "focus her", "focus them",
+            "drop him", "take him down", "finish him", "blow him up",
+            "убей его", "убей ее", "убей их", "убейте его", "убейте их", "убей этого",
+            "мочи его", "завали его", "добивай его", "добивай", "добивайте", "го убей его",
+            "да убей его", "бей его"
+        ];
+
+        let is_match = CALLOUTS.iter().any(|&c| {
+            clean == c
+                || clean.starts_with(&format!("{} ", c))
+                || clean.ends_with(&format!(" {}", c))
+                || clean.contains(&format!(" {} ", c))
+        });
+
+        if is_match {
+            const FORBIDDEN: &[&str] = &[
+                "kys", "kill yourself", "die", "suicide", "irl", "in real life", "house", "address",
+                "where you live", "ip", "doxx", "leak", "сдохни", "в реале", "вскройся", "повесься"
+            ];
+            return !FORBIDDEN.iter().any(|&f| clean.contains(f));
+        }
+
+        false
+    }
+
     pub fn contains_slur(text: &str) -> bool {
         let lower = text.to_lowercase();
         // Check exact words split by non-alphanumeric characters
@@ -652,6 +708,7 @@ impl AiModerator {
         top_cat: &str,
         is_game_shield: bool,
         is_meta: bool,
+        is_pvp_callout: bool,
     ) -> String {
         let mut p = String::with_capacity(512);
 
@@ -680,6 +737,9 @@ impl AiModerator {
         if is_meta {
             p.push_str("ℹ️ META CONTEXT NOTE: Message appears to be a meta-discussion, quote, rule discussion, or hypothetical placeholder example (e.g. discussing what words trigger the bot or using '(someone)'). Do NOT punish users for quoting, discussing bot rules, or hypothetical templates. Only punish genuine threats directed at real people.\n");
         }
+        if is_pvp_callout {
+            p.push_str("ℹ️ PVP CALLOUT NOTE: Message is a short tactical PvP/gaming callout ('kill him/them', 'shoot him', 'убей его') referring to an in-game opponent or character. It is NOT a real-world death threat. You must return VERDICT: ALLOW (RULE: None, MUTE: 0).\n");
+        }
         p
     }
 
@@ -706,8 +766,10 @@ impl AiModerator {
         let lower = trimmed.to_lowercase();
         let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
         let has_provocative_bait = PROVOCATIVE_BAIT_KEYWORDS.iter().any(|k| lower.contains(k));
+        let has_dox_threat = DOX_AND_EXTORTION_KEYWORDS.iter().any(|k| lower.contains(k));
         let has_slur = Self::contains_slur(trimmed);
         let is_game_shield = Self::is_game_shield_evasion(trimmed);
+        let is_pvp_callout = Self::is_gaming_pvp_callout(trimmed);
         let is_violent_category = matches!(
             top_cat.as_str(),
             "violence" | "violence/graphic" | "self-harm" | "self-harm/intent" | "self-harm/instructions" | "hate" | "hate/threatening" | "harassment/threatening"
@@ -715,6 +777,12 @@ impl AiModerator {
 
         if is_game_shield {
             println!("   🕵️ [GAME SHIELD DETECTED] Potential veiled toxicity/threat hiding behind game titles!");
+        }
+        if has_dox_threat {
+            println!("   🚨 [DOX/EXTORTION THREAT DETECTED] Threat to leak personal information/doxx in message!");
+        }
+        if is_pvp_callout {
+            println!("   🎮 [PVP CALLOUT DETECTED] Tactical in-game callout ('{}')", trimmed);
         }
         if has_slur {
             println!("   🚨 [SLUR DETECTED] Racial/hate slur or masked evasion detected in message!");
@@ -735,8 +803,8 @@ impl AiModerator {
             cat_breakdown
         );
 
-        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait, no slurs and no game shield evasion)
-        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !has_slur && !is_game_shield {
+        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait, no dox threats, no slurs and no game shield evasion)
+        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !has_dox_threat && !has_slur && !is_game_shield {
             println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
             return ModerationVerdict::Allow;
         }
@@ -755,6 +823,7 @@ impl AiModerator {
             || max_score > 0.78
             || (ctx.reply_to.is_some() && max_score > 0.55)
             || has_severe_harm_keyword
+            || has_dox_threat
             || has_slur
             || is_violent_category
             || is_game_shield;
@@ -776,7 +845,7 @@ impl AiModerator {
                     history.len(),
                     if is_hardcore_or_drama { "120B Deep Reasoning" } else { "27B Fast Guard" }
                 );
-                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta);
+                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta, is_pvp_callout);
 
                 match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
                     Ok((decision, model_used, elapsed_ms)) => {
@@ -808,15 +877,29 @@ impl AiModerator {
                                     mute_minutes: 1440,
                                 };
                             }
+                            if has_dox_threat && !is_meta {
+                                println!("   🚨 [DOX GUARD] Overriding LLM ALLOW for direct doxxing/extortion threat ('{}') -> DELETE(120m)", trimmed);
+                                return ModerationVerdict::DeleteConfirmed {
+                                    reason: format!("Doxxing, blackmail, or personal info leak threat detected: \"{}\"", trimmed),
+                                    score: if max_score > 0.5 { max_score } else { 0.95 },
+                                    category: "harassment/threatening".to_string(),
+                                    model_used: format!("Dox Guard ({})", model_used),
+                                    rule_violated: "Major (Threats/Doxx)".to_string(),
+                                    mute_minutes: 120,
+                                };
+                            }
                             println!("   ✅ [BANTER PASS] LLM verified message as safe gaming hyperbole -> ALLOW");
                             return ModerationVerdict::Allow;
                         } else if is_meta && !is_directed {
                             println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                             return ModerationVerdict::Allow;
-                        } else if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
+                        } else if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
+                            println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM {} on tactical in-game callout ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
+                        } else if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
                             println!("   🛡️ [BANTER GUARD] Overriding LLM {} on standalone profanity ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
-                        } else if Self::is_theatrical_hyperbole(trimmed) && !has_slur && !is_game_shield {
+                        } else if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                             println!("   🎭 [POST-IRONY GUARD] Overriding LLM {} on theatrical hyperbole ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
                         } else if decision.verdict.contains("DELETE") {
@@ -857,7 +940,23 @@ impl AiModerator {
                     }
                     Err(e) => {
                         eprintln!("   ❌ [GROQ GUARD FAILOVER] Error: {}. Falling back to FlagSuspicious.", e);
-                        if (top_cat == "hate" || top_cat == "hate/threatening") && max_score > 0.80 && !is_meta {
+                        if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
+                            println!("   🎮 [PVP CALLOUT GUARD] Failover fallback: tactical in-game callout ('{}') -> ALLOW.", trimmed);
+                            return ModerationVerdict::Allow;
+                        }
+                        if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
+                            println!("   🛡️ [BANTER GUARD] Failover fallback: standalone profanity ('{}') -> ALLOW.", trimmed);
+                            return ModerationVerdict::Allow;
+                        }
+                        if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
+                            println!("   🎭 [POST-IRONY GUARD] Failover fallback: theatrical hyperbole ('{}') -> ALLOW.", trimmed);
+                            return ModerationVerdict::Allow;
+                        }
+                        if is_meta && !is_directed {
+                            println!("   🛡️ [META GUARD] Failover fallback: meta quote -> ALLOW.");
+                            return ModerationVerdict::Allow;
+                        }
+                        if (top_cat == "hate" || top_cat == "hate/threatening" || top_cat == "harassment/threatening") && max_score > 0.80 && !is_meta {
                             return ModerationVerdict::DeleteConfirmed {
                                 reason: format!("{}: Severe hate speech / threatening violation", top_cat),
                                 score: max_score,
@@ -879,7 +978,24 @@ impl AiModerator {
                 }
             }
 
-            if (top_cat == "hate" || top_cat == "hate/threatening") && max_score > 0.80 && !is_meta {
+            if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
+                println!("   🎮 [PVP CALLOUT GUARD] High score fallback: tactical in-game callout ('{}') -> ALLOW.", trimmed);
+                return ModerationVerdict::Allow;
+            }
+            if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
+                println!("   🛡️ [BANTER GUARD] High score fallback: standalone profanity ('{}') -> ALLOW.", trimmed);
+                return ModerationVerdict::Allow;
+            }
+            if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
+                println!("   🎭 [POST-IRONY GUARD] High score fallback: theatrical hyperbole ('{}') -> ALLOW.", trimmed);
+                return ModerationVerdict::Allow;
+            }
+            if is_meta && !is_directed {
+                println!("   🛡️ [META GUARD] High score fallback: meta quote -> ALLOW.");
+                return ModerationVerdict::Allow;
+            }
+
+            if (top_cat == "hate" || top_cat == "hate/threatening" || top_cat == "harassment/threatening") && max_score > 0.80 && !is_meta {
                 return ModerationVerdict::DeleteConfirmed {
                     reason: format!("{}: Severe hate speech / threatening violation", top_cat),
                     score: max_score,
@@ -902,12 +1018,22 @@ impl AiModerator {
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
         // ONLY bypass if it's general non-violent gaming frustration (e.g. "fuck this lag")
-        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !has_provocative_bait && !has_slur && !is_game_shield && max_score < 0.60 {
+        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !has_provocative_bait && !has_dox_threat && !has_slur && !is_game_shield && max_score < 0.60 {
             println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
 
         if self.groq_keys.is_empty() {
+            if has_dox_threat && !is_meta {
+                return ModerationVerdict::DeleteConfirmed {
+                    reason: format!("Doxxing, blackmail, or personal info leak threat detected: \"{}\"", trimmed),
+                    score: 0.95,
+                    category: "harassment/threatening".to_string(),
+                    model_used: "Local Dox Guard".to_string(),
+                    rule_violated: "Major (Threats/Doxx)".to_string(),
+                    mute_minutes: 120,
+                };
+            }
             println!("   ↳ [NO KEYS] Groq keys not configured -> ALLOW");
             return ModerationVerdict::Allow;
         }
@@ -919,7 +1045,7 @@ impl AiModerator {
             history.len(),
             is_directed
         );
-        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta);
+        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta, is_pvp_callout);
 
         match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
             Ok((decision, model_used, elapsed_ms)) => {
@@ -932,11 +1058,15 @@ impl AiModerator {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                         return ModerationVerdict::Allow;
                     }
-                    if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
+                    if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
+                        println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM DELETE on tactical in-game callout ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🛡️ [BANTER GUARD] Overriding LLM DELETE on standalone profanity ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
-                    if Self::is_theatrical_hyperbole(trimmed) && !has_slur && !is_game_shield {
+                    if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🎭 [POST-IRONY GUARD] Overriding LLM DELETE on theatrical hyperbole ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
@@ -964,11 +1094,15 @@ impl AiModerator {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                         return ModerationVerdict::Allow;
                     }
-                    if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
+                    if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
+                        println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM SUSPICIOUS on tactical in-game callout ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🛡️ [BANTER GUARD] Overriding LLM SUSPICIOUS on standalone profanity ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
-                    if Self::is_theatrical_hyperbole(trimmed) && !has_slur && !is_game_shield {
+                    if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🎭 [POST-IRONY GUARD] Overriding LLM SUSPICIOUS on theatrical hyperbole ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
@@ -1000,12 +1134,27 @@ impl AiModerator {
                             mute_minutes: 1440,
                         };
                     }
+                    if has_dox_threat && !is_meta {
+                        println!("   🚨 [DOX GUARD] Overriding LLM ALLOW for direct doxxing/extortion threat in grey zone ('{}') -> DELETE(120m)", trimmed);
+                        return ModerationVerdict::DeleteConfirmed {
+                            reason: format!("Doxxing, blackmail, or personal info leak threat detected: \"{}\"", trimmed),
+                            score: if max_score > 0.5 { max_score } else { 0.95 },
+                            category: "harassment/threatening".to_string(),
+                            model_used: format!("Dox Guard ({})", model_used),
+                            rule_violated: "Major (Threats/Doxx)".to_string(),
+                            mute_minutes: 120,
+                        };
+                    }
                     println!("   ✅ [ALLOW] Grey-zone message allowed by LLM.");
                     ModerationVerdict::Allow
                 }
             }
             Err(e) => {
                 eprintln!("   ❌ [GROQ ERROR] Grey-zone call failed: {}. Checking Slur Guard.", e);
+                if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
+                    println!("   🎮 [PVP CALLOUT GUARD] Grey-zone failover fallback on tactical in-game callout ('{}') -> ALLOW.", trimmed);
+                    return ModerationVerdict::Allow;
+                }
                 if has_slur && !is_meta {
                     return ModerationVerdict::DeleteConfirmed {
                         reason: format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed),
@@ -1014,6 +1163,26 @@ impl AiModerator {
                         model_used: "Slur Guard (Failover)".to_string(),
                         rule_violated: "Crit (Slurs)".to_string(),
                         mute_minutes: 1440,
+                    };
+                }
+                if has_dox_threat && !is_meta {
+                    return ModerationVerdict::DeleteConfirmed {
+                        reason: format!("Doxxing, blackmail, or personal info leak threat detected: \"{}\"", trimmed),
+                        score: if max_score > 0.5 { max_score } else { 0.95 },
+                        category: "harassment/threatening".to_string(),
+                        model_used: "Dox Guard (Failover)".to_string(),
+                        rule_violated: "Major (Threats/Doxx)".to_string(),
+                        mute_minutes: 120,
+                    };
+                }
+                if has_provocative_bait {
+                    return ModerationVerdict::FlagSuspicious {
+                        reason: "Provocative baiting on sensitive topic".to_string(),
+                        score: max_score,
+                        category: top_cat,
+                        model_used: "Bait Guard (Failover)".to_string(),
+                        rule_violated: "Minor/Mild (Baiting)".to_string(),
+                        mute_minutes: 1,
                     };
                 }
                 ModerationVerdict::Allow
@@ -1757,6 +1926,99 @@ mod tests {
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for in-game 'i will kill you if you throw': {:?}\n", verdict);
         assert!(matches!(verdict, ModerationVerdict::Allow), "Expected in-game kill to be ALLOW, got {:?}", verdict);
+    }
+
+    #[tokio::test]
+    async fn test_check_message_spread_info() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 104,
+            timestamp_unix: 1727376000,
+            author_name: "Troll",
+            author_id: 99999,
+            author_nick: Some("Troll".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "I will spread all your information in social media",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'spread info': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }),
+            "Expected doxxing threat to be punished with Delete or Suspicious, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_dox_russian() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 105,
+            timestamp_unix: 1727376000,
+            author_name: "TrollRu",
+            author_id: 88888,
+            author_nick: Some("TrollRu".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "жди я солью твои данные и адрес",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for Russian doxx threat: {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }),
+            "Expected Russian doxxing threat to be punished with Delete or Suspicious, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_kill_him() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 106,
+            timestamp_unix: 1727376000,
+            author_name: "__mondej",
+            author_id: 1403293782186922054,
+            author_nick: Some("__mondej".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "kill him",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'kill him': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected 'kill him' (PvP callout) to be ALLOW, got {:?}",
+            verdict
+        );
     }
 }
 
