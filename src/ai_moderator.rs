@@ -101,6 +101,7 @@ SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
 - GENUINE BANTER & OPINIONS (ALLOW, RULE:None, MUTE:0):\n\
   Boasting, expressing opinions, casual critique ('They would think your dumb', 'you played bad', '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash').\n\
   Standalone casual profanity and common gaming insults ('fuck you', 'fuck u', 'stfu', 'fuck off', 'screw you', 'bitch', 'asshole', 'idiot', 'dumb') WITHOUT death wishes (kys/die) and WITHOUT slurs -> ALWAYS ALLOW (RULE: None, MUTE: 0). NEVER classify standalone 'fuck you' or 'stfu' as Harassment or Minor/Mild!\n\
+  POST-IRONY, THEATRICAL HYPERBOLE & DRAMATIC TRASHTALK ('i will eviscerate you', 'i will obliterate you', 'im gonna demolish/annihilate/vaporize you', 'i will tear you to pieces', 'я тебя расщеплю на атомы/разорву/сотру в порошок'): These are 100% POST-IRONIC JOKES and comic gaming exaggeration between members, NOT credible real-world violence! Real threats involve real-world stalking, doxxing, addresses, weapons, or dates. NEVER punish cartoonish/fantasy threats like 'i will eviscerate you'! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
   Banter NEVER includes racial slurs or evasive abbreviations like 'nga'. Calling someone 'dumb nga' is a SLUR, NOT banter!\n\
 - FAKE-GAME SHIELD EVASION (PUNISH STRICTLY - SUSPICIOUS/DELETE):\n\
   Trolls append game names ('in minecraft', 'in roblox', 'in game', '1v1') to disguise real toxicity, suicide incitement, or death threats.\n\
@@ -511,6 +512,28 @@ impl AiModerator {
         )
     }
 
+    pub fn is_theatrical_hyperbole(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        const HYPERBOLE_WORDS: &[&str] = &[
+            "eviscerate", "obliterate", "annihilate", "demolish", "decimate",
+            "disintegrate", "atomize", "vaporize", "turn into dust",
+            "fold you like a lawn chair", "tear you to pieces", "rip you apart",
+            "выпотрошу", "расщеплю", "сотру в порошок", "на атомы", "порву как грелку",
+            "разорву на куски", "размажу по стенке"
+        ];
+        let has_hyperbole = HYPERBOLE_WORDS.iter().any(|&w| lower.contains(w));
+        if !has_hyperbole {
+            return false;
+        }
+        // Only safe if there is NO real-world stalking/doxxing/severe violence keywords
+        const REAL_WORLD_MALICE: &[&str] = &[
+            "doxx", "leak", "address", "where you live", "find your house", "ip",
+            "burn alive", "burned alive", "cancer", "kys", "hang yourself", "suicide",
+            "сожгу", "повесься", "вскройся", "деанон", "сват"
+        ];
+        !REAL_WORLD_MALICE.iter().any(|&m| lower.contains(m))
+    }
+
     pub fn contains_slur(text: &str) -> bool {
         let lower = text.to_lowercase();
         // Check exact words split by non-alphanumeric characters
@@ -792,6 +815,9 @@ impl AiModerator {
                         } else if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
                             println!("   🛡️ [BANTER GUARD] Overriding LLM {} on standalone profanity ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
+                        } else if Self::is_theatrical_hyperbole(trimmed) && !has_slur && !is_game_shield {
+                            println!("   🎭 [POST-IRONY GUARD] Overriding LLM {} on theatrical hyperbole ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
                         } else if decision.verdict.contains("DELETE") {
                             println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                             let model_label = if model_used.contains("120b") {
@@ -909,6 +935,10 @@ impl AiModerator {
                         println!("   🛡️ [BANTER GUARD] Overriding LLM DELETE on standalone profanity ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
+                    if Self::is_theatrical_hyperbole(trimmed) && !has_slur && !is_game_shield {
+                        println!("   🎭 [POST-IRONY GUARD] Overriding LLM DELETE on theatrical hyperbole ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
                     let effective_mute = if has_slur { 1440 } else { decision.mute_minutes };
                     let effective_rule = if has_slur { "Crit (Slurs)".to_string() } else { decision.rule };
                     let effective_reason = if has_slur { format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed) } else { decision.reason };
@@ -935,6 +965,10 @@ impl AiModerator {
                     }
                     if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
                         println!("   🛡️ [BANTER GUARD] Overriding LLM SUSPICIOUS on standalone profanity ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if Self::is_theatrical_hyperbole(trimmed) && !has_slur && !is_game_shield {
+                        println!("   🎭 [POST-IRONY GUARD] Overriding LLM SUSPICIOUS on theatrical hyperbole ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
                     println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
@@ -1655,6 +1689,44 @@ mod tests {
         assert!(AiModerator::is_standalone_profanity("fuck tou"));
         assert!(AiModerator::is_standalone_profanity("пошел нахуй"));
         assert!(!AiModerator::is_standalone_profanity("hello world"));
+    }
+
+    #[test]
+    fn test_is_theatrical_hyperbole() {
+        assert!(AiModerator::is_theatrical_hyperbole("i will eviscerate you"));
+        assert!(AiModerator::is_theatrical_hyperbole("<@12345> i will obliterate you"));
+        assert!(AiModerator::is_theatrical_hyperbole("im gonna annihilate you in 1v1"));
+        assert!(AiModerator::is_theatrical_hyperbole("я тебя сотру в порошок"));
+        // Not safe if real-world doxxing or severe violence
+        assert!(!AiModerator::is_theatrical_hyperbole("i will eviscerate you and i know where you live"));
+        assert!(!AiModerator::is_theatrical_hyperbole("regular message"));
+    }
+
+    #[tokio::test]
+    async fn test_check_message_eviscerate() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 10,
+            timestamp_unix: 1727376000,
+            author_name: "kroticzz",
+            author_id: 615497792915505153,
+            author_nick: Some("kroticzz".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "<@642949365861842994> i will eviscerate you",
+            reply_to: None,
+            mentions: &[(642949365861842994, "partlow".to_string())],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'i will eviscerate you': {:?}\n", verdict);
+        assert!(matches!(verdict, ModerationVerdict::Allow), "Expected 'i will eviscerate you' to be ALLOW, got {:?}", verdict);
     }
 }
 
