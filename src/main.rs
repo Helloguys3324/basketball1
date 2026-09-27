@@ -783,6 +783,7 @@ impl EventHandler for Handler {
                                 m.author.id.get(),
                                 &m.author.name,
                                 &m.content,
+                                m.timestamp.unix_timestamp(),
                             );
                         }
                     }
@@ -982,6 +983,7 @@ impl EventHandler for Handler {
                         msg.author.id.get(),
                         &msg.author.name,
                         &msg.content,
+                        msg.timestamp.unix_timestamp(),
                     );
 
                     if AUTO_DELETE {
@@ -1077,6 +1079,7 @@ impl EventHandler for Handler {
                         msg.author.id.get(),
                         &msg.author.name,
                         &msg.content,
+                        msg.timestamp.unix_timestamp(),
                     );
 
                     // Check cooldown per user (15 seconds) so repeated silencing doesn't spam the chat
@@ -1118,6 +1121,7 @@ impl EventHandler for Handler {
                         msg.author.id.get(),
                         &msg.author.name,
                         &msg.content,
+                        msg.timestamp.unix_timestamp(),
                     );
                 }
             }

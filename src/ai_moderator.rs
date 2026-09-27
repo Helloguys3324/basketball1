@@ -190,6 +190,7 @@ pub struct ChatEntry {
     pub author_name: String,
     pub author_id: u64,
     pub content: String,
+    pub timestamp_unix: i64,
 }
 
 pub struct MessageContext<'a> {
@@ -255,9 +256,17 @@ pub enum ImageModerationVerdict {
 }
 
 #[derive(Serialize)]
-struct OpenAiModRequest<'a> {
+struct OpenAiBatchModRequest<'a> {
     model: &'a str,
-    input: &'a str,
+    input: Vec<&'a str>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenAiScores {
+    pub max_score: f64,
+    pub severe_score: f64,
+    pub top_cat: String,
+    pub breakdown: String,
 }
 
 #[derive(Deserialize)]
@@ -340,7 +349,7 @@ impl AiModerator {
         }
     }
 
-    pub fn record_message(&self, channel_id: u64, message_id: u64, author_id: u64, author_name: &str, content: &str) {
+    pub fn record_message(&self, channel_id: u64, message_id: u64, author_id: u64, author_name: &str, content: &str, timestamp_unix: i64) {
         if content.trim().is_empty() {
             return;
         }
@@ -360,7 +369,26 @@ impl AiModerator {
             author_id,
             author_name: author_name.to_string(),
             content: content.to_string(),
+            timestamp_unix,
         });
+    }
+
+    pub fn get_author_recent_context(&self, channel_id: u64, author_id: u64, current_timestamp: i64) -> Vec<String> {
+        let history = self.chat_history.read().unwrap();
+        if let Some(queue) = history.get(&channel_id) {
+            queue
+                .iter()
+                .rev()
+                .filter(|e| e.author_id == author_id && (current_timestamp - e.timestamp_unix).abs() <= 60)
+                .take(2)
+                .map(|e| e.content.clone())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn get_history_count(&self, channel_id: u64) -> usize {
@@ -782,6 +810,7 @@ impl AiModerator {
         is_game_shield: bool,
         is_meta: bool,
         is_pvp_callout: bool,
+        author_combined_thought: Option<&str>,
     ) -> String {
         let mut p = String::with_capacity(512);
 
@@ -799,6 +828,10 @@ impl AiModerator {
         p.push_str("FLAGGED MESSAGE TO EVALUATE:\n");
         p.push_str(&format!("Author: @{}\n", ctx.author_name));
         p.push_str(&format!("Content: \"{}\"\n", ctx.content.trim()));
+        if let Some(comb) = author_combined_thought {
+            let short_comb = Self::safe_truncate(comb, 180);
+            p.push_str(&format!("Author's Recent Combined Context: \"{}\"\n", short_comb.trim().replace('\n', " // ")));
+        }
         if let Some((rep_author, _, _, rep_text)) = ctx.reply_to {
             let short_rep = Self::safe_truncate(rep_text, 90);
             p.push_str(&format!("Replying to: @{}: \"{}\"\n", rep_author, short_rep.trim()));
@@ -830,20 +863,63 @@ impl AiModerator {
             None => return ModerationVerdict::Allow,
         };
 
-        let (max_score, severe_score, top_cat, cat_breakdown) = match self.call_openai_moderation(openai_key, trimmed).await {
-            Ok(scores) => scores,
-            Err(_) => (0.0, 0.0, String::new(), String::new()),
+        // Fetch author's recent messages in this channel within 60 seconds
+        let author_past_msgs = self.get_author_recent_context(ctx.channel_id, ctx.author_id, ctx.timestamp_unix);
+        let has_author_context = !author_past_msgs.is_empty();
+        let combined_text = if has_author_context {
+            format!("{}\n{}", author_past_msgs.join("\n"), trimmed)
+        } else {
+            trimmed.to_string()
         };
+
+        let inputs: Vec<&str> = if has_author_context {
+            vec![trimmed, &combined_text]
+        } else {
+            vec![trimmed]
+        };
+
+        let scores_list = match self.call_openai_moderation(openai_key, &inputs).await {
+            Ok(scores) => scores,
+            Err(_) => vec![OpenAiScores::default(); inputs.len()],
+        };
+
+        let single_scores = scores_list.get(0).cloned().unwrap_or_default();
+        let combined_scores = scores_list.get(1).cloned();
+
+        let mut max_score = single_scores.max_score;
+        let mut severe_score = single_scores.severe_score;
+        let mut top_cat = single_scores.top_cat;
+        let mut cat_breakdown = single_scores.breakdown;
 
         let history = self.get_context_snapshot(ctx.channel_id);
         let lower = trimmed.to_lowercase();
-        let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
+        let combined_lower = combined_text.to_lowercase();
+        let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k) || combined_lower.contains(k));
         let has_provocative_bait = PROVOCATIVE_BAIT_KEYWORDS.iter().any(|k| lower.contains(k));
-        let has_dox_threat = DOX_AND_EXTORTION_KEYWORDS.iter().any(|k| lower.contains(k));
-        let has_slur = Self::contains_slur(trimmed);
-        let is_game_shield = Self::is_game_shield_evasion(trimmed);
+        let has_dox_threat = DOX_AND_EXTORTION_KEYWORDS.iter().any(|k| lower.contains(k) || combined_lower.contains(k));
+        let has_slur = Self::contains_slur(trimmed) || Self::contains_slur(&combined_text);
+        let is_game_shield = Self::is_game_shield_evasion(trimmed) || Self::is_game_shield_evasion(&combined_text);
         let is_pvp_callout = Self::is_gaming_pvp_callout(trimmed);
         let is_shut_up = Self::is_shut_up_or_silencing(trimmed);
+
+        if let Some(ref cs) = combined_scores {
+            if cs.severe_score > severe_score + 0.10 || cs.max_score > max_score + 0.15 {
+                println!(
+                    "   ⚡ [SPLIT THREAT ESCALATION] Combined author thought scores higher! (Single: {:.2} -> Combined: {:.2} [{}] | Severe: {:.2} -> {:.2})",
+                    max_score, cs.max_score, cs.top_cat, severe_score, cs.severe_score
+                );
+                max_score = cs.max_score;
+                severe_score = cs.severe_score;
+                top_cat = cs.top_cat.clone();
+                cat_breakdown = cs.breakdown.clone();
+            } else if max_score > 0.80 && is_pvp_callout && cs.severe_score < 0.15 {
+                println!(
+                    "   🎮 [AUTHOR CONTEXT CLARIFICATION] In-game context confirmed by combined author messages! Severe score: {:.2}",
+                    cs.severe_score
+                );
+            }
+        }
+
         let is_violent_category = matches!(
             top_cat.as_str(),
             "violence" | "violence/graphic" | "self-harm" | "self-harm/intent" | "self-harm/instructions" | "hate" | "hate/threatening" | "harassment/threatening"
@@ -872,6 +948,13 @@ impl AiModerator {
             ctx.author_id,
             trimmed
         );
+        if has_author_context {
+            println!(
+                "   👥 [AUTHOR CONTEXT BATCH] {} prior msgs | Combined: \"{}\"",
+                author_past_msgs.len(),
+                Self::safe_truncate(&combined_text.replace('\n', " // "), 80)
+            );
+        }
         println!(
             "   📊 [OPENAI] Max Score: {:.2} ({}) | Severe: {:.2} | Details: [{}]",
             max_score,
@@ -936,7 +1019,16 @@ impl AiModerator {
                     history.len(),
                     if is_hardcore_or_drama { "120B Deep Reasoning" } else { "27B Fast Guard" }
                 );
-                let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta, is_pvp_callout);
+                let user_prompt = self.format_compact_prompt(
+                    ctx,
+                    &history,
+                    max_score,
+                    &top_cat,
+                    is_game_shield,
+                    is_meta,
+                    is_pvp_callout,
+                    if has_author_context { Some(combined_text.as_str()) } else { None },
+                );
 
                 match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
                     Ok((decision, model_used, elapsed_ms)) => {
@@ -1175,7 +1267,16 @@ impl AiModerator {
             history.len(),
             is_directed
         );
-        let user_prompt = self.format_compact_prompt(ctx, &history, max_score, &top_cat, is_game_shield, is_meta, is_pvp_callout);
+        let user_prompt = self.format_compact_prompt(
+            ctx,
+            &history,
+            max_score,
+            &top_cat,
+            is_game_shield,
+            is_meta,
+            is_pvp_callout,
+            if has_author_context { Some(combined_text.as_str()) } else { None },
+        );
 
         match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
             Ok((decision, model_used, elapsed_ms)) => {
@@ -1359,10 +1460,10 @@ impl AiModerator {
         }
     }
 
-    async fn call_openai_moderation(&self, api_key: &str, text: &str) -> Result<(f64, f64, String, String), reqwest::Error> {
-        let req_body = OpenAiModRequest {
+    async fn call_openai_moderation(&self, api_key: &str, texts: &[&str]) -> Result<Vec<OpenAiScores>, reqwest::Error> {
+        let req_body = OpenAiBatchModRequest {
             model: "omni-moderation-latest",
-            input: text,
+            input: texts.to_vec(),
         };
 
         let resp = self
@@ -1378,17 +1479,19 @@ impl AiModerator {
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
             eprintln!("[OPENAI API ERROR] Status {}: {}", status, err_text);
-            return Ok((0.0, 0.0, String::new(), String::new()));
+            return Ok(vec![OpenAiScores::default(); texts.len()]);
         }
 
         let body: OpenAiModResponse = resp.json().await?;
-        if let Some(first) = body.results.first() {
+        let mut results = Vec::with_capacity(body.results.len());
+
+        for res in body.results {
             let mut max_score = 0.0_f64;
             let mut severe_score = 0.0_f64;
             let mut top_cat = String::new();
             let mut breakdown_parts = Vec::new();
 
-            for (cat, &score) in &first.category_scores {
+            for (cat, &score) in &res.category_scores {
                 if score > 0.10 {
                     breakdown_parts.push(format!("{}: {:.2}", cat, score));
                 }
@@ -1402,10 +1505,19 @@ impl AiModerator {
                     }
                 }
             }
-            Ok((max_score, severe_score, top_cat, breakdown_parts.join(", ")))
-        } else {
-            Ok((0.0, 0.0, String::new(), String::new()))
+            results.push(OpenAiScores {
+                max_score,
+                severe_score,
+                top_cat,
+                breakdown: breakdown_parts.join(", "),
+            });
         }
+
+        while results.len() < texts.len() {
+            results.push(OpenAiScores::default());
+        }
+
+        Ok(results)
     }
 
     pub async fn check_image_bytes(&self, image_bytes: &[u8], mime_type: &str) -> ImageModerationVerdict {
@@ -1712,6 +1824,7 @@ mod tests {
                 author_id: 100,
                 author_name: "Mizuri".to_string(),
                 content: "hi".to_string(),
+                timestamp_unix: 1727376000,
             }
         ];
         assert!(AiModerator::is_directed_or_targeted("ты клоун", false, &[], &[]));
@@ -1771,8 +1884,8 @@ mod tests {
     fn test_chat_history_buffer() {
         let client = reqwest::Client::new();
         let moderator = AiModerator::new(client);
-        moderator.record_message(101, 1001, 2001, "Alice", "Hello everyone");
-        moderator.record_message(101, 1002, 2002, "Bob", "Hey Alice");
+        moderator.record_message(101, 1001, 2001, "Alice", "Hello everyone", 1727376000);
+        moderator.record_message(101, 1002, 2002, "Bob", "Hey Alice", 1727376005);
         let history = moderator.get_context_snapshot(101);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].message_id, 1001);
@@ -2072,8 +2185,8 @@ mod tests {
     async fn test_check_message_in_game_kill_context() {
         let client = reqwest::Client::new();
         let moderator = AiModerator::new(client);
-        moderator.record_message(1, 101, 12345, "Machi", "one match till i rankup in cs");
-        moderator.record_message(1, 102, 67890, "GusherZ", "im picking sniper on mid");
+        moderator.record_message(1, 101, 12345, "Machi", "one match till i rankup in cs", 1727375990);
+        moderator.record_message(1, 102, 67890, "GusherZ", "im picking sniper on mid", 1727375995);
         let ctx = MessageContext {
             guild_id: Some(123456789),
             guild_name: Some("Gaming Arena".to_string()),
@@ -2275,5 +2388,74 @@ mod tests {
             verdict
         );
     }
+
+    #[tokio::test]
+    async fn test_author_split_threat_detection() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        // Author sends message 1: "I will find you"
+        moderator.record_message(1, 109, 33333, "TrollSplitter", "I will find you", 1727375990);
+        // Author sends message 2: "and shoot you"
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 110,
+            timestamp_unix: 1727376000,
+            author_name: "TrollSplitter",
+            author_id: 33333,
+            author_nick: Some("TrollSplitter".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "and shoot you",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for split threat: {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }),
+            "Expected split threat ('I will find you' + 'and shoot you') to be caught with Delete or Suspicious, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_author_gaming_context_batch() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        // Author sends message 1: "we are playing csgo match"
+        moderator.record_message(1, 111, 44444, "PvPPlayer", "we are playing csgo match", 1727375990);
+        // Author sends message 2: "kill him"
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 112,
+            timestamp_unix: 1727376000,
+            author_name: "PvPPlayer",
+            author_id: 44444,
+            author_nick: Some("PvPPlayer".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "kill him",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for gaming context 'kill him': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected 'kill him' in gaming context to be ALLOW, got {:?}",
+            verdict
+        );
+    }
 }
+
 
