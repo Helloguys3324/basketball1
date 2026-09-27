@@ -87,17 +87,19 @@ const SLUR_WORDS: &[&str] = &[
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
 PUNISHMENT TIERS (SUSPICIOUS/DELETE):\n\
-1. Minor/Mild -> SUSPICIOUS(1m): Spam, off-topic, mild toxicity, insults ('dumb ...'), edgy bait ('i love sexism'), ghost-ping, bot abuse\n\
-2. Mod -> SUSPICIOUS(15-30m): Bait, disruptive, NSFW ref, bypass, drama\n\
-3. Major -> SUSPICIOUS(60m) or DELETE(120m): Impersonation, harassment, threats to members, ads, doxx\n\
+1. Minor/Mild -> SUSPICIOUS(1m): Persistent spam, off-topic spam, provocative bait ('i love sexism'), ghost-pinging, bot abuse\n\
+2. Mod -> SUSPICIOUS(15-30m): Disruptive behavior, NSFW ref, filter bypass, drama incitement\n\
+3. Major -> SUSPICIOUS(60m) or DELETE(120m): Impersonation, severe harassment/bullying, threats to members, ads, doxx\n\
 4. Crit -> DELETE(1440m): Racial/hate slurs ('nga','ngga','nigga','nigger','fag','faggot'), death threats('kys','you should die'), gore, raid, cheats\n\
-QUOTES, META-TALK & HYPOTHETICAL EXAMPLES (ALLOW, RULE:None, MUTE:0):\n\
+QUOTES, OPINIONS, META-TALK & HYPOTHETICALS (ALLOW, RULE:None, MUTE:0):\n\
+- Third-person remarks, opinions & hypotheticals ('They would think your dumb', 'people might think you're bad', 'I think that's stupid'): These are ordinary conversational remarks/opinions, NOT targeted harassment! ALWAYS ALLOW.\n\
+- Casual words like 'dumb', 'stupid', 'silly', 'trash', 'noob', 'idiot' used colloquially in conversation ('thats dumb', 'they would think your dumb', 'im so dumb', 'dumb game'): This is standard casual chatter, NOT harassment! ALWAYS ALLOW.\n\
 - Discussing server rules, testing bot triggers, quoting past messages, or explaining what caused a mute: 'Say I'll kill ... (Somone)', 'U said kill something ig', 'he got muted for saying die', 'the bot bans for kys'\n\
 - Abstract placeholders & sentence templates ('...', '(someone)', '[user]', '<person>', 'кого-то', 'кто-то'): These are grammatical examples/templates, NOT real threats or harassment against members.\n\
 - Only punish genuine direct malice/threats targeting real people. If demonstrating, quoting, explaining, or testing -> ALWAYS ALLOW.\n\
 SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
-- GENUINE BANTER (ALLOW, RULE:None, MUTE:0):\n\
-  Boasting strictly about match/skill: '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash'\n\
+- GENUINE BANTER & OPINIONS (ALLOW, RULE:None, MUTE:0):\n\
+  Boasting, expressing opinions, casual critique ('They would think your dumb', 'you played bad', '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash').\n\
   Banter NEVER includes racial slurs or evasive abbreviations like 'nga'. Calling someone 'dumb nga' is a SLUR, NOT banter!\n\
 - FAKE-GAME SHIELD EVASION (PUNISH STRICTLY - SUSPICIOUS/DELETE):\n\
   Trolls append game names ('in minecraft', 'in roblox', 'in game', '1v1') to disguise real toxicity, suicide incitement, or death threats.\n\
@@ -1222,18 +1224,17 @@ impl AiModerator {
                 }
             }
 
-            // Correction if model evaluated text as a violation or toxicity in REASON or RULE but output ALLOW
+            // Correction if model assigned a violation rule or explicitly identified hate/slur, but output ALLOW
             if verdict == "ALLOW" {
                 let lower_r = reason.to_lowercase();
                 let lower_rule = rule.to_lowercase();
-                if lower_r.contains("slur") || lower_r.contains("hate") || lower_rule.contains("crit") {
+                if lower_r.contains("slur") || lower_r.contains("hate speech") || lower_rule.contains("crit") {
                     verdict = "DELETE".to_string();
                     rule = "Crit (Slurs/Hate)".to_string();
                     mute_minutes = 1440;
-                } else if lower_r.contains("minor") || lower_r.contains("mild") || lower_r.contains("toxicity") || lower_r.contains("toxic") || lower_rule.contains("minor") || lower_rule.contains("mild") {
+                } else if (lower_rule.contains("minor") || lower_rule.contains("mild") || lower_rule.contains("mod") || lower_rule.contains("major")) && lower_rule != "none" {
                     verdict = "SUSPICIOUS".to_string();
-                    rule = "Minor/Mild".to_string();
-                    mute_minutes = 1;
+                    mute_minutes = if lower_rule.contains("minor") || lower_rule.contains("mild") { 1 } else { 30 };
                 }
             }
 
@@ -1537,6 +1538,33 @@ mod tests {
             }
             other => panic!("Expected DeleteConfirmed, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_check_message_they_would_think_your_dumb() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 8,
+            timestamp_unix: 1727376000,
+            author_name: "gusherz38269547",
+            author_id: 1233954009862377552,
+            author_nick: Some("GusherZ".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "They would think your dumb",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'They would think your dumb': {:?}\n", verdict);
+        assert!(matches!(verdict, ModerationVerdict::Allow), "Expected ALLOW for 'They would think your dumb', got {:?}", verdict);
     }
 }
 
