@@ -9,3 +9,4 @@ app
 # Secrets and environment variables
 .env
 *.env
+antiscambot-linux
