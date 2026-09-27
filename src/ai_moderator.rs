@@ -100,6 +100,7 @@ QUOTES, OPINIONS, META-TALK & HYPOTHETICALS (ALLOW, RULE:None, MUTE:0):\n\
 SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
 - GENUINE BANTER & OPINIONS (ALLOW, RULE:None, MUTE:0):\n\
   Boasting, expressing opinions, casual critique ('They would think your dumb', 'you played bad', '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash').\n\
+  Standalone casual profanity and common gaming insults ('fuck you', 'fuck u', 'stfu', 'fuck off', 'screw you', 'bitch', 'asshole', 'idiot', 'dumb') WITHOUT death wishes (kys/die) and WITHOUT slurs -> ALWAYS ALLOW (RULE: None, MUTE: 0). NEVER classify standalone 'fuck you' or 'stfu' as Harassment or Minor/Mild!\n\
   Banter NEVER includes racial slurs or evasive abbreviations like 'nga'. Calling someone 'dumb nga' is a SLUR, NOT banter!\n\
 - FAKE-GAME SHIELD EVASION (PUNISH STRICTLY - SUSPICIOUS/DELETE):\n\
   Trolls append game names ('in minecraft', 'in roblox', 'in game', '1v1') to disguise real toxicity, suicide incitement, or death threats.\n\
@@ -470,6 +471,46 @@ impl AiModerator {
         false
     }
 
+    pub fn is_standalone_profanity(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        let clean: String = lower.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+        let words: Vec<&str> = clean.split_whitespace().collect();
+        if words.is_empty() || words.len() > 3 {
+            return false;
+        }
+        let phrase = words.join(" ");
+        if (phrase.starts_with("fuck you")
+            || phrase.starts_with("fuck u")
+            || phrase.starts_with("fuck tou")
+            || phrase.starts_with("fuck off")
+            || phrase.starts_with("stfu")
+            || phrase.starts_with("screw you")
+            || phrase.starts_with("shut up")
+            || phrase.starts_with("пошел нахуй")
+            || phrase.starts_with("иди нахуй"))
+            && words.len() <= 3
+        {
+            return true;
+        }
+        matches!(
+            phrase.as_str(),
+            "f you"
+                | "stfu"
+                | "stfu bum"
+                | "stfu noob"
+                | "stfu idiot"
+                | "stfu bro"
+                | "screw u"
+                | "пошел нахер"
+                | "иди нахер"
+                | "пошел на хер"
+                | "иди в баню"
+                | "отвали"
+                | "завались"
+                | "закройся"
+        )
+    }
+
     pub fn contains_slur(text: &str) -> bool {
         let lower = text.to_lowercase();
         // Check exact words split by non-alphanumeric characters
@@ -748,6 +789,9 @@ impl AiModerator {
                         } else if is_meta && !is_directed {
                             println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                             return ModerationVerdict::Allow;
+                        } else if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
+                            println!("   🛡️ [BANTER GUARD] Overriding LLM {} on standalone profanity ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
                         } else if decision.verdict.contains("DELETE") {
                             println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                             let model_label = if model_used.contains("120b") {
@@ -861,6 +905,10 @@ impl AiModerator {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
                         return ModerationVerdict::Allow;
                     }
+                    if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
+                        println!("   🛡️ [BANTER GUARD] Overriding LLM DELETE on standalone profanity ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
                     let effective_mute = if has_slur { 1440 } else { decision.mute_minutes };
                     let effective_rule = if has_slur { "Crit (Slurs)".to_string() } else { decision.rule };
                     let effective_reason = if has_slur { format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed) } else { decision.reason };
@@ -883,6 +931,10 @@ impl AiModerator {
                 } else if decision.verdict.contains("SUSPICIOUS") {
                     if is_meta && !is_directed {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
+                        return ModerationVerdict::Allow;
+                    }
+                    if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_slur && !is_game_shield {
+                        println!("   🛡️ [BANTER GUARD] Overriding LLM SUSPICIOUS on standalone profanity ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
                     println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
@@ -1589,7 +1641,20 @@ mod tests {
         };
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for 'Fuck you': {:?}\n", verdict);
-        assert!(!matches!(verdict, ModerationVerdict::DeleteConfirmed { .. }), "Expected 'Fuck you' NOT to be DeleteConfirmed(1440m Crit Slurs/Hate), got {:?}", verdict);
+        assert!(matches!(verdict, ModerationVerdict::Allow), "Expected 'Fuck you' to be ALLOW, got {:?}", verdict);
+    }
+
+    #[test]
+    fn test_is_standalone_profanity() {
+        assert!(AiModerator::is_standalone_profanity("fuck you"));
+        assert!(AiModerator::is_standalone_profanity("Fuck you!"));
+        assert!(AiModerator::is_standalone_profanity("fuck you for"));
+        assert!(AiModerator::is_standalone_profanity("fuck you bro"));
+        assert!(AiModerator::is_standalone_profanity("stfu bum"));
+        assert!(AiModerator::is_standalone_profanity("stfu"));
+        assert!(AiModerator::is_standalone_profanity("fuck tou"));
+        assert!(AiModerator::is_standalone_profanity("пошел нахуй"));
+        assert!(!AiModerator::is_standalone_profanity("hello world"));
     }
 }
 
