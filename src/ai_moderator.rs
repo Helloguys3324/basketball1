@@ -123,6 +123,8 @@ SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
   POST-IRONY, THEATRICAL HYPERBOLE & DRAMATIC TRASHTALK ('i will eviscerate you', 'i will obliterate you', 'im gonna demolish/annihilate/vaporize you', 'i will tear you to pieces', 'я тебя расщеплю на атомы/разорву/сотру в порошок'): These are 100% POST-IRONIC JOKES and comic gaming exaggeration between members, NOT credible real-world violence! Real threats involve real-world stalking, doxxing, addresses, weapons, or dates. NEVER punish cartoonish/fantasy threats like 'i will eviscerate you'! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
   IN-GAME 'KILL' & PVP TRASHTALK ('i will kill you', 'im gonna kill you', 'let me kill you', 'i will kill you if you throw', 'i will kill you in 1v1'): When the conversation context involves games, matches, ranks, characters, PvP, gameplay, anime, or gaming banter ('stop stealing my kills', 'one match till rankup', '1v1 me', 'playing together'): These refer to IN-GAME CHARACTER DEATH or gaming frustration between players, NOT real-world murder! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). Only punish 'kill' if it threatens REAL-WORLD physical harm (e.g. 'i know where you live and will kill you', real-life stalking, weapons, dates).\n\
   THIRD-PERSON GAMING CALLOUTS & PVP DIRECTIVES ('kill him', 'kill her', 'kill them', 'kill it', 'shoot him', 'get him', 'focus him', 'finish him', 'убей его', 'добивай', 'завали его'): These are standard tactical PvP/gaming callouts, spectator banter, or stream clip reactions referring to opponents, in-game characters, bosses, or enemies! They are NEVER real-world death threats! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). NEVER classify 'kill him/her/them' as Direct death threat, Harassment, or Violence!\n\
+  ROBLOX & GAMING PVP / HUNTING BANTER ('I will find you and kill you', 'im gonna find u and kill u in roblox', 'найду тебя и убью'): In this Discord community, members constantly play Roblox and competitive multiplayer games. Phrases like 'I will find you and kill you', 'im gonna find you and destroy you in roblox', 'найду тебя на сервере и убью' are completely standard in-game hunting trashtalk referring to finding the player's avatar in Roblox or hunting them in a match! ALWAYS analyze context deeply. Unless someone specifies REAL-WORLD personal details (real physical address, city, street, school, phone, real full name, swatting, IRL weapons, leaked IP) or demands real-world extortion/money, statements like 'I will find you and kill you' must be treated as in-game Roblox hunting banter! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
+  CALIBRATION FOR 0% OR LOW TOXICITY MESSAGES: If a message has 0% toxicity or near-zero toxicity (score <= 0.20), take it MUCH less seriously! NEVER issue auto-deletions or timeouts for low-score messages unless there is a blatant, explicit, unambiguous real-world violation: (1) An explicit, real-world doxx threat with real PII or blackmail ('i will leak your home address/phone/school', 'солью твой домашний адрес') NOT in the context of Roblox/games; (2) Direct, undeniable hate/racial slurs (N-word, etc.). If there is any doubt or ambiguity in a low-toxicity message, default to VERDICT: ALLOW.\n\
   Banter NEVER includes racial slurs or evasive abbreviations like 'nga'. Calling someone 'dumb nga' is a SLUR, NOT banter!\n\
 - FAKE-GAME SHIELD EVASION (PUNISH STRICTLY - SUSPICIOUS/DELETE):\n\
   Trolls append game names ('in minecraft', 'in roblox', 'in game', '1v1') to disguise real toxicity, suicide incitement, or death threats.\n\
@@ -571,8 +573,105 @@ impl AiModerator {
         !SEVERE_VIOLATION_MARKERS.iter().any(|&s| lower.contains(s))
     }
 
+    pub fn is_explicit_real_world_dox_threat(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        // If it's meta-talk about doxxing, it's NOT a threat
+        if Self::is_dox_meta_talk(text) {
+            return false;
+        }
+
+        // Check combinations of action verb + target PII
+        let is_leak_action = lower.contains("leak") || lower.contains("post") || lower.contains("expose")
+            || lower.contains("spread") || lower.contains("солью") || lower.contains("выложу")
+            || lower.contains("распространю");
+
+        let has_real_pii = lower.contains("address") || lower.contains("home") || lower.contains("phone")
+            || lower.contains("photos") || lower.contains("pics") || lower.contains("face")
+            || lower.contains("school") || lower.contains("family") || lower.contains("parents")
+            || lower.contains("адрес") || lower.contains("номер") || lower.contains("фото")
+            || lower.contains("данные") || lower.contains("школу") || lower.contains("родител")
+            || lower.contains("info") || lower.contains("information") || lower.contains("инфу") || lower.contains("информаци");
+
+        if is_leak_action && has_real_pii {
+            if lower.contains("roblox address") || lower.contains("in-game address") {
+                return false;
+            }
+            return true;
+        }
+
+        // Stalking phrases: "know where you live", "find where you live", "знаю где ты живешь", "знаю твой адрес"
+        const STALKING_PATTERNS: &[&str] = &[
+            "know where you live", "find where you live", "know your address",
+            "find your address", "got your address",
+            "знаю где ты живешь", "знаю твой адрес", "найду твой адрес", "пробью тебя"
+        ];
+        if STALKING_PATTERNS.iter().any(|&p| lower.contains(p)) {
+            if lower.contains("in roblox") || lower.contains("in-game") || lower.contains("в роблоксе") {
+                return false;
+            }
+            return true;
+        }
+
+        // Generic doxx threat ("i will doxx you", "солью инфу", "сдеаноню")
+        // ONLY real if NOT in a game context!
+        const GENERIC_DOX_THREATS: &[&str] = &[
+            "i will doxx you", "im gonna doxx you", "i'll doxx you", "doxx you",
+            "i will dox you", "im gonna dox you", "dox you",
+            "spread all your info", "spread your info", "spread all your information", "spread your information",
+            "солью инфу", "сдеаноню тебя", "сдеаноню", "пробью тебя по базе"
+        ];
+
+        let has_generic_dox = GENERIC_DOX_THREATS.iter().any(|&g| lower.contains(g));
+        if has_generic_dox {
+            if lower.contains("in roblox") || lower.contains("in game") || lower.contains("по игре") || lower.contains("роблокс") {
+                return false;
+            }
+            return true;
+        }
+
+        false
+    }
+
+    pub fn is_game_hunting_or_pvp_threat(text: &str) -> bool {
+        let lower = text.to_lowercase();
+
+        // 1. Check for hunting / avatar killing phrasing (common in Roblox/PvP)
+        let has_hunting_phrase = lower.contains("find you and kill you")
+            || lower.contains("find u and kill u")
+            || lower.contains("find you and kill u")
+            || lower.contains("find u and kill you")
+            || lower.contains("find you and destroy you")
+            || lower.contains("hunt you down and kill you")
+            || lower.contains("hunt you down")
+            || lower.contains("track you down and kill you")
+            || lower.contains("track you down")
+            || lower.contains("catch you and kill you")
+            || lower.contains("найду тебя и убью")
+            || lower.contains("найду и убью")
+            || lower.contains("поймаю тебя и убью")
+            || lower.contains("выслежу тебя и убью")
+            || (lower.contains("найду тебя") && (lower.contains("убью") || lower.contains("уничтожу")))
+            || (lower.contains("find you") && (lower.contains("kill") || lower.contains("destroy")))
+            || (lower.contains("kill you") && (lower.contains("if you throw") || lower.contains("in 1v1") || lower.contains("if you feed") || lower.contains("if we lose") || lower.contains("if you miss")))
+            || (lower.contains("убью") && (lower.contains("если сольешь") || lower.contains("если проиграем") || lower.contains("в 1v1") || lower.contains("1 на 1")));
+
+        if !has_hunting_phrase {
+            return false;
+        }
+
+        // 2. Disqualify if message contains explicit real-world physical identifying details or IRL weapons
+        const REAL_WORLD_EVIDENCE: &[&str] = &[
+            "irl", "in real life", "your house", "your address", "your city", "your street",
+            "your school", "your parents", "your phone", "swat", "doxx", "leak", "gun", "knife",
+            "в реале", "в жизни", "твой дом", "твой адрес", "твой город", "твою улицу",
+            "твою школу", "родител", "твой номер", "деанон", "солью", "пистолет", "нож", "зарежу"
+        ];
+
+        !REAL_WORLD_EVIDENCE.iter().any(|&e| lower.contains(e))
+    }
+
     fn is_game_shield_evasion(content: &str) -> bool {
-        if Self::is_3rd_party_dev_or_game_critique(content) {
+        if Self::is_3rd_party_dev_or_game_critique(content) || Self::is_game_hunting_or_pvp_threat(content) {
             return false;
         }
 
@@ -963,6 +1062,12 @@ impl AiModerator {
             p.push_str(&format!("Replying to: @{}: \"{}\"\n", rep_author, short_rep.trim()));
         }
         p.push_str(&format!("OpenAI Flag: {} (score: {:.2})\n", top_cat, max_score));
+        if max_score <= 0.20 {
+            p.push_str(&format!(
+                "⚠️ LOW TOXICITY BASELINE (score: {:.2} <= 0.20): Message scored near 0% toxic by classifiers. On this gaming server, users frequently use dramatic expressions in Roblox. Take this message MUCH less seriously! DO NOT punish unless there is an unambiguous real-world doxx threat (leaking real address/phone/school) or explicit hate slurs. If it relates to Roblox or in-game hunting, you MUST return VERDICT: ALLOW (RULE: None, MUTE: 0).\n",
+                max_score
+            ));
+        }
         if is_game_shield {
             p.push_str("⚠️ EVASION ALERT: Message uses game shield ('in minecraft/roblox/game') to disguise toxicity/threats! Do NOT excuse death wishes, suicide or harassment as banter.\n");
         }
@@ -971,6 +1076,9 @@ impl AiModerator {
         }
         if is_pvp_callout {
             p.push_str("ℹ️ PVP CALLOUT NOTE: Message is a short tactical PvP/gaming callout ('kill him/them', 'shoot him', 'убей его') referring to an in-game opponent or character. It is NOT a real-world death threat. You must return VERDICT: ALLOW (RULE: None, MUTE: 0).\n");
+        }
+        if Self::is_game_hunting_or_pvp_threat(ctx.content) {
+            p.push_str("ℹ️ ROBLOX / GAMING HUNTING NOTE: Message is in-game hunting/PvP trash talk ('I will find you and kill you'). On this server, this refers to tracking down a player's avatar in Roblox or hunting them in a match, NOT real-world murder. Unless there are real-world addresses or IRL markers, you MUST return VERDICT: ALLOW (RULE: None, MUTE: 0).\n");
         }
         p
     }
@@ -1118,6 +1226,14 @@ impl AiModerator {
             return ModerationVerdict::Allow;
         }
 
+        // 1A-2. ROBLOX & GAMING PVP / HUNTING BANTER:
+        // On this server, phrases like 'I will find you and kill you', 'найду тебя и убью в роблоксе'
+        // are standard in-game hunting trashtalk unless paired with real-world PII/stalking or slurs.
+        if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !Self::is_explicit_real_world_dox_threat(trimmed) {
+            println!("   ↳ [ROBLOX HUNTING ALLOW] In-game hunting trashtalk ('{}') -> ALLOW (0 tokens spent)", trimmed);
+            return ModerationVerdict::Allow;
+        }
+
         // ── Smart Dynamic Model Routing: 120B Deep Reasoning for Drama/Hardcore/Threats/Slurs vs Fast Guard for Banter ──
         let is_hardcore_or_drama = severe_score > 0.65
             || max_score > 0.78
@@ -1232,6 +1348,17 @@ impl AiModerator {
                         } else if (Self::is_drama_or_gossip(trimmed) || decision.rule.to_lowercase().contains("drama") || decision.reason.to_lowercase().contains("drama incitement")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                             println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM {} on gossip / drama rumor ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
+                        } else if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
+                            println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM {} on in-game hunting banter ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
+                        } else if decision.rule.to_lowercase().contains("dox") && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                            println!("   🛡️ [DOXX GUARD] Overriding LLM {} on non-explicit doxx rule ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
+                        } else if max_score <= 0.20 && !has_slur && !has_provocative_bait && !has_severe_harm_keyword && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                            if decision.rule.contains("Minor") || decision.rule.contains("Mild") || decision.rule.to_lowercase().contains("drama") || decision.rule.to_lowercase().contains("harassment") || decision.mute_minutes <= 15 {
+                                println!("   🛡️ [LOW TOXICITY GUARD] Overriding LLM {} on low-toxicity message (score {:.2} <= 0.20, rule '{}') to ALLOW.", decision.verdict, max_score, decision.rule);
+                                return ModerationVerdict::Allow;
+                            }
                         } else if decision.verdict.contains("DELETE") {
                             println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                             let model_label = if model_used.contains("120b") {
@@ -1508,6 +1635,20 @@ impl AiModerator {
                         println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM DELETE on gossip / drama rumor to ALLOW.");
                         return ModerationVerdict::Allow;
                     }
+                    if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
+                        println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM DELETE on in-game hunting banter ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if decision.rule.to_lowercase().contains("dox") && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                        println!("   🛡️ [DOXX GUARD] Overriding LLM DELETE on non-explicit doxx rule ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if max_score <= 0.20 && !has_slur && !has_provocative_bait && !has_severe_harm_keyword && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                        if decision.rule.contains("Minor") || decision.rule.contains("Mild") || decision.rule.to_lowercase().contains("drama") || decision.rule.to_lowercase().contains("harassment") || decision.mute_minutes <= 15 {
+                            println!("   🛡️ [LOW TOXICITY GUARD] Overriding LLM DELETE on low-toxicity message (score {:.2} <= 0.20, rule '{}') to ALLOW.", max_score, decision.rule);
+                            return ModerationVerdict::Allow;
+                        }
+                    }
                     let effective_mute = if has_slur { 1440 } else { decision.mute_minutes };
                     let effective_rule = if has_slur { "Crit (Slurs)".to_string() } else { decision.rule };
                     let effective_reason = if has_slur { format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed) } else { decision.reason };
@@ -1569,6 +1710,20 @@ impl AiModerator {
                         println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM SUSPICIOUS on gossip / drama rumor to ALLOW.");
                         return ModerationVerdict::Allow;
                     }
+                    if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
+                        println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM SUSPICIOUS on in-game hunting banter ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if decision.rule.to_lowercase().contains("dox") && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                        println!("   🛡️ [DOXX GUARD] Overriding LLM SUSPICIOUS on non-explicit doxx rule ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if max_score <= 0.20 && !has_slur && !has_provocative_bait && !has_severe_harm_keyword && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                        if decision.rule.contains("Minor") || decision.rule.contains("Mild") || decision.rule.to_lowercase().contains("drama") || decision.rule.to_lowercase().contains("harassment") || decision.mute_minutes <= 15 {
+                            println!("   🛡️ [LOW TOXICITY GUARD] Overriding LLM SUSPICIOUS on low-toxicity message (score {:.2} <= 0.20, rule '{}') to ALLOW.", max_score, decision.rule);
+                            return ModerationVerdict::Allow;
+                        }
+                    }
                     println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                     let model_label = if model_used.contains("120b") {
                         format!("{} (120B Deep Drama Arbiter)", model_used)
@@ -1608,6 +1763,17 @@ impl AiModerator {
                             mute_minutes: 120,
                         };
                     }
+                    if (combined_lower.contains("find you") || combined_lower.contains("find u") || combined_lower.contains("найду")) && (combined_lower.contains("shoot") || combined_lower.contains("пристрелю") || combined_lower.contains("stab") || combined_lower.contains("зарежу")) && !is_meta {
+                        println!("   🚨 [SPLIT THREAT GUARD] Overriding LLM ALLOW for author-split physical threat ('{}') -> DeleteConfirmed(120m)", combined_text);
+                        return ModerationVerdict::DeleteConfirmed {
+                            reason: format!("Split physical violence/stalking threat detected across messages: \"{}\"", combined_text),
+                            score: 0.95,
+                            category: "violence".to_string(),
+                            model_used: format!("Split Threat Guard ({})", model_used),
+                            rule_violated: "Major (Threats/Harm)".to_string(),
+                            mute_minutes: 120,
+                        };
+                    }
                     println!("   ✅ [ALLOW] Grey-zone message allowed by LLM.");
                     ModerationVerdict::Allow
                 }
@@ -1631,6 +1797,10 @@ impl AiModerator {
                     println!("   🎮 [PVP CALLOUT GUARD] Grey-zone failover fallback on tactical in-game callout ('{}') -> ALLOW.", trimmed);
                     return ModerationVerdict::Allow;
                 }
+                if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
+                    println!("   🎮 [ROBLOX HUNTING GUARD] Grey-zone failover fallback on in-game hunting banter ('{}') -> ALLOW.", trimmed);
+                    return ModerationVerdict::Allow;
+                }
                 if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
                     println!("   🛡️ [DOXX META GUARD] Grey-zone failover fallback on doxx meta-talk -> ALLOW.");
                     return ModerationVerdict::Allow;
@@ -1642,6 +1812,16 @@ impl AiModerator {
                 if (Self::is_drama_or_gossip(trimmed) || top_cat.contains("drama")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                     println!("   🛡️ [DRAMA / GOSSIP GUARD] Grey-zone failover fallback on drama rumor -> ALLOW.");
                     return ModerationVerdict::Allow;
+                }
+                if (lower.contains("kill all") || lower.contains("убить всех") || (lower.contains("kill") && (lower.contains("blacks") || lower.contains("jews") || lower.contains("gays") || lower.contains("trans")))) && !is_meta {
+                    return ModerationVerdict::DeleteConfirmed {
+                        reason: format!("Hate speech inciting violence against protected group: \"{}\"", trimmed),
+                        score: 0.99,
+                        category: "hate".to_string(),
+                        model_used: "Hate Speech Guard (Failover)".to_string(),
+                        rule_violated: "Crit (Hate Speech)".to_string(),
+                        mute_minutes: 1440,
+                    };
                 }
                 if has_slur && !is_meta {
                     return ModerationVerdict::DeleteConfirmed {
@@ -2802,6 +2982,157 @@ mod tests {
         // Multi-word checks
         assert!(AiModerator::contains_word("i will burn alive in hell", "burn alive"));
         assert!(!AiModerator::contains_word("i will burn hot", "burn alive"));
+    }
+
+    #[test]
+    fn test_game_hunting_or_pvp_threat_unit() {
+        assert!(AiModerator::is_game_hunting_or_pvp_threat("I will find you and kill you"));
+        assert!(AiModerator::is_game_hunting_or_pvp_threat("i will find you and kill you in roblox"));
+        assert!(AiModerator::is_game_hunting_or_pvp_threat("im gonna find u and kill u"));
+        assert!(AiModerator::is_game_hunting_or_pvp_threat("найду тебя и убью в роблоксе"));
+        assert!(AiModerator::is_game_hunting_or_pvp_threat("найду тебя на сервере и убью"));
+
+        // If real-world address/IRL indicators exist, it's NOT just game hunting!
+        assert!(!AiModerator::is_game_hunting_or_pvp_threat("I will find your house in real life and kill you"));
+        assert!(!AiModerator::is_game_hunting_or_pvp_threat("найду твой адрес и убью"));
+    }
+
+    #[test]
+    fn test_explicit_real_world_dox_threat_unit() {
+        assert!(AiModerator::is_explicit_real_world_dox_threat("I will leak your address and phone number"));
+        assert!(AiModerator::is_explicit_real_world_dox_threat("солью твой домашний адрес"));
+        assert!(AiModerator::is_explicit_real_world_dox_threat("знаю где ты живешь"));
+
+        // Meta talk is NOT a doxx threat
+        assert!(!AiModerator::is_explicit_real_world_dox_threat("Its basically a doxx soo yeah"));
+        assert!(!AiModerator::is_explicit_real_world_dox_threat("это деанон"));
+
+        // In-game context is NOT a real-world doxx threat
+        assert!(!AiModerator::is_explicit_real_world_dox_threat("i will doxx you in roblox"));
+    }
+
+    #[tokio::test]
+    async fn test_check_message_roblox_find_and_kill() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 116,
+            timestamp_unix: 1727376000,
+            author_name: "RobloxWarrior",
+            author_id: 55555,
+            author_nick: Some("RobloxWarrior".to_string()),
+            account_age_days: Some(60),
+            server_member_days: Some(30),
+            roles_count: 2,
+            content: "I will find you and kill you in roblox",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'I will find you and kill you in roblox': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected 'I will find you and kill you in roblox' to be ALLOW, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_find_and_kill_standalone() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 117,
+            timestamp_unix: 1727376000,
+            author_name: "RobloxWarrior",
+            author_id: 55555,
+            author_nick: Some("RobloxWarrior".to_string()),
+            account_age_days: Some(60),
+            server_member_days: Some(30),
+            roles_count: 2,
+            content: "I will find you and kill you",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'I will find you and kill you': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected 'I will find you and kill you' to be ALLOW, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_find_and_kill_russian_roblox() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 118,
+            timestamp_unix: 1727376000,
+            author_name: "RobloxWarriorRu",
+            author_id: 55556,
+            author_nick: Some("RobloxWarriorRu".to_string()),
+            account_age_days: Some(60),
+            server_member_days: Some(30),
+            roles_count: 2,
+            content: "найду тебя и убью в роблоксе",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'найду тебя и убью в роблоксе': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected 'найду тебя и убью в роблоксе' to be ALLOW, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_real_life_house_threat() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 119,
+            timestamp_unix: 1727376000,
+            author_name: "RealStalker",
+            author_id: 77777,
+            author_nick: Some("RealStalker".to_string()),
+            account_age_days: Some(60),
+            server_member_days: Some(30),
+            roles_count: 2,
+            content: "I will find your house in real life and kill you",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'I will find your house in real life and kill you': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::DeleteConfirmed { .. } | ModerationVerdict::FlagSuspicious { .. }),
+            "Expected real-life house threat to be caught, got {:?}",
+            verdict
+        );
     }
 }
 
