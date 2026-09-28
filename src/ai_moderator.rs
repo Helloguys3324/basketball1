@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -100,6 +100,7 @@ const SLUR_WORDS: &[&str] = &[
     "нигер", "нигеры", "ниггер", "ниггеры", "чурка", "чурки", "хач", "хачи", "пидор", "пидоры", "пидорас", "пидорасы", "хохол", "хохлы"
 ];
 
+#[allow(dead_code)]
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
 PUNISHMENT TIERS (SUSPICIOUS/DELETE):\n\
@@ -346,20 +347,38 @@ struct GroqMessageContent {
     reasoning: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct BatchLogEntry {
+    pub message_id: u64,
+    pub channel_id: u64,
+    pub channel_name: String,
+    pub author_id: u64,
+    pub author_name: String,
+    pub content: String,
+    pub timestamp_unix: i64,
+    pub reply_to: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct OpenAiBatchRequest {
     pub inputs: Vec<String>,
-    pub sender: oneshot::Sender<Vec<OpenAiScores>>,
+    pub meta: BatchLogEntry,
+    pub sender: oneshot::Sender<(Vec<OpenAiScores>, Arc<Vec<BatchLogEntry>>)>,
 }
 
 #[derive(Debug)]
 pub struct GroqBatchItemRequest {
+    pub message_id: u64,
+    pub channel_id: u64,
     pub channel_name: String,
     pub author_name: String,
     pub author_id: u64,
     pub trimmed_content: String,
-    pub prompt_chunk: String,
+    pub telemetry_chunk: String,
     pub is_hardcore: bool,
+    pub batch_transcript: Arc<Vec<BatchLogEntry>>,
+    pub channel_history: Vec<ChatEntry>,
     pub sender: oneshot::Sender<Result<(GroqDecision, String, u128), String>>,
 }
 
@@ -1192,61 +1211,176 @@ impl AiModerator {
         }
     }
 
-    fn format_compact_prompt(
-        &self,
-        ctx: &MessageContext<'_>,
-        history: &[ChatEntry],
+    pub fn format_telemetry_chunk(
         max_score: f64,
+        severe_score: f64,
         top_cat: &str,
         is_game_shield: bool,
         is_meta: bool,
         is_pvp_callout: bool,
         author_combined_thought: Option<&str>,
+        reply_to: Option<(&str, u64, u64, &str)>,
     ) -> String {
-        let mut p = String::with_capacity(512);
-
-        // Include recent conversation context (up to 7 prior messages)
-        let recent: Vec<_> = history.iter().rev().take(7).collect();
-        if !recent.is_empty() {
-            p.push_str("Recent chat context:\n");
-            for (idx, e) in recent.into_iter().rev().enumerate() {
-                let short_c = Self::safe_truncate(&e.content, 90);
-                p.push_str(&format!("{}. {}: \"{}\"\n", idx + 1, e.author_name, short_c.trim()));
-            }
-            p.push('\n');
+        let mut t = format!(
+            "OpenAI Flag: {} (score: {:.2}, severe: {:.2})",
+            if top_cat.is_empty() { "none" } else { top_cat },
+            max_score,
+            severe_score
+        );
+        if let Some((rep_author, _, _, rep_text)) = reply_to {
+            let short_rep = Self::safe_truncate(rep_text, 50);
+            t.push_str(&format!(" | Replying to @{}: \"{}\"", rep_author, short_rep.trim()));
         }
-
-        p.push_str("FLAGGED MESSAGE TO EVALUATE:\n");
-        p.push_str(&format!("Author: @{}\n", ctx.author_name));
-        p.push_str(&format!("Content: \"{}\"\n", ctx.content.trim()));
         if let Some(comb) = author_combined_thought {
-            let short_comb = Self::safe_truncate(comb, 180);
-            p.push_str(&format!("Author's Recent Combined Context: \"{}\"\n", short_comb.trim().replace('\n', " // ")));
+            let short_comb = Self::safe_truncate(comb, 120);
+            t.push_str(&format!(" | Author Recent Thoughts: \"{}\"", short_comb.trim().replace('\n', " // ")));
         }
-        if let Some((rep_author, _, _, rep_text)) = ctx.reply_to {
-            let short_rep = Self::safe_truncate(rep_text, 90);
-            p.push_str(&format!("Replying to: @{}: \"{}\"\n", rep_author, short_rep.trim()));
-        }
-        p.push_str(&format!("OpenAI Flag: {} (score: {:.2})\n", top_cat, max_score));
         if max_score <= 0.20 {
-            p.push_str(&format!(
-                "⚠️ LOW TOXICITY BASELINE (score: {:.2} <= 0.20): Message scored near 0% toxic by classifiers. On this gaming server, users frequently use dramatic expressions in Roblox. Take this message MUCH less seriously! DO NOT punish unless there is an unambiguous real-world doxx threat (leaking real address/phone/school) or explicit hate slurs. If it relates to Roblox or in-game hunting, you MUST return VERDICT: ALLOW (RULE: None, MUTE: 0).\n",
-                max_score
-            ));
+            t.push_str(" | ⚠️ LOW TOXICITY BASELINE (<=0.20)");
         }
         if is_game_shield {
-            p.push_str("⚠️ EVASION ALERT: Message uses game shield ('in minecraft/roblox/game') to disguise toxicity/threats! Do NOT excuse death wishes, suicide or harassment as banter.\n");
+            t.push_str(" | ⚠️ EVASION ALERT (fake-game shield)");
         }
         if is_meta {
-            p.push_str("ℹ️ META CONTEXT NOTE: Message appears to be a meta-discussion, quote, rule discussion, or hypothetical placeholder example (e.g. discussing what words trigger the bot or using '(someone)'). Do NOT punish users for quoting, discussing bot rules, or hypothetical templates. Only punish genuine threats directed at real people.\n");
+            t.push_str(" | ℹ️ META TALK NOTE (rule discussion/quote)");
         }
         if is_pvp_callout {
-            p.push_str("ℹ️ PVP CALLOUT NOTE: Message is a short tactical PvP/gaming callout ('kill him/them', 'shoot him', 'убей его') referring to an in-game opponent or character. It is NOT a real-world death threat. You must return VERDICT: ALLOW (RULE: None, MUTE: 0).\n");
+            t.push_str(" | ℹ️ PVP CALLOUT (in-game tactical directive)");
         }
-        if Self::is_game_hunting_or_pvp_threat(ctx.content) {
-            p.push_str("ℹ️ ROBLOX / GAMING HUNTING NOTE: Message is in-game hunting/PvP trash talk ('I will find you and kill you'). On this server, this refers to tracking down a player's avatar in Roblox or hunting them in a match, NOT real-world murder. Unless there are real-world addresses or IRL markers, you MUST return VERDICT: ALLOW (RULE: None, MUTE: 0).\n");
+        t
+    }
+
+    pub fn build_batch_transcript_prompt(batch: &[GroqBatchItemRequest]) -> String {
+        let count = batch.len();
+        let mut all_batch_msgs: Vec<BatchLogEntry> = Vec::new();
+        let mut seen_msg_ids: HashSet<u64> = HashSet::new();
+
+        // 1. Gather all transcript entries from items in this batch
+        for item in batch {
+            for entry in item.batch_transcript.iter() {
+                if entry.message_id > 0 && seen_msg_ids.insert(entry.message_id) {
+                    all_batch_msgs.push(entry.clone());
+                }
+            }
         }
-        p
+
+        // 2. If batch transcript was empty, fallback to channel_history
+        if all_batch_msgs.is_empty() {
+            for item in batch {
+                for ch in &item.channel_history {
+                    if ch.message_id > 0 && seen_msg_ids.insert(ch.message_id) {
+                        all_batch_msgs.push(BatchLogEntry {
+                            message_id: ch.message_id,
+                            channel_id: item.channel_id,
+                            channel_name: item.channel_name.clone(),
+                            author_id: ch.author_id,
+                            author_name: ch.author_name.clone(),
+                            content: ch.content.clone(),
+                            timestamp_unix: ch.timestamp_unix,
+                            reply_to: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 3. Ensure all flagged items in the batch are in the message list
+        for item in batch {
+            if seen_msg_ids.insert(item.message_id) {
+                all_batch_msgs.push(BatchLogEntry {
+                    message_id: item.message_id,
+                    channel_id: item.channel_id,
+                    channel_name: item.channel_name.clone(),
+                    author_id: item.author_id,
+                    author_name: item.author_name.clone(),
+                    content: item.trimmed_content.clone(),
+                    timestamp_unix: 0,
+                    reply_to: None,
+                });
+            }
+        }
+
+        // 4. Sort messages chronologically by timestamp (stable)
+        all_batch_msgs.sort_by_key(|m| m.timestamp_unix);
+
+        // Map message_id to flagged item index
+        let mut flagged_map: HashMap<u64, (usize, &GroqBatchItemRequest)> = HashMap::new();
+        for (idx, item) in batch.iter().enumerate() {
+            flagged_map.insert(item.message_id, (idx + 1, item));
+        }
+
+        let mut prompt = String::with_capacity(count * 512 + all_batch_msgs.len() * 128);
+
+        prompt.push_str("══════════════════════════════════════════════════════════════════════════════\n");
+        prompt.push_str("CHRONOLOGICAL BATCH LOG (Sequential messages collected during 17-second window):\n");
+        prompt.push_str("══════════════════════════════════════════════════════════════════════════════\n\n");
+
+        let mut displayed_flagged: HashSet<usize> = HashSet::new();
+
+        for (log_idx, entry) in all_batch_msgs.iter().enumerate() {
+            let line_no = log_idx + 1;
+            if let Some(&(item_num, ref item)) = flagged_map.get(&entry.message_id) {
+                displayed_flagged.insert(item_num);
+                prompt.push_str(&format!(
+                    "[{}] #{} | >>> [FLAGGED ITEM #{}] <<< @{}: \"{}\"\n",
+                    line_no,
+                    entry.channel_name,
+                    item_num,
+                    entry.author_name,
+                    entry.content.trim()
+                ));
+                if !item.telemetry_chunk.is_empty() {
+                    prompt.push_str(&format!("    ↳ [Telemetry: {}]\n", item.telemetry_chunk.trim()));
+                }
+            } else {
+                let short_c = Self::safe_truncate(&entry.content, 90);
+                let rep_str = if let Some(ref r) = entry.reply_to {
+                    format!(" (replying to {})", r)
+                } else {
+                    String::new()
+                };
+                prompt.push_str(&format!(
+                    "[{}] #{} | @{}: \"{}\"{}\n",
+                    line_no,
+                    entry.channel_name,
+                    entry.author_name,
+                    short_c.trim(),
+                    rep_str
+                ));
+            }
+        }
+
+        // Guarantee any unplaced flagged item is displayed:
+        for (idx, item) in batch.iter().enumerate() {
+            let item_num = idx + 1;
+            if !displayed_flagged.contains(&item_num) {
+                prompt.push_str(&format!(
+                    "\n>>> [FLAGGED ITEM #{}] <<< #{} | @{}: \"{}\"\n",
+                    item_num,
+                    item.channel_name,
+                    item.author_name,
+                    item.trimmed_content.trim()
+                ));
+                if !item.telemetry_chunk.is_empty() {
+                    prompt.push_str(&format!("    ↳ [Telemetry: {}]\n", item.telemetry_chunk.trim()));
+                }
+            }
+        }
+
+        prompt.push_str("\n══════════════════════════════════════════════════════════════════════════════\n");
+        prompt.push_str("MODERATION EVALUATION TASK:\n");
+        prompt.push_str("Evaluate each [FLAGGED ITEM #X] inside the context of what other users said before and after it.\n");
+        prompt.push_str("Determine if each flagged message is true harmful behavior, toxic evasion, hate speech, or innocent gaming chatter/banter.\n");
+        prompt.push_str("For EVERY flagged item, output your decision block:\n\n");
+        for idx in 0..count {
+            let item_num = idx + 1;
+            prompt.push_str(&format!(
+                "[ITEM {}]\nVERDICT: [ALLOW|SUSPICIOUS|DELETE]\nRULE: [Crit|Major|Minor/Mild|None]\nMUTE_MINUTES: [0|1|15|30|60|120|1440]\nREASON: [concise rationale]\n\n",
+                item_num
+            ));
+        }
+
+        prompt
     }
 
     pub async fn check_message(&self, ctx: &MessageContext<'_>) -> ModerationVerdict {
@@ -1278,7 +1412,18 @@ impl AiModerator {
             vec![trimmed.to_string()]
         };
 
-        let scores_list = self.check_openai_batch(openai_key, inputs).await;
+        let meta = BatchLogEntry {
+            message_id: ctx.message_id,
+            channel_id: ctx.channel_id,
+            channel_name: ctx.channel_name.clone().unwrap_or_else(|| "general".to_string()),
+            author_id: ctx.author_id,
+            author_name: ctx.author_name.to_string(),
+            content: trimmed.to_string(),
+            timestamp_unix: ctx.timestamp_unix,
+            reply_to: ctx.reply_to.map(|(a, _, _, t)| format!("@{}: {}", a, Self::safe_truncate(t, 50))),
+        };
+
+        let (scores_list, batch_transcript) = self.check_openai_batch(openai_key, inputs, Some(meta)).await;
 
         let single_scores = scores_list.get(0).cloned().unwrap_or_default();
         let combined_scores = scores_list.get(1).cloned();
@@ -1424,24 +1569,28 @@ impl AiModerator {
                     history.len(),
                     if is_hardcore_or_drama { "120B Deep Reasoning" } else { "27B Fast Guard" }
                 );
-                let user_prompt = self.format_compact_prompt(
-                    ctx,
-                    &history,
+                let telemetry_chunk = Self::format_telemetry_chunk(
                     max_score,
+                    severe_score,
                     &top_cat,
                     is_game_shield,
                     is_meta,
                     is_pvp_callout,
                     if has_author_context { Some(combined_text.as_str()) } else { None },
+                    ctx.reply_to,
                 );
 
                 match self.evaluate_via_groq_batch(
-                    ctx.channel_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                    ctx.message_id,
+                    ctx.channel_id,
+                    ctx.channel_name.clone().unwrap_or_else(|| "general".to_string()),
                     ctx.author_name.to_string(),
                     ctx.author_id,
                     trimmed.to_string(),
-                    user_prompt,
+                    telemetry_chunk,
                     is_hardcore_or_drama,
+                    batch_transcript.clone(),
+                    history.clone(),
                 ).await {
                     Ok((decision, model_used, elapsed_ms)) => {
                         println!(
@@ -1521,7 +1670,11 @@ impl AiModerator {
                         } else if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
                             println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM {} on in-game hunting banter ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
-                        } else if decision.rule.to_lowercase().contains("dox") && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                        } else if decision.rule.to_lowercase().contains("dox")
+                            && !decision.rule.to_lowercase().contains("threat")
+                            && !has_severe_harm_keyword
+                            && !decision.reason.to_lowercase().contains("threat")
+                            && !Self::is_explicit_real_world_dox_threat(trimmed) {
                             println!("   🛡️ [DOXX GUARD] Overriding LLM {} on non-explicit doxx rule ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
                         } else if max_score <= 0.20 && !has_slur && !has_provocative_bait && !has_severe_harm_keyword && !Self::is_explicit_real_world_dox_threat(trimmed) {
@@ -1746,24 +1899,28 @@ impl AiModerator {
             history.len(),
             is_directed
         );
-        let user_prompt = self.format_compact_prompt(
-            ctx,
-            &history,
+        let telemetry_chunk = Self::format_telemetry_chunk(
             max_score,
+            severe_score,
             &top_cat,
             is_game_shield,
             is_meta,
             is_pvp_callout,
             if has_author_context { Some(combined_text.as_str()) } else { None },
+            ctx.reply_to,
         );
 
         match self.evaluate_via_groq_batch(
-            ctx.channel_name.clone().unwrap_or_else(|| "unknown".to_string()),
+            ctx.message_id,
+            ctx.channel_id,
+            ctx.channel_name.clone().unwrap_or_else(|| "general".to_string()),
             ctx.author_name.to_string(),
             ctx.author_id,
             trimmed.to_string(),
-            user_prompt,
+            telemetry_chunk,
             is_hardcore_or_drama,
+            batch_transcript.clone(),
+            history.clone(),
         ).await {
             Ok((decision, model_used, elapsed_ms)) => {
                 println!(
@@ -1816,7 +1973,11 @@ impl AiModerator {
                         println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM DELETE on in-game hunting banter ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
-                    if decision.rule.to_lowercase().contains("dox") && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                    if decision.rule.to_lowercase().contains("dox")
+                        && !decision.rule.to_lowercase().contains("threat")
+                        && !has_severe_harm_keyword
+                        && !decision.reason.to_lowercase().contains("threat")
+                        && !Self::is_explicit_real_world_dox_threat(trimmed) {
                         println!("   🛡️ [DOXX GUARD] Overriding LLM DELETE on non-explicit doxx rule ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
@@ -2045,46 +2206,71 @@ impl AiModerator {
         }
     }
 
-    pub async fn check_openai_batch(&self, api_key: &str, inputs: Vec<String>) -> Vec<OpenAiScores> {
+    pub async fn check_openai_batch(
+        &self,
+        api_key: &str,
+        inputs: Vec<String>,
+        meta: Option<BatchLogEntry>,
+    ) -> (Vec<OpenAiScores>, Arc<Vec<BatchLogEntry>>) {
         let expected_len = inputs.len();
         if let Some(ref tx) = self.batch_tx {
             let (resp_tx, resp_rx) = oneshot::channel();
+            let default_meta = BatchLogEntry {
+                message_id: 0,
+                channel_id: 0,
+                channel_name: "general".to_string(),
+                author_id: 0,
+                author_name: "unknown".to_string(),
+                content: inputs.first().cloned().unwrap_or_default(),
+                timestamp_unix: 0,
+                reply_to: None,
+            };
             let req = OpenAiBatchRequest {
                 inputs: inputs.clone(),
+                meta: meta.clone().unwrap_or(default_meta),
                 sender: resp_tx,
             };
             if tx.send(req).is_ok() {
-                if let Ok(scores) = resp_rx.await {
-                    return scores;
+                if let Ok(res) = resp_rx.await {
+                    return res;
                 }
             }
         }
 
         let str_refs: Vec<&str> = inputs.iter().map(|s| s.as_str()).collect();
+        let fallback_transcript = Arc::new(meta.into_iter().collect::<Vec<_>>());
         match self.call_openai_moderation(api_key, &str_refs).await {
-            Ok(scores) => scores,
-            Err(_) => vec![OpenAiScores::default(); expected_len],
+            Ok(scores) => (scores, fallback_transcript),
+            Err(_) => (vec![OpenAiScores::default(); expected_len], fallback_transcript),
         }
     }
 
     pub async fn evaluate_via_groq_batch(
         &self,
+        message_id: u64,
+        channel_id: u64,
         channel_name: String,
         author_name: String,
         author_id: u64,
         trimmed_content: String,
-        prompt_chunk: String,
+        telemetry_chunk: String,
         is_hardcore: bool,
+        batch_transcript: Arc<Vec<BatchLogEntry>>,
+        channel_history: Vec<ChatEntry>,
     ) -> Result<(GroqDecision, String, u128), String> {
         if let Some(ref tx) = self.groq_batch_tx {
             let (resp_tx, resp_rx) = oneshot::channel();
             let req = GroqBatchItemRequest {
-                channel_name,
-                author_name,
+                message_id,
+                channel_id,
+                channel_name: channel_name.clone(),
+                author_name: author_name.clone(),
                 author_id,
-                trimmed_content,
-                prompt_chunk: prompt_chunk.clone(),
+                trimmed_content: trimmed_content.clone(),
+                telemetry_chunk: telemetry_chunk.clone(),
                 is_hardcore,
+                batch_transcript: batch_transcript.clone(),
+                channel_history: channel_history.clone(),
                 sender: resp_tx,
             };
             if tx.send(req).is_ok() {
@@ -2099,7 +2285,21 @@ impl AiModerator {
         } else {
             &self.groq_fast_model
         };
-        self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &prompt_chunk).await
+        let single_item = GroqBatchItemRequest {
+            message_id,
+            channel_id,
+            channel_name,
+            author_name,
+            author_id,
+            trimmed_content,
+            telemetry_chunk,
+            is_hardcore,
+            batch_transcript,
+            channel_history,
+            sender: oneshot::channel().0,
+        };
+        let prompt = Self::build_batch_transcript_prompt(&[single_item]);
+        self.call_groq_failover(preferred_model, SERVER_RULES_BATCH_SYSTEM_PROMPT, &prompt).await
     }
 
     async fn run_batch_worker(
@@ -2163,12 +2363,16 @@ impl AiModerator {
         let batch = std::mem::take(pending);
         *total_inputs = 0;
 
+        let batch_transcript: Arc<Vec<BatchLogEntry>> = Arc::new(
+            batch.iter().map(|r| r.meta.clone()).collect()
+        );
+
         let api_key = match openai_key {
             Some(k) if !k.is_empty() => k,
             _ => {
                 for req in batch {
                     let default_scores = vec![OpenAiScores::default(); req.inputs.len()];
-                    let _ = req.sender.send(default_scores);
+                    let _ = req.sender.send((default_scores, batch_transcript.clone()));
                 }
                 return;
             }
@@ -2210,7 +2414,7 @@ impl AiModerator {
                 vec![OpenAiScores::default(); len]
             };
             cursor = end;
-            let _ = req.sender.send(sub_scores);
+            let _ = req.sender.send((sub_scores, batch_transcript.clone()));
         }
     }
 
@@ -2793,57 +2997,16 @@ impl AiModerator {
             groq_fast_model
         };
 
-        if count == 1 {
-            let item = batch.into_iter().next().unwrap();
-            let res = Self::call_groq_failover_static(
-                http_client,
-                groq_keys,
-                groq_counter,
-                preferred_model,
-                SERVER_RULES_SYSTEM_PROMPT,
-                &item.prompt_chunk,
-                if preferred_model.contains("gpt-oss") { 1024 } else { 85 },
-            ).await;
-
-            match res {
-                Ok((raw_text, reasoning, model_used, elapsed_ms)) => {
-                    let decision = Self::parse_single_decision_from_text(&raw_text, reasoning.as_deref())
-                        .unwrap_or_else(|_| GroqDecision {
-                            verdict: "ALLOW".to_string(),
-                            rule: "None".to_string(),
-                            mute_minutes: 0,
-                            reason: "Safe chat banter".to_string(),
-                        });
-                    let _ = item.sender.send(Ok((decision, model_used, elapsed_ms)));
-                }
-                Err(e) => {
-                    let _ = item.sender.send(Err(e));
-                }
-            }
-            return;
-        }
-
-        // Multi-item batch flush!
         println!(
-            "\n📦 [GROQ BATCH FLUSH] Evaluating {} flagged messages in 1 LLM request! (Model: {}, Hardcore/Deep: {})",
+            "\n📦 [GROQ BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript! (Model: {}, Hardcore/Deep: {})",
             count,
             preferred_model,
             has_hardcore
         );
 
-        let mut combined_user_prompt = String::with_capacity(count * 512 + 256);
-        combined_user_prompt.push_str("FLAGGED MESSAGES TO EVALUATE IN THIS BATCH:\n\n");
-        for (idx, item) in batch.iter().enumerate() {
-            combined_user_prompt.push_str(&format!(
-                "─── [ITEM {}] (Channel: #{}, Author: @{}) ───\n{}\n\n",
-                idx + 1,
-                item.channel_name,
-                item.author_name,
-                item.prompt_chunk.trim()
-            ));
-        }
-
-        let max_tokens = ((count * 120).max(512)).min(2048) as u32;
+        let combined_user_prompt = Self::build_batch_transcript_prompt(&batch);
+        let base_tokens = if preferred_model.contains("gpt-oss") { 350 } else { 120 };
+        let max_tokens = ((count * base_tokens).max(512)).min(4096) as u32;
 
         let res = Self::call_groq_failover_static(
             http_client,
@@ -3834,13 +3997,24 @@ mod tests {
             let mod_clone = moderator.clone();
             let text = format!("batch test message {}", i);
             handles.push(tokio::spawn(async move {
-                mod_clone.check_openai_batch("test_key", vec![text]).await
+                let meta = BatchLogEntry {
+                    message_id: 1000 + i as u64,
+                    channel_id: 1,
+                    channel_name: "general".to_string(),
+                    author_id: 2000 + i as u64,
+                    author_name: format!("user{}", i),
+                    content: text.clone(),
+                    timestamp_unix: 1727376000 + i as i64,
+                    reply_to: None,
+                };
+                mod_clone.check_openai_batch("test_key", vec![text], Some(meta)).await
             }));
         }
 
         for h in handles {
-            let res = h.await.unwrap();
+            let (res, transcript) = h.await.unwrap();
             assert_eq!(res.len(), 1);
+            assert!(!transcript.is_empty());
         }
     }
 
@@ -3848,8 +4022,68 @@ mod tests {
     async fn test_openai_batcher_multi_input_slice() {
         let client = reqwest::Client::new();
         let moderator = AiModerator::new(client);
-        let res = moderator.check_openai_batch("test_key", vec!["hello".to_string(), "world".to_string()]).await;
+        let (res, _transcript) = moderator.check_openai_batch("test_key", vec!["hello".to_string(), "world".to_string()], None).await;
         assert_eq!(res.len(), 2);
+    }
+
+    #[test]
+    fn test_build_batch_transcript_prompt_inlining() {
+        let transcript = std::sync::Arc::new(vec![
+            BatchLogEntry {
+                message_id: 101,
+                channel_id: 1,
+                channel_name: "general".to_string(),
+                author_id: 1001,
+                author_name: "Alice".to_string(),
+                content: "did anyone finish the homework?".to_string(),
+                timestamp_unix: 100,
+                reply_to: None,
+            },
+            BatchLogEntry {
+                message_id: 102,
+                channel_id: 1,
+                channel_name: "general".to_string(),
+                author_id: 1002,
+                author_name: "Troll".to_string(),
+                content: "kys you idiot".to_string(),
+                timestamp_unix: 105,
+                reply_to: Some("@Alice: homework".to_string()),
+            },
+            BatchLogEntry {
+                message_id: 103,
+                channel_id: 1,
+                channel_name: "general".to_string(),
+                author_id: 1003,
+                author_name: "Charlie".to_string(),
+                content: "whoa calm down".to_string(),
+                timestamp_unix: 110,
+                reply_to: None,
+            },
+        ]);
+
+        let (tx, _) = tokio::sync::oneshot::channel();
+        let flagged_item = GroqBatchItemRequest {
+            message_id: 102,
+            channel_id: 1,
+            channel_name: "general".to_string(),
+            author_name: "Troll".to_string(),
+            author_id: 1002,
+            trimmed_content: "kys you idiot".to_string(),
+            telemetry_chunk: "OpenAI Score: 0.92 (harassment) | Severe: 0.89".to_string(),
+            is_hardcore: true,
+            batch_transcript: transcript,
+            channel_history: Vec::new(),
+            sender: tx,
+        };
+
+        let prompt = AiModerator::build_batch_transcript_prompt(&[flagged_item]);
+        println!("\n=== GENERATED BATCH TRANSCRIPT PROMPT ===\n{}\n=========================================\n", prompt);
+
+        assert!(prompt.contains(">>> [FLAGGED ITEM #1] <<< @Troll: \"kys you idiot\""));
+        assert!(prompt.contains("@Alice: \"did anyone finish the homework?\""));
+        assert!(prompt.contains("@Charlie: \"whoa calm down\""));
+        assert!(prompt.contains("[ITEM 1]"));
+        assert!(prompt.contains("VERDICT: [ALLOW|SUSPICIOUS|DELETE]"));
     }
 
     #[test]
