@@ -1,0 +1,9 @@
+services:
+  antiscambot:
+    build: .
+    container_name: antiscambot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./mod_config.json:/app/mod_config.json
