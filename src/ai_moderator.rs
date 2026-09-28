@@ -2650,9 +2650,14 @@ impl AiModerator {
         max_tokens: u32,
     ) -> Result<(String, u128), String> {
         let start_time = std::time::Instant::now();
+        // Zero key leak: pass key strictly in encrypted HTTP header (x-goog-api-key)
+        // so proxy operators and network sniffers can NEVER see the key in URL parameters
+        let base_url = get_env_var("GEMINI_API_ENDPOINT")
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, api_key
+            "{}/v1beta/models/{}:generateContent",
+            base_url.trim_end_matches('/'),
+            model
         );
 
         let system_instruction = if !system_prompt.trim().is_empty() {
@@ -2679,6 +2684,7 @@ impl AiModerator {
         let resp = http_client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", api_key)
             .json(&req_body)
             .send()
             .await

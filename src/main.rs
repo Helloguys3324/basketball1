@@ -1552,12 +1552,28 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // High-performance HTTP client with connection pooling
-    let http_client = reqwest::Client::builder()
+    // High-performance HTTP client with connection pooling and optional rotating proxy
+    let mut client_builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .pool_idle_timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(10)
+        .pool_max_idle_per_host(10);
+
+    if let Some(proxy_url) = ai_moderator::get_env_var("HTTP_PROXY")
+        .or_else(|| ai_moderator::get_env_var("GEMINI_PROXY"))
+    {
+        let trimmed = proxy_url.trim();
+        if !trimmed.is_empty() {
+            println!("🌐 [PROXY ROTATION] Routing AI moderation traffic via proxy: {}", trimmed);
+            if let Ok(proxy) = reqwest::Proxy::all(trimmed) {
+                client_builder = client_builder.proxy(proxy);
+            } else {
+                eprintln!("[WARN] Failed to parse proxy URL: {}", trimmed);
+            }
+        }
+    }
+
+    let http_client = client_builder
         .build()
         .expect("[ERROR] Failed to build HTTP client");
 
