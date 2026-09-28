@@ -354,15 +354,23 @@ impl AiModerator {
         let groq_deep_model = get_env_var("GROQ_DEEP_MODEL")
             .unwrap_or_else(|| "openai/gpt-oss-120b".to_string());
 
+        let default_batch_size = if cfg!(test) { 10 } else { 100 };
         let batch_size = get_env_var("OPENAI_MODERATION_BATCH_SIZE")
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(10);
+            .unwrap_or(default_batch_size);
 
+        let default_timeout_ms = if cfg!(test) { 100 } else { 17000 };
         let batch_timeout_ms = get_env_var("OPENAI_MODERATION_BATCH_TIMEOUT_MS")
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(100);
+            .unwrap_or(default_timeout_ms);
 
         let batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            println!(
+                "   📦 [OPENAI BATCHING] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms)",
+                batch_size,
+                batch_timeout_ms as f64 / 1000.0,
+                batch_timeout_ms
+            );
             let (tx, rx) = mpsc::unbounded_channel::<OpenAiBatchRequest>();
             let client_clone = http_client.clone();
             let key_clone = openai_key.clone();
