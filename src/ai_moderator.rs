@@ -4,7 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 
 // =============================================================================
 // AI MODERATOR CONFIGURATION & CONSTANTS
@@ -318,6 +320,12 @@ struct GroqMessageContent {
     reasoning: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct OpenAiBatchRequest {
+    pub inputs: Vec<String>,
+    pub sender: oneshot::Sender<Vec<OpenAiScores>>,
+}
+
 pub struct AiModerator {
     http_client: reqwest::Client,
     openai_key: Option<String>,
@@ -326,6 +334,7 @@ pub struct AiModerator {
     groq_deep_model: String,
     groq_counter: AtomicUsize,
     chat_history: RwLock<HashMap<u64, VecDeque<ChatEntry>>>,
+    batch_tx: Option<mpsc::UnboundedSender<OpenAiBatchRequest>>,
 }
 
 impl AiModerator {
@@ -345,6 +354,30 @@ impl AiModerator {
         let groq_deep_model = get_env_var("GROQ_DEEP_MODEL")
             .unwrap_or_else(|| "openai/gpt-oss-120b".to_string());
 
+        let batch_size = get_env_var("OPENAI_MODERATION_BATCH_SIZE")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10);
+
+        let batch_timeout_ms = get_env_var("OPENAI_MODERATION_BATCH_TIMEOUT_MS")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100);
+
+        let batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let (tx, rx) = mpsc::unbounded_channel::<OpenAiBatchRequest>();
+            let client_clone = http_client.clone();
+            let key_clone = openai_key.clone();
+            handle.spawn(Self::run_batch_worker(
+                rx,
+                client_clone,
+                key_clone,
+                batch_size,
+                Duration::from_millis(batch_timeout_ms),
+            ));
+            Some(tx)
+        } else {
+            None
+        };
+
         Self {
             http_client,
             openai_key,
@@ -353,6 +386,7 @@ impl AiModerator {
             groq_deep_model,
             groq_counter: AtomicUsize::new(0),
             chat_history: RwLock::new(HashMap::new()),
+            batch_tx,
         }
     }
 
@@ -1106,16 +1140,13 @@ impl AiModerator {
             trimmed.to_string()
         };
 
-        let inputs: Vec<&str> = if has_author_context {
-            vec![trimmed, &combined_text]
+        let inputs: Vec<String> = if has_author_context {
+            vec![trimmed.to_string(), combined_text.clone()]
         } else {
-            vec![trimmed]
+            vec![trimmed.to_string()]
         };
 
-        let scores_list = match self.call_openai_moderation(openai_key, &inputs).await {
-            Ok(scores) => scores,
-            Err(_) => vec![OpenAiScores::default(); inputs.len()],
-        };
+        let scores_list = self.check_openai_batch(openai_key, inputs).await;
 
         let single_scores = scores_list.get(0).cloned().unwrap_or_default();
         let combined_scores = scores_list.get(1).cloned();
@@ -1868,14 +1899,151 @@ impl AiModerator {
         }
     }
 
-    async fn call_openai_moderation(&self, api_key: &str, texts: &[&str]) -> Result<Vec<OpenAiScores>, reqwest::Error> {
+    pub async fn check_openai_batch(&self, api_key: &str, inputs: Vec<String>) -> Vec<OpenAiScores> {
+        let expected_len = inputs.len();
+        if let Some(ref tx) = self.batch_tx {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let req = OpenAiBatchRequest {
+                inputs: inputs.clone(),
+                sender: resp_tx,
+            };
+            if tx.send(req).is_ok() {
+                if let Ok(scores) = resp_rx.await {
+                    return scores;
+                }
+            }
+        }
+
+        let str_refs: Vec<&str> = inputs.iter().map(|s| s.as_str()).collect();
+        match self.call_openai_moderation(api_key, &str_refs).await {
+            Ok(scores) => scores,
+            Err(_) => vec![OpenAiScores::default(); expected_len],
+        }
+    }
+
+    async fn run_batch_worker(
+        mut rx: mpsc::UnboundedReceiver<OpenAiBatchRequest>,
+        http_client: reqwest::Client,
+        openai_key: Option<String>,
+        batch_size: usize,
+        batch_wait: Duration,
+    ) {
+        let mut pending: Vec<OpenAiBatchRequest> = Vec::new();
+        let mut total_inputs: usize = 0;
+
+        while let Some(first_req) = rx.recv().await {
+            total_inputs += first_req.inputs.len();
+            pending.push(first_req);
+
+            if total_inputs >= batch_size {
+                Self::flush_batch(&mut pending, &mut total_inputs, &http_client, openai_key.as_deref()).await;
+                continue;
+            }
+
+            let deadline = tokio::time::Instant::now() + batch_wait;
+
+            while !pending.is_empty() {
+                tokio::select! {
+                    maybe_req = rx.recv() => {
+                        match maybe_req {
+                            Some(req) => {
+                                total_inputs += req.inputs.len();
+                                pending.push(req);
+                                if total_inputs >= batch_size {
+                                    Self::flush_batch(&mut pending, &mut total_inputs, &http_client, openai_key.as_deref()).await;
+                                    break;
+                                }
+                            }
+                            None => {
+                                Self::flush_batch(&mut pending, &mut total_inputs, &http_client, openai_key.as_deref()).await;
+                                return;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        Self::flush_batch(&mut pending, &mut total_inputs, &http_client, openai_key.as_deref()).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn flush_batch(
+        pending: &mut Vec<OpenAiBatchRequest>,
+        total_inputs: &mut usize,
+        http_client: &reqwest::Client,
+        openai_key: Option<&str>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+
+        let batch = std::mem::take(pending);
+        *total_inputs = 0;
+
+        let api_key = match openai_key {
+            Some(k) if !k.is_empty() => k,
+            _ => {
+                for req in batch {
+                    let default_scores = vec![OpenAiScores::default(); req.inputs.len()];
+                    let _ = req.sender.send(default_scores);
+                }
+                return;
+            }
+        };
+
+        let mut flat_inputs: Vec<&str> = Vec::new();
+        let mut slice_lens: Vec<usize> = Vec::with_capacity(batch.len());
+
+        for req in &batch {
+            slice_lens.push(req.inputs.len());
+            for inp in &req.inputs {
+                flat_inputs.push(inp.as_str());
+            }
+        }
+
+        if batch.len() > 1 || flat_inputs.len() > 1 {
+            println!(
+                "   📦 [OPENAI BATCH FLUSH] Moderating {} messages ({} inputs in single array) in 1 API request",
+                batch.len(),
+                flat_inputs.len()
+            );
+        }
+
+        let scores_res = Self::call_openai_moderation_static(http_client, api_key, &flat_inputs).await;
+        let all_scores = match scores_res {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[OPENAI BATCH ERROR] Status/Network error: {}. Falling back to default.", e);
+                vec![OpenAiScores::default(); flat_inputs.len()]
+            }
+        };
+
+        let mut cursor = 0;
+        for (req, len) in batch.into_iter().zip(slice_lens.into_iter()) {
+            let end = (cursor + len).min(all_scores.len());
+            let sub_scores = if cursor < all_scores.len() {
+                all_scores[cursor..end].to_vec()
+            } else {
+                vec![OpenAiScores::default(); len]
+            };
+            cursor = end;
+            let _ = req.sender.send(sub_scores);
+        }
+    }
+
+    pub async fn call_openai_moderation(&self, api_key: &str, texts: &[&str]) -> Result<Vec<OpenAiScores>, reqwest::Error> {
+        Self::call_openai_moderation_static(&self.http_client, api_key, texts).await
+    }
+
+    pub async fn call_openai_moderation_static(http_client: &reqwest::Client, api_key: &str, texts: &[&str]) -> Result<Vec<OpenAiScores>, reqwest::Error> {
         let req_body = OpenAiBatchModRequest {
             model: "omni-moderation-latest",
             input: texts.to_vec(),
         };
 
-        let resp = self
-            .http_client
+        let resp = http_client
             .post("https://api.openai.com/v1/moderations")
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
@@ -3133,6 +3301,34 @@ mod tests {
             "Expected real-life house threat to be caught, got {:?}",
             verdict
         );
+    }
+
+    #[tokio::test]
+    async fn test_openai_batcher_concurrent_dispatch() {
+        let client = reqwest::Client::new();
+        let moderator = std::sync::Arc::new(AiModerator::new(client));
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let mod_clone = moderator.clone();
+            let text = format!("batch test message {}", i);
+            handles.push(tokio::spawn(async move {
+                mod_clone.check_openai_batch("test_key", vec![text]).await
+            }));
+        }
+
+        for h in handles {
+            let res = h.await.unwrap();
+            assert_eq!(res.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_openai_batcher_multi_input_slice() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let res = moderator.check_openai_batch("test_key", vec!["hello".to_string(), "world".to_string()]).await;
+        assert_eq!(res.len(), 2);
     }
 }
 

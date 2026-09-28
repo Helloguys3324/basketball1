@@ -7,7 +7,7 @@ edition = "2021"
 serenity = { version = "0.12", default-features = false, features = [
     "client", "gateway", "model", "cache", "http", "builder", "rustls_backend"
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 serde = { version = "1", features = ["derive"] }
