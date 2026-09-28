@@ -32,8 +32,8 @@ const TARGET_PRONOUNS: &[&str] = &[
 
 const SEVERE_HARM_KEYWORDS: &[&str] = &[
     "burn alive", "burned alive", "burn you", "burn him", "burn her", "kill", "die",
-    "murder", "stab", "shoot", "hang", "slit", "doxx", "rape", "torture", "strangle",
-    "choke", "execute", "suicide", "kys", "burn",
+    "murder", "stab", "shoot", "hang", "slit", "rape", "torture", "strangle",
+    "choke", "execute", "suicide", "kys",
     "сожгу", "сжечь", "сжечь заживо", "убью", "убить", "сдохни", "смерть", "зарезать",
     "пристрелить", "повесить", "расчленить", "вскройся", "самоубийство"
 ];
@@ -101,16 +101,21 @@ const SLUR_WORDS: &[&str] = &[
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
 PUNISHMENT TIERS (SUSPICIOUS/DELETE):\n\
-1. Minor/Mild -> SUSPICIOUS(1m): Persistent spam, off-topic spam, provocative bait ('i love sexism'), ghost-pinging, bot abuse\n\
-2. Mod -> SUSPICIOUS(15-30m): Disruptive behavior, NSFW ref, filter bypass, drama incitement\n\
-3. Major -> SUSPICIOUS(60m) or DELETE(120m): Impersonation, severe harassment/bullying, threats to members, ads, doxx\n\
-4. Crit -> DELETE(1440m): Racial/hate slurs ('nga','ngga','nigga','nigger','fag','faggot'), death threats('kys','you should die'), gore, raid, cheats\n\
+1. Minor/Mild -> SUSPICIOUS(1m): Malicious chat flooding, repetitive copy-paste raid spam, provocative gender bait ('i love sexism'). NEVER punish standard banter, complaints, or single messages under Minor/Mild!\n\
+2. Mod -> SUSPICIOUS(15-30m): Explicit NSFW pornography links, deliberate toxic filter bypass. (NO mutes for gossip, rumors, or drama!)\n\
+3. Major -> SUSPICIOUS(60m) or DELETE(120m): Direct real-world threats, stalking, publishing or threatening to leak private personal info (doxxing/extortion), malicious impersonation, server raid invites\n\
+4. Crit -> DELETE(1440m): Racial/hate slurs ('nga','ngga','nigga','nigger','fag','faggot'), direct death wishes ('kys','you should die'), gore, malware\n\
 QUOTES, OPINIONS, META-TALK & HYPOTHETICALS (ALLOW, RULE:None, MUTE:0):\n\
+- Meta-talk and observations about doxxing or rules ('Its basically a doxx soo yeah', 'is that a doxx?', 'he got doxxed', 'thats a doxx', 'stop doxxing', 'you can't doxx people'): Discussing, observing, or reporting doxxing is META-TALK, NOT committing or threatening a doxx! Doxxing violations strictly require leaking actual private personal information (PII: address, phone, real full name, IP) or explicitly threatening/blackmailing someone to leak their info ('i will doxx you', 'im gonna leak your address/photos', 'солью твой адрес'). ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
 - Third-person remarks, opinions & hypotheticals ('They would think your dumb', 'people might think you're bad', 'I think that's stupid'): These are ordinary conversational remarks/opinions, NOT targeted harassment! ALWAYS ALLOW.\n\
 - Casual words like 'dumb', 'stupid', 'silly', 'trash', 'noob', 'idiot' used colloquially in conversation ('thats dumb', 'they would think your dumb', 'im so dumb', 'dumb game'): This is standard casual chatter, NOT harassment! ALWAYS ALLOW.\n\
 - Discussing server rules, testing bot triggers, quoting past messages, or explaining what caused a mute: 'Say I'll kill ... (Somone)', 'U said kill something ig', 'he got muted for saying die', 'the bot bans for kys'\n\
 - Abstract placeholders & sentence templates ('...', '(someone)', '[user]', '<person>', 'кого-то', 'кто-то'): These are grammatical examples/templates, NOT real threats or harassment against members.\n\
 - Only punish genuine direct malice/threats targeting real people. If demonstrating, quoting, explaining, or testing -> ALWAYS ALLOW.\n\
+CRITIQUE & VENTING ABOUT 3RD-PARTY ENTITIES, GAMES, STUDIOS & DEVS (ALLOW, RULE:None, MUTE:0):\n\
+- Complaining, venting, criticizing, or insulting game developers, game studios, companies, games, or public figures ('roblox devs becoming actual subhuman idiots', 'valve devs are brainless', 'ea is a trash company', 'riot balance team is clowns', 'this game sucks', 'devs are morons'): These are general gaming frustrations directed at external companies/studios, NOT interpersonal harassment or bullying of server members! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
+CHAT GOSSIP, RUMORS & INTERPERSONAL QUESTIONS BETWEEN MEMBERS (ALLOW, RULE:None, MUTE:0):\n\
+- Mentioning rumors, asking questions about what someone said or did, gossip, or playful accusations ('i heard from the grape vine that u paid someone to do something to me', 'did you talk behind my back?', 'why did you say that?'): This is natural social interaction and chat banter between Discord users. NEVER classify gossip, rumors, questions, or accusations as 'drama incitement' or harassment! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
 SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
 - GENUINE BANTER & OPINIONS (ALLOW, RULE:None, MUTE:0):\n\
   Boasting, expressing opinions, casual critique ('They would think your dumb', 'you played bad', '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash').\n\
@@ -131,7 +136,7 @@ REAL VIOLATIONS (SUSPICIOUS/DELETE):\n\
 - Threats naming users (or short nicknames like 'miz' for 'Mizuri') or with dates/methods -> DELETE(120m)\n\
 - Direct death wishes/suicide: 'kys', 'you should die', 'die idiot' -> SUSPICIOUS(30m)\n\
 - Credible real-world threats with doxxing/stalking: 'i know where you live' -> DELETE(120m)\n\
-- Doxxing, blackmail, extortion & leaking personal info ('I will spread all your information', 'leak your info/photos', 'expose your address', 'doxx you', 'солью инфу', 'деанон') -> DELETE(120m) under Major (Threats/Doxx). Blackmail and spreading private information is a severe violation. NEVER ALLOW under any pretext!\n\
+- Doxxing, blackmail, extortion & leaking personal info ('I will spread all your information', 'leak your info/photos', 'expose your address', 'i will doxx you', 'солью инфу', 'деанон') -> DELETE(120m) under Major (Threats/Doxx). Must be an actual threat to leak private information or publishing PII. Does NOT apply to meta-discussion ('its a doxx').\n\
 Format strictly:\n\
 VERDICT:[ALLOW|SUSPICIOUS|DELETE]\n\
 RULE:[Rule name or None]\n\
@@ -447,7 +452,130 @@ impl AiModerator {
         false
     }
 
+    pub fn contains_word(text: &str, target: &str) -> bool {
+        let text_lower = text.to_lowercase();
+        let target_lower = target.to_lowercase();
+        let t_len = target_lower.len();
+
+        if t_len == 0 {
+            return false;
+        }
+
+        // For multi-word phrases or non-alphanumeric patterns (e.g. "burn alive", "spread your info"), check substring
+        if target_lower.chars().any(|c| !c.is_alphanumeric()) {
+            return text_lower.contains(&target_lower);
+        }
+
+        // For single alphanumeric words, find matches bounded by non-alphanumeric chars or boundaries
+        for (i, _) in text_lower.match_indices(&target_lower) {
+            let prev_ok = if i == 0 {
+                true
+            } else {
+                let prev_char = text_lower[..i].chars().last();
+                prev_char.map(|c| !c.is_alphanumeric()).unwrap_or(true)
+            };
+
+            let end_idx = i + t_len;
+            let next_ok = if end_idx >= text_lower.len() {
+                true
+            } else {
+                let next_char = text_lower[end_idx..].chars().next();
+                next_char.map(|c| !c.is_alphanumeric()).unwrap_or(true)
+            };
+
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn is_dox_meta_talk(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        const DOXX_META_PHRASES: &[&str] = &[
+            "basically a doxx", "basically a dox", "is a doxx", "is a dox",
+            "thats a doxx", "that's a doxx", "thats a dox", "that's a dox",
+            "it is a doxx", "it is a dox", "its a doxx", "it's a doxx",
+            "it's basically a doxx", "its basically a doxx", "it's basically a dox", "its basically a dox",
+            "got doxxed", "was doxxed", "got doxed", "was doxed",
+            "stop doxxing", "stop doxing", "you can't doxx", "dont doxx", "don't doxx",
+            "why doxx", "reported for doxx", "banned for doxx",
+            "это деанон", "это слив", "его задеанонили", "его слили", "перестань деанонить",
+            "не деанонь", "зачем деанонить"
+        ];
+        let has_meta = DOXX_META_PHRASES.iter().any(|&p| lower.contains(p));
+        if !has_meta {
+            return false;
+        }
+
+        // Must NOT contain an actual threat to leak info
+        const REAL_DOX_THREAT: &[&str] = &[
+            "i will doxx", "im gonna doxx", "i'll doxx", "doxx you", "leak your",
+            "post your address", "know where you live", "солью твой", "найду где живешь"
+        ];
+        !REAL_DOX_THREAT.iter().any(|&t| lower.contains(t))
+    }
+
+    pub fn is_3rd_party_dev_or_game_critique(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        let mentions_dev = lower.contains("dev")
+            || lower.contains("devs")
+            || lower.contains("developer")
+            || lower.contains("developers")
+            || lower.contains("разраб")
+            || lower.contains("разрабы")
+            || lower.contains("разработчик")
+            || lower.contains("разработчики")
+            || lower.contains("studio")
+            || lower.contains("studios")
+            || lower.contains("company")
+            || lower.contains("valve")
+            || lower.contains("ea ")
+            || lower.contains("ubisoft")
+            || lower.contains("mojang")
+            || lower.contains("riot")
+            || lower.contains("blizzard")
+            || lower.contains("roblox devs")
+            || lower.contains("game devs");
+
+        if !mentions_dev {
+            return false;
+        }
+
+        // Must NOT contain direct real-world death threats or doxxing against members
+        const MEMBER_SEVERE_ATTACK: &[&str] = &[
+            "kys", "kill yourself", "burn your house", "know where you live", "find where you live",
+            "doxx you", "leak your", "солью твой", "знаю где ты", "сдохни", "вскройся"
+        ];
+
+        !MEMBER_SEVERE_ATTACK.iter().any(|&m| lower.contains(m))
+    }
+
+    pub fn is_drama_or_gossip(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        const GOSSIP_MARKERS: &[&str] = &[
+            "grape vine", "grapevine", "heard that", "heard from", "i heard",
+            "rumor", "rumors", "rumours", "talking behind", "said about me", "paid someone",
+            "слышал что", "слухи", "говорят что", "за спиной"
+        ];
+        let has_marker = GOSSIP_MARKERS.iter().any(|&m| lower.contains(m));
+        if !has_marker {
+            return false;
+        }
+
+        const SEVERE_VIOLATION_MARKERS: &[&str] = &[
+            "kys", "kill yourself", "burn alive", "burn your house", "know where you live",
+            "doxx you", "leak your", "солью твой", "сдохни", "вскройся"
+        ];
+        !SEVERE_VIOLATION_MARKERS.iter().any(|&s| lower.contains(s))
+    }
+
     fn is_game_shield_evasion(content: &str) -> bool {
+        if Self::is_3rd_party_dev_or_game_critique(content) {
+            return false;
+        }
+
         let lower = content.to_lowercase();
         let has_shield = GAME_SHIELD_PATTERNS.iter().any(|p| lower.contains(p))
             || lower.contains("minecraft")
@@ -457,21 +585,15 @@ impl AiModerator {
         if !has_shield {
             return false;
         }
-        let has_hostility = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k))
-            || TARGET_INSULTS.iter().any(|i| lower.contains(i))
-            || lower.contains("kys")
-            || lower.contains("die")
-            || lower.contains("cancer")
-            || lower.contains("doxx")
-            || lower.contains("leak")
-            || lower.contains("ip")
-            || lower.contains("swat")
-            || lower.contains("hang")
-            || lower.contains("сожгу")
-            || lower.contains("сдохни")
-            || lower.contains("рак")
-            || lower.contains("вскройся");
-        has_hostility
+
+        const GAME_SHIELD_THREATS: &[&str] = &[
+            "kys", "kill yourself", "die", "suicide", "burn alive", "burned alive",
+            "burn your house", "find your house", "know where you live", "find where you live",
+            "hang yourself", "slit your", "shoot you", "shoot yourself",
+            "сдохни", "вскройся", "повесься", "сожгу", "сожгу твой дом", "найду где живешь", "убью тебя", "убью"
+        ];
+
+        GAME_SHIELD_THREATS.iter().any(|&t| Self::contains_word(&lower, t))
     }
 
     fn is_abstract_placeholder(text: &str) -> bool {
@@ -492,6 +614,10 @@ impl AiModerator {
         let trimmed_lower = lower.trim();
 
         if Self::is_abstract_placeholder(trimmed_lower) {
+            return true;
+        }
+
+        if Self::is_dox_meta_talk(trimmed_lower) {
             return true;
         }
 
@@ -894,9 +1020,9 @@ impl AiModerator {
         let history = self.get_context_snapshot(ctx.channel_id);
         let lower = trimmed.to_lowercase();
         let combined_lower = combined_text.to_lowercase();
-        let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| lower.contains(k) || combined_lower.contains(k));
-        let has_provocative_bait = PROVOCATIVE_BAIT_KEYWORDS.iter().any(|k| lower.contains(k));
-        let has_dox_threat = DOX_AND_EXTORTION_KEYWORDS.iter().any(|k| lower.contains(k) || combined_lower.contains(k));
+        let has_severe_harm_keyword = SEVERE_HARM_KEYWORDS.iter().any(|k| Self::contains_word(&lower, k) || Self::contains_word(&combined_lower, k));
+        let has_provocative_bait = PROVOCATIVE_BAIT_KEYWORDS.iter().any(|k| Self::contains_word(&lower, k));
+        let has_dox_threat = DOX_AND_EXTORTION_KEYWORDS.iter().any(|k| Self::contains_word(&lower, k) || Self::contains_word(&combined_lower, k));
         let has_slur = Self::contains_slur(trimmed) || Self::contains_slur(&combined_text);
         let is_game_shield = Self::is_game_shield_evasion(trimmed) || Self::is_game_shield_evasion(&combined_text);
         let is_pvp_callout = Self::is_gaming_pvp_callout(trimmed);
@@ -1097,6 +1223,15 @@ impl AiModerator {
                         } else if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                             println!("   🎭 [POST-IRONY GUARD] Overriding LLM {} on theatrical hyperbole ('{}') to ALLOW.", decision.verdict, trimmed);
                             return ModerationVerdict::Allow;
+                        } else if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
+                            println!("   🛡️ [DOXX META GUARD] Overriding LLM {} on doxx meta-talk/observation ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
+                        } else if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                            println!("   🛡️ [DEV CRITIQUE GUARD] Overriding LLM {} on developer/game critique ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
+                        } else if (Self::is_drama_or_gossip(trimmed) || decision.rule.to_lowercase().contains("drama") || decision.reason.to_lowercase().contains("drama incitement")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                            println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM {} on gossip / drama rumor ('{}') to ALLOW.", decision.verdict, trimmed);
+                            return ModerationVerdict::Allow;
                         } else if decision.verdict.contains("DELETE") {
                             println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                             let model_label = if model_used.contains("120b") {
@@ -1160,6 +1295,18 @@ impl AiModerator {
                             println!("   🎭 [POST-IRONY GUARD] Failover fallback: theatrical hyperbole ('{}') -> ALLOW.", trimmed);
                             return ModerationVerdict::Allow;
                         }
+                        if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
+                            println!("   🛡️ [DOXX META GUARD] Failover fallback: doxx meta-talk -> ALLOW.");
+                            return ModerationVerdict::Allow;
+                        }
+                        if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                            println!("   🛡️ [DEV CRITIQUE GUARD] Failover fallback: dev critique -> ALLOW.");
+                            return ModerationVerdict::Allow;
+                        }
+                        if (Self::is_drama_or_gossip(trimmed) || top_cat.contains("drama")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                            println!("   🛡️ [DRAMA / GOSSIP GUARD] Failover fallback: drama rumor -> ALLOW.");
+                            return ModerationVerdict::Allow;
+                        }
                         if is_meta && !is_directed {
                             println!("   🛡️ [META GUARD] Failover fallback: meta quote -> ALLOW.");
                             return ModerationVerdict::Allow;
@@ -1212,6 +1359,18 @@ impl AiModerator {
                 println!("   🎭 [POST-IRONY GUARD] High score fallback: theatrical hyperbole ('{}') -> ALLOW.", trimmed);
                 return ModerationVerdict::Allow;
             }
+            if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
+                println!("   🛡️ [DOXX META GUARD] High score fallback: doxx meta-talk -> ALLOW.");
+                return ModerationVerdict::Allow;
+            }
+            if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                println!("   🛡️ [DEV CRITIQUE GUARD] High score fallback: dev critique -> ALLOW.");
+                return ModerationVerdict::Allow;
+            }
+            if (Self::is_drama_or_gossip(trimmed) || top_cat.contains("drama")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                println!("   🛡️ [DRAMA / GOSSIP GUARD] High score fallback: drama rumor -> ALLOW.");
+                return ModerationVerdict::Allow;
+            }
             if is_meta && !is_directed {
                 println!("   🛡️ [META GUARD] High score fallback: meta quote -> ALLOW.");
                 return ModerationVerdict::Allow;
@@ -1239,6 +1398,19 @@ impl AiModerator {
         }
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
+        if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && max_score < 0.75 {
+            println!("   ↳ [DEV CRITIQUE PRE-FILTER] 3rd-party dev / game critique (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
+            return ModerationVerdict::Allow;
+        }
+        if Self::is_dox_meta_talk(trimmed) && !has_dox_threat && !has_slur && max_score < 0.75 {
+            println!("   ↳ [DOXX META PRE-FILTER] Meta-talk about doxxing (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
+            return ModerationVerdict::Allow;
+        }
+        if Self::is_drama_or_gossip(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && max_score < 0.75 {
+            println!("   ↳ [DRAMA PRE-FILTER] Chat gossip / drama rumor (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
+            return ModerationVerdict::Allow;
+        }
+
         // ONLY bypass if it's general non-violent gaming frustration (e.g. "fuck this lag")
         if !is_directed && !is_violent_category && !has_severe_harm_keyword && !has_provocative_bait && !has_dox_threat && !has_slur && !is_game_shield && max_score < 0.60 {
             println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
@@ -1254,6 +1426,16 @@ impl AiModerator {
                     model_used: "Local Dox Guard".to_string(),
                     rule_violated: "Major (Threats/Doxx)".to_string(),
                     mute_minutes: 120,
+                };
+            }
+            if has_severe_harm_keyword && !is_pvp_callout && !is_meta {
+                return ModerationVerdict::FlagSuspicious {
+                    reason: format!("Severe harm keyword detected in message: \"{}\"", trimmed),
+                    score: if max_score > 0.5 { max_score } else { 0.85 },
+                    category: if top_cat.is_empty() { "violence".to_string() } else { top_cat },
+                    model_used: "Local Severe Keyword Guard".to_string(),
+                    rule_violated: "Major (Threats/Harm)".to_string(),
+                    mute_minutes: 60,
                 };
             }
             println!("   ↳ [NO KEYS] Groq keys not configured -> ALLOW");
@@ -1314,6 +1496,18 @@ impl AiModerator {
                         println!("   🎭 [POST-IRONY GUARD] Overriding LLM DELETE on theatrical hyperbole ('{}') to ALLOW.", trimmed);
                         return ModerationVerdict::Allow;
                     }
+                    if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
+                        println!("   🛡️ [DOXX META GUARD] Overriding LLM DELETE on doxx meta-talk/observation to ALLOW.");
+                        return ModerationVerdict::Allow;
+                    }
+                    if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                        println!("   🛡️ [DEV CRITIQUE GUARD] Overriding LLM DELETE on developer/game critique to ALLOW.");
+                        return ModerationVerdict::Allow;
+                    }
+                    if (Self::is_drama_or_gossip(trimmed) || decision.rule.to_lowercase().contains("drama") || decision.reason.to_lowercase().contains("drama incitement")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                        println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM DELETE on gossip / drama rumor to ALLOW.");
+                        return ModerationVerdict::Allow;
+                    }
                     let effective_mute = if has_slur { 1440 } else { decision.mute_minutes };
                     let effective_rule = if has_slur { "Crit (Slurs)".to_string() } else { decision.rule };
                     let effective_reason = if has_slur { format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed) } else { decision.reason };
@@ -1361,6 +1555,18 @@ impl AiModerator {
                     }
                     if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🎭 [POST-IRONY GUARD] Overriding LLM SUSPICIOUS on theatrical hyperbole ('{}') to ALLOW.", trimmed);
+                        return ModerationVerdict::Allow;
+                    }
+                    if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
+                        println!("   🛡️ [DOXX META GUARD] Overriding LLM SUSPICIOUS on doxx meta-talk/observation to ALLOW.");
+                        return ModerationVerdict::Allow;
+                    }
+                    if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                        println!("   🛡️ [DEV CRITIQUE GUARD] Overriding LLM SUSPICIOUS on developer/game critique to ALLOW.");
+                        return ModerationVerdict::Allow;
+                    }
+                    if (Self::is_drama_or_gossip(trimmed) || decision.rule.to_lowercase().contains("drama") || decision.reason.to_lowercase().contains("drama incitement")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                        println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM SUSPICIOUS on gossip / drama rumor to ALLOW.");
                         return ModerationVerdict::Allow;
                     }
                     println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
@@ -1425,6 +1631,18 @@ impl AiModerator {
                     println!("   🎮 [PVP CALLOUT GUARD] Grey-zone failover fallback on tactical in-game callout ('{}') -> ALLOW.", trimmed);
                     return ModerationVerdict::Allow;
                 }
+                if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
+                    println!("   🛡️ [DOXX META GUARD] Grey-zone failover fallback on doxx meta-talk -> ALLOW.");
+                    return ModerationVerdict::Allow;
+                }
+                if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                    println!("   🛡️ [DEV CRITIQUE GUARD] Grey-zone failover fallback on dev critique -> ALLOW.");
+                    return ModerationVerdict::Allow;
+                }
+                if (Self::is_drama_or_gossip(trimmed) || top_cat.contains("drama")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                    println!("   🛡️ [DRAMA / GOSSIP GUARD] Grey-zone failover fallback on drama rumor -> ALLOW.");
+                    return ModerationVerdict::Allow;
+                }
                 if has_slur && !is_meta {
                     return ModerationVerdict::DeleteConfirmed {
                         reason: format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed),
@@ -1453,6 +1671,16 @@ impl AiModerator {
                         model_used: "Bait Guard (Failover)".to_string(),
                         rule_violated: "Minor/Mild (Baiting)".to_string(),
                         mute_minutes: 1,
+                    };
+                }
+                if has_severe_harm_keyword && !is_pvp_callout && !is_meta {
+                    return ModerationVerdict::FlagSuspicious {
+                        reason: format!("Severe harm keyword detected in message: \"{}\"", trimmed),
+                        score: if max_score > 0.5 { max_score } else { 0.85 },
+                        category: if top_cat.is_empty() { "violence".to_string() } else { top_cat },
+                        model_used: "Severe Keyword Guard (Failover)".to_string(),
+                        rule_violated: "Major (Threats/Harm)".to_string(),
+                        mute_minutes: 60,
                     };
                 }
                 ModerationVerdict::Allow
@@ -2455,6 +2683,125 @@ mod tests {
             "Expected 'kill him' in gaming context to be ALLOW, got {:?}",
             verdict
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_dox_meta_talk() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 113,
+            timestamp_unix: 1727376000,
+            author_name: "fr.",
+            author_id: 460229578896572417,
+            author_nick: Some("fr.".to_string()),
+            account_age_days: Some(100),
+            server_member_days: Some(50),
+            roles_count: 2,
+            content: "Its basically a doxx soo yeah",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'Its basically a doxx soo yeah': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected 'Its basically a doxx soo yeah' to be ALLOW, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_dev_critique_vent() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 114,
+            timestamp_unix: 1727376000,
+            author_name: "freshmanlovernothacked",
+            author_id: 1534598207001329864,
+            author_nick: Some("freshmanlovernothacked".to_string()),
+            account_age_days: Some(50),
+            server_member_days: Some(20),
+            roles_count: 1,
+            content: "roblox devs becoming actual subhuman idiots the moment their games boutta release",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'roblox devs becoming actual subhuman idiots...': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected developer critique vent to be ALLOW, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_grapevine_gossip() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 115,
+            timestamp_unix: 1727376000,
+            author_name: "Mizo",
+            author_id: 357645179722661891,
+            author_nick: Some("Mizo".to_string()),
+            account_age_days: Some(200),
+            server_member_days: Some(100),
+            roles_count: 3,
+            content: "<@357645179722661891> i heard from the grape vine that u paid someone to do something to me",
+            reply_to: None,
+            mentions: &[(357645179722661891, "TargetUser".to_string())],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for grapevine gossip: {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected grapevine gossip to be ALLOW, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn test_contains_word_boundaries() {
+        assert!(!AiModerator::contains_word("i heard from the grape vine", "rape"));
+        assert!(!AiModerator::contains_word("grapevine", "rape"));
+        assert!(!AiModerator::contains_word("he scraped his knee", "rape"));
+        assert!(AiModerator::contains_word("did he rape someone", "rape"));
+        assert!(AiModerator::contains_word("rape!", "rape"));
+        assert!(AiModerator::contains_word("rape", "rape"));
+
+        assert!(!AiModerator::contains_word("он дурак", "рак"));
+        assert!(!AiModerator::contains_word("трактор", "рак"));
+        assert!(AiModerator::contains_word("ты рак", "рак"));
+        assert!(AiModerator::contains_word("рак!", "рак"));
+
+        assert!(!AiModerator::contains_word("system stability", "stab"));
+        assert!(AiModerator::contains_word("i will stab you", "stab"));
+
+        assert!(!AiModerator::contains_word("audience", "die"));
+        assert!(!AiModerator::contains_word("diet", "die"));
+        assert!(AiModerator::contains_word("you will die", "die"));
+
+        // Multi-word checks
+        assert!(AiModerator::contains_word("i will burn alive in hell", "burn alive"));
+        assert!(!AiModerator::contains_word("i will burn hot", "burn alive"));
     }
 }
 
