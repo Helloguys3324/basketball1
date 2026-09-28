@@ -448,7 +448,8 @@ pub struct AiModerator {
     groq_fast_model: String,
     groq_deep_model: String,
     groq_counter: Arc<AtomicUsize>,
-    gemini_key: Option<String>,
+    gemini_keys: Vec<String>,
+    gemini_counter: Arc<AtomicUsize>,
     gemini_fast_model: String,
     gemini_deep_model: String,
     chat_history: RwLock<HashMap<u64, VecDeque<ChatEntry>>>,
@@ -536,7 +537,16 @@ impl AiModerator {
 
         let groq_counter = Arc::new(AtomicUsize::new(0));
 
-        let gemini_key = get_env_var("GEMINI_API_KEY");
+        let gemini_keys: Vec<String> = get_env_var("GEMINI_API_KEYS")
+            .or_else(|| get_env_var("GEMINI_API_KEY"))
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let gemini_counter = Arc::new(AtomicUsize::new(0));
+
         let gemini_fast_model = get_env_var("GEMINI_FAST_MODEL")
             .unwrap_or_else(|| "gemini-3.8-flash".to_string());
         let gemini_deep_model = get_env_var("GEMINI_DEEP_MODEL")
@@ -565,14 +575,14 @@ impl AiModerator {
         };
 
         let groq_batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            if !groq_keys.is_empty() || gemini_key.is_some() {
+            if !groq_keys.is_empty() || !gemini_keys.is_empty() {
                 println!(
-                    "   🤖 [LLM ARBITER] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms) (Gemini: {}, Groq: {})",
+                    "   🤖 [LLM ARBITER] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms) (Gemini Keys: {}, Groq Keys: {})",
                     groq_batch_size,
                     groq_batch_wait.as_secs_f64(),
                     groq_batch_wait.as_millis(),
-                    gemini_key.is_some(),
-                    !groq_keys.is_empty()
+                    gemini_keys.len(),
+                    groq_keys.len()
                 );
                 let (tx, rx) = mpsc::unbounded_channel::<GroqBatchItemRequest>();
                 let client_clone = http_client.clone();
@@ -580,7 +590,8 @@ impl AiModerator {
                 let fast_clone = groq_fast_model.clone();
                 let deep_clone = groq_deep_model.clone();
                 let counter_clone = groq_counter.clone();
-                let gemini_key_clone = gemini_key.clone();
+                let gemini_keys_clone = gemini_keys.clone();
+                let gemini_counter_clone = gemini_counter.clone();
                 let gemini_fast_clone = gemini_fast_model.clone();
                 let gemini_deep_clone = gemini_deep_model.clone();
                 handle.spawn(Self::run_groq_batch_worker(
@@ -590,7 +601,8 @@ impl AiModerator {
                     fast_clone,
                     deep_clone,
                     counter_clone,
-                    gemini_key_clone,
+                    gemini_keys_clone,
+                    gemini_counter_clone,
                     gemini_fast_clone,
                     gemini_deep_clone,
                     groq_batch_size,
@@ -611,7 +623,8 @@ impl AiModerator {
             groq_fast_model,
             groq_deep_model,
             groq_counter,
-            gemini_key,
+            gemini_keys,
+            gemini_counter,
             gemini_fast_model,
             gemini_deep_model,
             chat_history: RwLock::new(HashMap::new()),
@@ -2717,12 +2730,18 @@ impl AiModerator {
 
     pub async fn call_gemini_failover_static(
         http_client: &reqwest::Client,
-        api_key: &str,
+        gemini_keys: &[String],
+        gemini_counter: &AtomicUsize,
         preferred_model: &str,
         system_prompt: &str,
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<(String, String, u128), String> {
+        let total_keys = gemini_keys.len();
+        if total_keys == 0 {
+            return Err("No Gemini keys configured".to_string());
+        }
+
         let mut models_to_try = vec![preferred_model];
         for candidate in &[
             "gemini-3.5-flash-lite",
@@ -2739,16 +2758,21 @@ impl AiModerator {
             }
         }
 
-        for model in models_to_try {
-            match Self::call_gemini_static(http_client, api_key, model, system_prompt, user_prompt, max_tokens).await {
-                Ok((text, elapsed_ms)) => return Ok((text, model.to_string(), elapsed_ms)),
-                Err(e) => {
-                    eprintln!("[GEMINI FAILOVER] Model '{}' error: {}. Trying fallback...", model, e);
-                    continue;
+        let start_idx = gemini_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
+        for target_model in models_to_try {
+            for i in 0..total_keys {
+                let idx = (start_idx + i) % total_keys;
+                let key = &gemini_keys[idx];
+                match Self::call_gemini_static(http_client, key, target_model, system_prompt, user_prompt, max_tokens).await {
+                    Ok((text, elapsed_ms)) => return Ok((text, target_model.to_string(), elapsed_ms)),
+                    Err(e) => {
+                        eprintln!("[GEMINI FAILOVER] Key #{} model '{}' error: {}. Trying fallback...", idx + 1, target_model, e);
+                        continue;
+                    }
                 }
             }
         }
-        Err("All Gemini models exhausted".to_string())
+        Err("All Gemini keys and models exhausted".to_string())
     }
 
     async fn call_groq_failover(
@@ -2758,7 +2782,7 @@ impl AiModerator {
         user_prompt: &str,
     ) -> Result<(GroqDecision, String, u128), String> {
         // First try Gemini if configured
-        if let Some(gemini_key) = &self.gemini_key {
+        if !self.gemini_keys.is_empty() {
             let preferred_gemini = if model.contains("gpt-oss") || model.contains("pro") {
                 &self.gemini_deep_model
             } else {
@@ -2767,7 +2791,8 @@ impl AiModerator {
             let max_tokens = if preferred_gemini.contains("pro") { 1024 } else { 150 };
             match Self::call_gemini_failover_static(
                 &self.http_client,
-                gemini_key,
+                &self.gemini_keys,
+                &self.gemini_counter,
                 preferred_gemini,
                 system_prompt,
                 user_prompt,
@@ -3115,7 +3140,8 @@ impl AiModerator {
         groq_fast_model: String,
         groq_deep_model: String,
         groq_counter: Arc<AtomicUsize>,
-        gemini_key: Option<String>,
+        gemini_keys: Vec<String>,
+        gemini_counter: Arc<AtomicUsize>,
         gemini_fast_model: String,
         gemini_deep_model: String,
         batch_size: usize,
@@ -3134,7 +3160,8 @@ impl AiModerator {
                     &groq_fast_model,
                     &groq_deep_model,
                     &groq_counter,
-                    gemini_key.as_deref(),
+                    &gemini_keys,
+                    &gemini_counter,
                     &gemini_fast_model,
                     &gemini_deep_model,
                 ).await;
@@ -3157,7 +3184,8 @@ impl AiModerator {
                                         &groq_fast_model,
                                         &groq_deep_model,
                                         &groq_counter,
-                                        gemini_key.as_deref(),
+                                        &gemini_keys,
+                                        &gemini_counter,
                                         &gemini_fast_model,
                                         &gemini_deep_model,
                                     ).await;
@@ -3172,7 +3200,8 @@ impl AiModerator {
                                     &groq_fast_model,
                                     &groq_deep_model,
                                     &groq_counter,
-                                    gemini_key.as_deref(),
+                                    &gemini_keys,
+                                    &gemini_counter,
                                     &gemini_fast_model,
                                     &gemini_deep_model,
                                 ).await;
@@ -3188,7 +3217,8 @@ impl AiModerator {
                             &groq_fast_model,
                             &groq_deep_model,
                             &groq_counter,
-                            gemini_key.as_deref(),
+                            &gemini_keys,
+                            &gemini_counter,
                             &gemini_fast_model,
                             &gemini_deep_model,
                         ).await;
@@ -3206,7 +3236,8 @@ impl AiModerator {
         groq_fast_model: &str,
         groq_deep_model: &str,
         groq_counter: &AtomicUsize,
-        gemini_key: Option<&str>,
+        gemini_keys: &[String],
+        gemini_counter: &AtomicUsize,
         gemini_fast_model: &str,
         gemini_deep_model: &str,
     ) {
@@ -3217,7 +3248,7 @@ impl AiModerator {
         let batch = std::mem::take(pending);
         let count = batch.len();
 
-        if groq_keys.is_empty() && gemini_key.is_none() {
+        if groq_keys.is_empty() && gemini_keys.is_empty() {
             for item in batch {
                 let _ = item.sender.send(Err("No Gemini or Groq keys configured".to_string()));
             }
@@ -3227,10 +3258,10 @@ impl AiModerator {
         let has_hardcore = batch.iter().any(|item| item.is_hardcore);
         let combined_user_prompt = Self::build_batch_transcript_prompt(&batch);
 
-        // Try Gemini first if key is present
+        // Try Gemini first if keys are present
         let mut eval_result: Option<(String, Option<String>, String, u128)> = None;
 
-        if let Some(key) = gemini_key {
+        if !gemini_keys.is_empty() {
             let preferred_gemini = if has_hardcore {
                 gemini_deep_model
             } else {
@@ -3245,7 +3276,8 @@ impl AiModerator {
 
             match Self::call_gemini_failover_static(
                 http_client,
-                key,
+                gemini_keys,
+                gemini_counter,
                 preferred_gemini,
                 SERVER_RULES_BATCH_SYSTEM_PROMPT,
                 &combined_user_prompt,
