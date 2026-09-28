@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -146,6 +146,32 @@ VERDICT:[ALLOW|SUSPICIOUS|DELETE]\n\
 RULE:[Rule name or None]\n\
 MUTE_MINUTES:[0|1|15|30|60|120|1440]\n\
 REASON:[<=8 words]";
+
+pub const SERVER_RULES_BATCH_SYSTEM_PROMPT: &str = r#"Discord Arbiter for a gaming community. You are auditing multiple flagged Discord messages from users.
+Mutes only (NO BAN/KICK).
+PUNISHMENT TIERS (SUSPICIOUS/DELETE):
+1. Minor/Mild -> SUSPICIOUS(1m): Malicious chat flooding, repetitive copy-paste raid spam, provocative gender bait ('i love sexism'). NEVER punish standard banter, complaints, or single messages under Minor/Mild!
+2. Mod -> SUSPICIOUS(15-30m): Explicit NSFW pornography links, deliberate toxic filter bypass. (NO mutes for gossip, rumors, or drama!)
+3. Major -> SUSPICIOUS(60m) or DELETE(120m): Direct real-world threats, stalking, publishing or threatening to leak private personal info (doxxing/extortion), malicious impersonation, server raid invites
+4. Crit -> DELETE(1440m): Racial/hate slurs ('nga','ngga','nigga','nigger','fag','faggot'), direct death wishes ('kys','you should die'), gore, malware
+QUOTES, OPINIONS, META-TALK & HYPOTHETICALS (ALLOW, RULE:None, MUTE:0):
+- Meta-talk and observations about doxxing or rules -> ALWAYS ALLOW (RULE: None, MUTE: 0).
+- Casual words ('dumb', 'stupid', 'silly', 'trash', 'noob', 'idiot') in casual conversation -> ALWAYS ALLOW.
+- Discussing server rules, testing bot triggers, quoting past messages, abstract placeholders -> ALWAYS ALLOW.
+- General gaming frustrations directed at external companies, game studios or developers -> ALWAYS ALLOW.
+- Chat gossip, rumors, questions, or accusations between members -> ALWAYS ALLOW.
+- Third-person gaming callouts ('kill him', 'shoot him', 'убей его') -> ALWAYS ALLOW (RULE: None, MUTE: 0).
+- Roblox / Gaming hunting trashtalk ('I will find you and kill you in roblox', 'найду тебя на сервере и убью') -> ALWAYS ALLOW (RULE: None, MUTE: 0).
+- Standalone casual profanity ('fuck you', 'stfu') WITHOUT death wishes and WITHOUT slurs -> ALWAYS ALLOW.
+- Post-irony, theatrical hyperbole & dramatic exaggeration ('i will eviscerate you', 'я тебя расщеплю на атомы') -> ALWAYS ALLOW.
+- Fake-game shield evasion ('kys in minecraft', 'die in roblox', 'burn your house in rust') -> SUSPICIOUS(60m) or DELETE(120m).
+CRITICAL OUTPUT FORMAT:
+You MUST evaluate EACH item independently and output a dedicated block for EVERY [ITEM <number>] in the batch in order:
+[ITEM <number>]
+VERDICT:[ALLOW|SUSPICIOUS|DELETE]
+RULE:[Rule name or None]
+MUTE_MINUTES:[0|1|15|30|60|120|1440]
+REASON:[<=8 words]"#;
 
 pub fn get_env_var(name: &str) -> Option<String> {
     let env_paths = [
@@ -326,19 +352,92 @@ pub struct OpenAiBatchRequest {
     pub sender: oneshot::Sender<Vec<OpenAiScores>>,
 }
 
+#[derive(Debug)]
+pub struct GroqBatchItemRequest {
+    pub channel_name: String,
+    pub author_name: String,
+    pub author_id: u64,
+    pub trimmed_content: String,
+    pub prompt_chunk: String,
+    pub is_hardcore: bool,
+    pub sender: oneshot::Sender<Result<(GroqDecision, String, u128), String>>,
+}
+
 pub struct AiModerator {
     http_client: reqwest::Client,
     openai_key: Option<String>,
     groq_keys: Vec<String>,
     groq_fast_model: String,
     groq_deep_model: String,
-    groq_counter: AtomicUsize,
+    groq_counter: Arc<AtomicUsize>,
     chat_history: RwLock<HashMap<u64, VecDeque<ChatEntry>>>,
     batch_tx: Option<mpsc::UnboundedSender<OpenAiBatchRequest>>,
+    groq_batch_tx: Option<mpsc::UnboundedSender<GroqBatchItemRequest>>,
 }
 
 impl AiModerator {
     pub fn new(http_client: reqwest::Client) -> Self {
+        let default_batch_size = if cfg!(test) { 10 } else { 100 };
+        let batch_size = get_env_var("OPENAI_MODERATION_BATCH_SIZE")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(default_batch_size);
+
+        let default_timeout_ms = if cfg!(test) { 100 } else { 17000 };
+        let batch_timeout_ms = get_env_var("OPENAI_MODERATION_BATCH_TIMEOUT_MS")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(default_timeout_ms);
+
+        let default_groq_batch_size = if cfg!(test) { 5 } else { 8 };
+        let groq_batch_size = get_env_var("GROQ_MODERATION_BATCH_SIZE")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(default_groq_batch_size);
+
+        let default_groq_timeout_ms = if cfg!(test) { 50 } else { 500 };
+        let groq_batch_timeout_ms = get_env_var("GROQ_MODERATION_BATCH_TIMEOUT_MS")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(default_groq_timeout_ms);
+
+        Self::new_full(
+            http_client,
+            batch_size,
+            Duration::from_millis(batch_timeout_ms),
+            groq_batch_size,
+            Duration::from_millis(groq_batch_timeout_ms),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn new_with_batch_config(
+        http_client: reqwest::Client,
+        batch_size: usize,
+        batch_wait: Duration,
+    ) -> Self {
+        let default_groq_batch_size = if cfg!(test) { 5 } else { 8 };
+        let groq_batch_size = get_env_var("GROQ_MODERATION_BATCH_SIZE")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(default_groq_batch_size);
+
+        let default_groq_timeout_ms = if cfg!(test) { 50 } else { 500 };
+        let groq_batch_timeout_ms = get_env_var("GROQ_MODERATION_BATCH_TIMEOUT_MS")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(default_groq_timeout_ms);
+
+        Self::new_full(
+            http_client,
+            batch_size,
+            batch_wait,
+            groq_batch_size,
+            Duration::from_millis(groq_batch_timeout_ms),
+        )
+    }
+
+    pub fn new_full(
+        http_client: reqwest::Client,
+        openai_batch_size: usize,
+        openai_batch_wait: Duration,
+        groq_batch_size: usize,
+        groq_batch_wait: Duration,
+    ) -> Self {
         let openai_key = get_env_var("OPENAI_API_KEY");
 
         let groq_keys: Vec<String> = get_env_var("GROQ_API_KEYS")
@@ -354,22 +453,14 @@ impl AiModerator {
         let groq_deep_model = get_env_var("GROQ_DEEP_MODEL")
             .unwrap_or_else(|| "openai/gpt-oss-120b".to_string());
 
-        let default_batch_size = if cfg!(test) { 10 } else { 100 };
-        let batch_size = get_env_var("OPENAI_MODERATION_BATCH_SIZE")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(default_batch_size);
-
-        let default_timeout_ms = if cfg!(test) { 100 } else { 17000 };
-        let batch_timeout_ms = get_env_var("OPENAI_MODERATION_BATCH_TIMEOUT_MS")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(default_timeout_ms);
+        let groq_counter = Arc::new(AtomicUsize::new(0));
 
         let batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             println!(
                 "   📦 [OPENAI BATCHING] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms)",
-                batch_size,
-                batch_timeout_ms as f64 / 1000.0,
-                batch_timeout_ms
+                openai_batch_size,
+                openai_batch_wait.as_secs_f64(),
+                openai_batch_wait.as_millis()
             );
             let (tx, rx) = mpsc::unbounded_channel::<OpenAiBatchRequest>();
             let client_clone = http_client.clone();
@@ -378,10 +469,42 @@ impl AiModerator {
                 rx,
                 client_clone,
                 key_clone,
-                batch_size,
-                Duration::from_millis(batch_timeout_ms),
+                openai_batch_size,
+                openai_batch_wait,
             ));
             Some(tx)
+        } else {
+            None
+        };
+
+        let groq_batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if !groq_keys.is_empty() {
+                println!(
+                    "   🤖 [GROQ BATCHING] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms)",
+                    groq_batch_size,
+                    groq_batch_wait.as_secs_f64(),
+                    groq_batch_wait.as_millis()
+                );
+                let (tx, rx) = mpsc::unbounded_channel::<GroqBatchItemRequest>();
+                let client_clone = http_client.clone();
+                let keys_clone = groq_keys.clone();
+                let fast_clone = groq_fast_model.clone();
+                let deep_clone = groq_deep_model.clone();
+                let counter_clone = groq_counter.clone();
+                handle.spawn(Self::run_groq_batch_worker(
+                    rx,
+                    client_clone,
+                    keys_clone,
+                    fast_clone,
+                    deep_clone,
+                    counter_clone,
+                    groq_batch_size,
+                    groq_batch_wait,
+                ));
+                Some(tx)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -392,9 +515,10 @@ impl AiModerator {
             groq_keys,
             groq_fast_model,
             groq_deep_model,
-            groq_counter: AtomicUsize::new(0),
+            groq_counter,
             chat_history: RwLock::new(HashMap::new()),
             batch_tx,
+            groq_batch_tx,
         }
     }
 
@@ -1311,7 +1435,14 @@ impl AiModerator {
                     if has_author_context { Some(combined_text.as_str()) } else { None },
                 );
 
-                match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
+                match self.evaluate_via_groq_batch(
+                    ctx.channel_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                    ctx.author_name.to_string(),
+                    ctx.author_id,
+                    trimmed.to_string(),
+                    user_prompt,
+                    is_hardcore_or_drama,
+                ).await {
                     Ok((decision, model_used, elapsed_ms)) => {
                         println!(
                             "   ⚡ [AI RESPONSE] Model: {} (took {}ms) | Verdict: {} | Rule: {} | Mute: {}m | Reason: \"{}\"",
@@ -1626,7 +1757,14 @@ impl AiModerator {
             if has_author_context { Some(combined_text.as_str()) } else { None },
         );
 
-        match self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &user_prompt).await {
+        match self.evaluate_via_groq_batch(
+            ctx.channel_name.clone().unwrap_or_else(|| "unknown".to_string()),
+            ctx.author_name.to_string(),
+            ctx.author_id,
+            trimmed.to_string(),
+            user_prompt,
+            is_hardcore_or_drama,
+        ).await {
             Ok((decision, model_used, elapsed_ms)) => {
                 println!(
                     "   ⚡ [AI RESPONSE] Model: {} (took {}ms) | Verdict: {} | Rule: {} | Mute: {}m | Reason: \"{}\"",
@@ -1929,6 +2067,41 @@ impl AiModerator {
         }
     }
 
+    pub async fn evaluate_via_groq_batch(
+        &self,
+        channel_name: String,
+        author_name: String,
+        author_id: u64,
+        trimmed_content: String,
+        prompt_chunk: String,
+        is_hardcore: bool,
+    ) -> Result<(GroqDecision, String, u128), String> {
+        if let Some(ref tx) = self.groq_batch_tx {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let req = GroqBatchItemRequest {
+                channel_name,
+                author_name,
+                author_id,
+                trimmed_content,
+                prompt_chunk: prompt_chunk.clone(),
+                is_hardcore,
+                sender: resp_tx,
+            };
+            if tx.send(req).is_ok() {
+                if let Ok(res) = resp_rx.await {
+                    return res;
+                }
+            }
+        }
+
+        let preferred_model = if is_hardcore {
+            &self.groq_deep_model
+        } else {
+            &self.groq_fast_model
+        };
+        self.call_groq_failover(preferred_model, SERVER_RULES_SYSTEM_PROMPT, &prompt_chunk).await
+    }
+
     async fn run_batch_worker(
         mut rx: mpsc::UnboundedReceiver<OpenAiBatchRequest>,
         http_client: reqwest::Client,
@@ -2191,7 +2364,31 @@ impl AiModerator {
         system_prompt: &str,
         user_prompt: &str,
     ) -> Result<(GroqDecision, String, u128), String> {
-        let total_keys = self.groq_keys.len();
+        let max_tokens = if model.contains("gpt-oss") { 1024 } else { 85 };
+        let (raw_text, reasoning, model_used, elapsed_ms) = Self::call_groq_failover_static(
+            &self.http_client,
+            &self.groq_keys,
+            &self.groq_counter,
+            model,
+            system_prompt,
+            user_prompt,
+            max_tokens,
+        ).await?;
+
+        let decision = Self::parse_single_decision_from_text(&raw_text, reasoning.as_deref())?;
+        Ok((decision, model_used, elapsed_ms))
+    }
+
+    pub async fn call_groq_failover_static(
+        http_client: &reqwest::Client,
+        groq_keys: &[String],
+        groq_counter: &AtomicUsize,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<(String, Option<String>, String, u128), String> {
+        let total_keys = groq_keys.len();
         if total_keys == 0 {
             return Err("No Groq keys configured".to_string());
         }
@@ -2207,13 +2404,13 @@ impl AiModerator {
             models_to_try.push("openai/gpt-oss-20b");
         }
 
-        let start_idx = self.groq_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
+        let start_idx = groq_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
         for target_model in models_to_try {
             for i in 0..total_keys {
                 let idx = (start_idx + i) % total_keys;
-                let key = &self.groq_keys[idx];
-                match self.execute_groq_call(key, target_model, system_prompt, user_prompt).await {
-                    Ok((res, elapsed_ms)) => return Ok((res, target_model.to_string(), elapsed_ms)),
+                let key = &groq_keys[idx];
+                match Self::execute_groq_call_raw_static(http_client, key, target_model, system_prompt, user_prompt, max_tokens).await {
+                    Ok((content, reasoning, elapsed_ms)) => return Ok((content, reasoning, target_model.to_string(), elapsed_ms)),
                     Err(e) => {
                         eprintln!("[GROQ FAILOVER] Key {} model '{}' error: {}. Trying fallback...", idx, target_model, e);
                         continue;
@@ -2224,6 +2421,7 @@ impl AiModerator {
         Err("All Groq keys and models exhausted".to_string())
     }
 
+    #[allow(dead_code)]
     async fn execute_groq_call(
         &self,
         api_key: &str,
@@ -2231,8 +2429,29 @@ impl AiModerator {
         system_prompt: &str,
         user_prompt: &str,
     ) -> Result<(GroqDecision, u128), String> {
-        let start_time = std::time::Instant::now();
         let max_tokens = if model.contains("gpt-oss") { 1024 } else { 85 };
+        let (raw_text, reasoning, elapsed_ms) = Self::execute_groq_call_raw_static(
+            &self.http_client,
+            api_key,
+            model,
+            system_prompt,
+            user_prompt,
+            max_tokens,
+        ).await?;
+
+        let decision = Self::parse_single_decision_from_text(&raw_text, reasoning.as_deref())?;
+        Ok((decision, elapsed_ms))
+    }
+
+    async fn execute_groq_call_raw_static(
+        http_client: &reqwest::Client,
+        api_key: &str,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<(String, Option<String>, u128), String> {
+        let start_time = std::time::Instant::now();
         let req_body = GroqChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -2249,8 +2468,7 @@ impl AiModerator {
             temperature: 0.0,
         };
 
-        let resp = self
-            .http_client
+        let resp = http_client
             .post("https://api.groq.com/openai/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
@@ -2268,121 +2486,416 @@ impl AiModerator {
         let raw_json = resp.text().await.map_err(|e| format!("Network error: {}", e))?;
         let body: GroqChatResponse = serde_json::from_str(&raw_json).map_err(|e| format!("JSON decode error: {}", e))?;
         let elapsed_ms = start_time.elapsed().as_millis();
+
         if let Some(choice) = body.choices.first() {
-            let text = &choice.message.content;
-            let upper = text.to_uppercase();
-            let mut verdict = String::new();
-            let mut rule = "Server Guidelines".to_string();
-            let mut mute_minutes: u64 = 0;
-            let mut reason = String::new();
-
-            for line in text.lines() {
-                let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
-                let upper_l = normalized.to_uppercase();
-                if let Some(rest) = upper_l.strip_prefix("VERDICT:") {
-                    verdict = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'').to_uppercase();
-                } else if let Some(_rest) = upper_l.strip_prefix("RULE:") {
-                    let val = normalized["RULE:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
-                    rule = val.to_string();
-                } else if let Some(rest) = upper_l.strip_prefix("MUTE_MINUTES:") {
-                    let num_str = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
-                    mute_minutes = num_str.parse::<u64>().unwrap_or(0);
-                } else if let Some(_rest) = upper_l.strip_prefix("REASON:") {
-                    let val = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
-                    reason = val.to_string();
-                }
-            }
-
-            // If content was empty or didn't contain VERDICT, also try reasoning if available
-            if verdict.is_empty() {
-                if let Some(ref r) = choice.message.reasoning {
-                    for line in r.lines() {
-                        let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
-                        let upper_l = normalized.to_uppercase();
-                        if let Some(rest) = upper_l.strip_prefix("VERDICT:") {
-                            verdict = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'').to_uppercase();
-                        } else if let Some(_rest) = upper_l.strip_prefix("RULE:") {
-                            let val = normalized["RULE:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
-                            rule = val.to_string();
-                        } else if let Some(rest) = upper_l.strip_prefix("MUTE_MINUTES:") {
-                            let num_str = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
-                            mute_minutes = num_str.parse::<u64>().unwrap_or(0);
-                        } else if let Some(_rest) = upper_l.strip_prefix("REASON:") {
-                            let val = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
-                            reason = val.to_string();
-                        }
-                    }
-                    if verdict.is_empty() {
-                        let r_upper = r.to_uppercase();
-                        if r_upper.contains("DELETE") || r_upper.contains("CRIT") || r_upper.contains("HATE SPEECH") || r_upper.contains("GENOCIDE") {
-                            verdict = "DELETE".to_string();
-                            rule = "Crit".to_string();
-                            mute_minutes = 1440;
-                            reason = "Severe violation identified in evaluation".to_string();
-                        }
-                    }
-                }
-            }
-
-            if verdict.is_empty() {
-                if upper.contains("DELETE") {
-                    verdict = "DELETE".to_string();
-                } else if upper.contains("SUSPICIOUS") {
-                    verdict = "SUSPICIOUS".to_string();
-                } else if text.trim().is_empty() {
-                    // LLM ran out of tokens or returned empty completion - do NOT guess ALLOW!
-                    return Err("LLM returned empty completion (ran out of tokens or filtered)".to_string());
-                } else {
-                    verdict = "ALLOW".to_string();
-                }
-            }
-
-            if reason.is_empty() {
-                if rule != "Server Guidelines" && !rule.is_empty() {
-                    reason = format!("Violated: {}", rule);
-                } else {
-                    reason = "Context telemetry evaluation".to_string();
-                }
-            }
-
-            // Correction only if model explicitly assigned a punishment RULE other than None but output ALLOW
-            if verdict == "ALLOW" {
-                let lower_rule = rule.to_lowercase();
-                if lower_rule.contains("crit") {
-                    verdict = "DELETE".to_string();
-                    mute_minutes = 1440;
-                } else if (lower_rule.contains("minor") || lower_rule.contains("mild") || lower_rule.contains("mod") || lower_rule.contains("major")) && lower_rule != "none" {
-                    verdict = "SUSPICIOUS".to_string();
-                    mute_minutes = if lower_rule.contains("minor") || lower_rule.contains("mild") { 1 } else { 30 };
-                }
-            }
-
-            // Fallback timeout scaling if model omitted MUTE_MINUTES
-            if mute_minutes == 0 {
-                if verdict == "DELETE" {
-                    mute_minutes = 120;
-                } else if verdict == "SUSPICIOUS" && rule != "None" {
-                    if rule.to_lowercase().contains("minor") || rule.to_lowercase().contains("mild") {
-                        mute_minutes = 1;
-                    } else {
-                        mute_minutes = 30;
-                    }
-                }
-            }
-
-            // Enforce 1 minute for Minor / Mild violations instead of 5
-            if mute_minutes == 5 || (mute_minutes > 1 && mute_minutes <= 10 && (rule.to_lowercase().contains("minor") || rule.to_lowercase().contains("mild"))) {
-                mute_minutes = 1;
-            }
-
-            Ok((GroqDecision {
-                verdict,
-                rule,
-                mute_minutes,
-                reason,
-            }, elapsed_ms))
+            Ok((choice.message.content.clone(), choice.message.reasoning.clone(), elapsed_ms))
         } else {
             Err("Empty choices in response".to_string())
+        }
+    }
+
+    pub fn parse_single_decision_from_text(text: &str, reasoning: Option<&str>) -> Result<GroqDecision, String> {
+        let upper = text.to_uppercase();
+        let mut verdict = String::new();
+        let mut rule = "Server Guidelines".to_string();
+        let mut mute_minutes: u64 = 0;
+        let mut reason = String::new();
+
+        for line in text.lines() {
+            let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
+            let upper_l = normalized.to_uppercase();
+            if let Some(rest) = upper_l.strip_prefix("VERDICT:") {
+                verdict = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'').to_uppercase();
+            } else if let Some(_rest) = upper_l.strip_prefix("RULE:") {
+                let val = normalized["RULE:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                rule = val.to_string();
+            } else if let Some(rest) = upper_l.strip_prefix("MUTE_MINUTES:") {
+                let num_str = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                mute_minutes = num_str.parse::<u64>().unwrap_or(0);
+            } else if let Some(_rest) = upper_l.strip_prefix("REASON:") {
+                let val = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                reason = val.to_string();
+            }
+        }
+
+        // If content was empty or didn't contain VERDICT, also try reasoning if available
+        if verdict.is_empty() {
+            if let Some(r) = reasoning {
+                for line in r.lines() {
+                    let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
+                    let upper_l = normalized.to_uppercase();
+                    if let Some(rest) = upper_l.strip_prefix("VERDICT:") {
+                        verdict = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'').to_uppercase();
+                    } else if let Some(_rest) = upper_l.strip_prefix("RULE:") {
+                        let val = normalized["RULE:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                        rule = val.to_string();
+                    } else if let Some(rest) = upper_l.strip_prefix("MUTE_MINUTES:") {
+                        let num_str = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                        mute_minutes = num_str.parse::<u64>().unwrap_or(0);
+                    } else if let Some(_rest) = upper_l.strip_prefix("REASON:") {
+                        let val = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                        reason = val.to_string();
+                    }
+                }
+                if verdict.is_empty() {
+                    let r_upper = r.to_uppercase();
+                    if r_upper.contains("DELETE") || r_upper.contains("CRIT") || r_upper.contains("HATE SPEECH") || r_upper.contains("GENOCIDE") {
+                        verdict = "DELETE".to_string();
+                        rule = "Crit".to_string();
+                        mute_minutes = 1440;
+                        reason = "Severe violation identified in evaluation".to_string();
+                    }
+                }
+            }
+        }
+
+        if verdict.is_empty() {
+            if upper.contains("DELETE") {
+                verdict = "DELETE".to_string();
+            } else if upper.contains("SUSPICIOUS") {
+                verdict = "SUSPICIOUS".to_string();
+            } else if text.trim().is_empty() {
+                return Err("LLM returned empty completion (ran out of tokens or filtered)".to_string());
+            } else {
+                verdict = "ALLOW".to_string();
+            }
+        }
+
+        if reason.is_empty() {
+            if rule != "Server Guidelines" && !rule.is_empty() {
+                reason = format!("Violated: {}", rule);
+            } else {
+                reason = "Context telemetry evaluation".to_string();
+            }
+        }
+
+        // Correction only if model explicitly assigned a punishment RULE other than None but output ALLOW
+        if verdict == "ALLOW" {
+            let lower_rule = rule.to_lowercase();
+            if lower_rule.contains("crit") {
+                verdict = "DELETE".to_string();
+                mute_minutes = 1440;
+            } else if (lower_rule.contains("minor") || lower_rule.contains("mild") || lower_rule.contains("mod") || lower_rule.contains("major")) && lower_rule != "none" {
+                verdict = "SUSPICIOUS".to_string();
+                mute_minutes = if lower_rule.contains("minor") || lower_rule.contains("mild") { 1 } else { 30 };
+            }
+        }
+
+        // Fallback timeout scaling if model omitted MUTE_MINUTES
+        if mute_minutes == 0 {
+            if verdict == "DELETE" {
+                mute_minutes = 120;
+            } else if verdict == "SUSPICIOUS" && rule != "None" {
+                if rule.to_lowercase().contains("minor") || rule.to_lowercase().contains("mild") {
+                    mute_minutes = 1;
+                } else {
+                    mute_minutes = 30;
+                }
+            }
+        }
+
+        // Enforce 1 minute for Minor / Mild violations instead of 5
+        if mute_minutes == 5 || (mute_minutes > 1 && mute_minutes <= 10 && (rule.to_lowercase().contains("minor") || rule.to_lowercase().contains("mild"))) {
+            mute_minutes = 1;
+        }
+
+        Ok(GroqDecision {
+            verdict,
+            rule,
+            mute_minutes,
+            reason,
+        })
+    }
+
+    pub fn extract_item_id(upper: &str) -> Option<usize> {
+        let clean = upper.replace('*', "").replace('`', "").replace('#', "");
+        let clean = clean.trim();
+        for prefix in &["[ITEM", "ITEM", "[MESSAGE", "MESSAGE", "[MSG", "MSG"] {
+            if let Some(idx) = clean.find(prefix) {
+                let rest = &clean[idx + prefix.len()..];
+                let rest = rest.trim_start_matches(|c: char| c == ':' || c == '#' || c == ' ' || c == '[' || c == ']' || c == '-' || c == '.');
+                let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(id) = num_str.parse::<usize>() {
+                    if id > 0 {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn parse_batch_decisions(
+        text: &str,
+        reasoning: Option<&str>,
+        item_count: usize,
+    ) -> HashMap<usize, GroqDecision> {
+        let mut map: HashMap<usize, GroqDecision> = HashMap::new();
+        if item_count == 0 {
+            return map;
+        }
+
+        let full_text = if let Some(r) = reasoning {
+            format!("{}\n{}", text, r)
+        } else {
+            text.to_string()
+        };
+
+        let mut current_id: Option<usize> = if item_count == 1 { Some(1) } else { None };
+        let mut cur_lines: Vec<String> = Vec::new();
+
+        let flush_item = |id_opt: Option<usize>, lines: &[String], out: &mut HashMap<usize, GroqDecision>| {
+            if let Some(id) = id_opt {
+                if !lines.is_empty() {
+                    let chunk = lines.join("\n");
+                    if let Ok(decision) = Self::parse_single_decision_from_text(&chunk, None) {
+                        out.insert(id, decision);
+                    }
+                }
+            }
+        };
+
+        for line in full_text.lines() {
+            let clean = line.replace('*', "").replace('`', "").replace('#', "").trim().to_string();
+            let upper = clean.to_uppercase();
+
+            if let Some(new_id) = Self::extract_item_id(&upper) {
+                flush_item(current_id, &cur_lines, &mut map);
+                cur_lines.clear();
+                current_id = Some(new_id);
+                continue;
+            }
+
+            cur_lines.push(clean);
+        }
+        flush_item(current_id, &cur_lines, &mut map);
+
+        if item_count == 1 && !map.contains_key(&1) {
+            if let Ok(decision) = Self::parse_single_decision_from_text(text, reasoning) {
+                map.insert(1, decision);
+            }
+        }
+
+        for i in 1..=item_count {
+            map.entry(i).or_insert_with(|| GroqDecision {
+                verdict: "ALLOW".to_string(),
+                rule: "None".to_string(),
+                mute_minutes: 0,
+                reason: "Safe chat banter".to_string(),
+            });
+        }
+
+        map
+    }
+
+    async fn run_groq_batch_worker(
+        mut rx: mpsc::UnboundedReceiver<GroqBatchItemRequest>,
+        http_client: reqwest::Client,
+        groq_keys: Vec<String>,
+        groq_fast_model: String,
+        groq_deep_model: String,
+        groq_counter: Arc<AtomicUsize>,
+        batch_size: usize,
+        batch_wait: Duration,
+    ) {
+        let mut pending: Vec<GroqBatchItemRequest> = Vec::new();
+
+        while let Some(first_req) = rx.recv().await {
+            pending.push(first_req);
+
+            if pending.len() >= batch_size {
+                Self::flush_groq_batch(
+                    &mut pending,
+                    &http_client,
+                    &groq_keys,
+                    &groq_fast_model,
+                    &groq_deep_model,
+                    &groq_counter,
+                ).await;
+                continue;
+            }
+
+            let deadline = tokio::time::Instant::now() + batch_wait;
+
+            while !pending.is_empty() {
+                tokio::select! {
+                    maybe_req = rx.recv() => {
+                        match maybe_req {
+                            Some(req) => {
+                                pending.push(req);
+                                if pending.len() >= batch_size {
+                                    Self::flush_groq_batch(
+                                        &mut pending,
+                                        &http_client,
+                                        &groq_keys,
+                                        &groq_fast_model,
+                                        &groq_deep_model,
+                                        &groq_counter,
+                                    ).await;
+                                    break;
+                                }
+                            }
+                            None => {
+                                Self::flush_groq_batch(
+                                    &mut pending,
+                                    &http_client,
+                                    &groq_keys,
+                                    &groq_fast_model,
+                                    &groq_deep_model,
+                                    &groq_counter,
+                                ).await;
+                                return;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        Self::flush_groq_batch(
+                            &mut pending,
+                            &http_client,
+                            &groq_keys,
+                            &groq_fast_model,
+                            &groq_deep_model,
+                            &groq_counter,
+                        ).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn flush_groq_batch(
+        pending: &mut Vec<GroqBatchItemRequest>,
+        http_client: &reqwest::Client,
+        groq_keys: &[String],
+        groq_fast_model: &str,
+        groq_deep_model: &str,
+        groq_counter: &AtomicUsize,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+
+        let batch = std::mem::take(pending);
+        let count = batch.len();
+
+        if groq_keys.is_empty() {
+            for item in batch {
+                let _ = item.sender.send(Err("No Groq keys configured".to_string()));
+            }
+            return;
+        }
+
+        let has_hardcore = batch.iter().any(|item| item.is_hardcore);
+        let preferred_model = if has_hardcore {
+            groq_deep_model
+        } else {
+            groq_fast_model
+        };
+
+        if count == 1 {
+            let item = batch.into_iter().next().unwrap();
+            let res = Self::call_groq_failover_static(
+                http_client,
+                groq_keys,
+                groq_counter,
+                preferred_model,
+                SERVER_RULES_SYSTEM_PROMPT,
+                &item.prompt_chunk,
+                if preferred_model.contains("gpt-oss") { 1024 } else { 85 },
+            ).await;
+
+            match res {
+                Ok((raw_text, reasoning, model_used, elapsed_ms)) => {
+                    let decision = Self::parse_single_decision_from_text(&raw_text, reasoning.as_deref())
+                        .unwrap_or_else(|_| GroqDecision {
+                            verdict: "ALLOW".to_string(),
+                            rule: "None".to_string(),
+                            mute_minutes: 0,
+                            reason: "Safe chat banter".to_string(),
+                        });
+                    let _ = item.sender.send(Ok((decision, model_used, elapsed_ms)));
+                }
+                Err(e) => {
+                    let _ = item.sender.send(Err(e));
+                }
+            }
+            return;
+        }
+
+        // Multi-item batch flush!
+        println!(
+            "\n📦 [GROQ BATCH FLUSH] Evaluating {} flagged messages in 1 LLM request! (Model: {}, Hardcore/Deep: {})",
+            count,
+            preferred_model,
+            has_hardcore
+        );
+
+        let mut combined_user_prompt = String::with_capacity(count * 512 + 256);
+        combined_user_prompt.push_str("FLAGGED MESSAGES TO EVALUATE IN THIS BATCH:\n\n");
+        for (idx, item) in batch.iter().enumerate() {
+            combined_user_prompt.push_str(&format!(
+                "─── [ITEM {}] (Channel: #{}, Author: @{}) ───\n{}\n\n",
+                idx + 1,
+                item.channel_name,
+                item.author_name,
+                item.prompt_chunk.trim()
+            ));
+        }
+
+        let max_tokens = ((count * 120).max(512)).min(2048) as u32;
+
+        let res = Self::call_groq_failover_static(
+            http_client,
+            groq_keys,
+            groq_counter,
+            preferred_model,
+            SERVER_RULES_BATCH_SYSTEM_PROMPT,
+            &combined_user_prompt,
+            max_tokens,
+        ).await;
+
+        match res {
+            Ok((raw_text, reasoning, model_used, elapsed_ms)) => {
+                let mut decisions_map = Self::parse_batch_decisions(&raw_text, reasoning.as_deref(), count);
+                println!(
+                    "⚡ [GROQ BATCH RESULTS] Evaluated {} items in {}ms (Model: {}):",
+                    count, elapsed_ms, model_used
+                );
+
+                for (idx, item) in batch.into_iter().enumerate() {
+                    let item_num = idx + 1;
+                    let decision = decisions_map.remove(&item_num).unwrap_or_else(|| GroqDecision {
+                        verdict: "ALLOW".to_string(),
+                        rule: "None".to_string(),
+                        mute_minutes: 0,
+                        reason: "Safe chat banter".to_string(),
+                    });
+
+                    println!(
+                        "   ↳ Item #{} (@{} [{}] in #{}): [{}] Rule: {} | Mute: {}m | Reason: \"{}\"",
+                        item_num,
+                        item.author_name,
+                        item.author_id,
+                        item.channel_name,
+                        decision.verdict,
+                        decision.rule,
+                        decision.mute_minutes,
+                        decision.reason
+                    );
+                    if decision.verdict != "ALLOW" {
+                        println!("      ⚠️ Caught text: \"{}\"", Self::safe_truncate(&item.trimmed_content, 60));
+                    }
+
+                    let _ = item.sender.send(Ok((decision, model_used.clone(), elapsed_ms)));
+                }
+            }
+            Err(e) => {
+                eprintln!("[GROQ BATCH ERROR] Batch failed across all failovers: {}. Falling back each item.", e);
+                for item in batch {
+                    let _ = item.sender.send(Err(e.clone()));
+                }
+            }
         }
     }
 }
@@ -3338,6 +3851,62 @@ mod tests {
         let res = moderator.check_openai_batch("test_key", vec!["hello".to_string(), "world".to_string()]).await;
         assert_eq!(res.len(), 2);
     }
+
+    #[test]
+    fn test_extract_item_id() {
+        assert_eq!(AiModerator::extract_item_id("[ITEM 1]"), Some(1));
+        assert_eq!(AiModerator::extract_item_id("[ITEM 2] (Channel: #general)"), Some(2));
+        assert_eq!(AiModerator::extract_item_id("ITEM 3:"), Some(3));
+        assert_eq!(AiModerator::extract_item_id("### ITEM #4: [ALLOW]"), Some(4));
+        assert_eq!(AiModerator::extract_item_id("[MESSAGE 5]"), Some(5));
+        assert_eq!(AiModerator::extract_item_id("VERDICT: ALLOW"), None);
+    }
+
+    #[test]
+    fn test_parse_batch_decisions() {
+        let sample_output = "\
+[ITEM 1]
+VERDICT: ALLOW
+RULE: None
+MUTE_MINUTES: 0
+REASON: Roblox hunting banter
+
+[ITEM 2]
+VERDICT: DELETE
+RULE: Crit (Slurs)
+MUTE_MINUTES: 1440
+REASON: Racial slur detected
+";
+        let decisions = AiModerator::parse_batch_decisions(sample_output, None, 2);
+        assert_eq!(decisions.len(), 2);
+
+        let d1 = decisions.get(&1).unwrap();
+        assert_eq!(d1.verdict, "ALLOW");
+        assert_eq!(d1.rule, "None");
+        assert_eq!(d1.mute_minutes, 0);
+
+        let d2 = decisions.get(&2).unwrap();
+        assert_eq!(d2.verdict, "DELETE");
+        assert_eq!(d2.rule, "Crit (Slurs)");
+        assert_eq!(d2.mute_minutes, 1440);
+    }
+
+    #[test]
+    fn test_parse_single_decision_fallback() {
+        let sample_single = "\
+VERDICT: ALLOW
+RULE: None
+MUTE_MINUTES: 0
+REASON: Friendly banter
+";
+        let decisions = AiModerator::parse_batch_decisions(sample_single, None, 1);
+        assert_eq!(decisions.len(), 1);
+        let d = decisions.get(&1).unwrap();
+        assert_eq!(d.verdict, "ALLOW");
+        assert_eq!(d.rule, "None");
+        assert_eq!(d.mute_minutes, 0);
+    }
 }
+
 
 
