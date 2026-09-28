@@ -548,9 +548,11 @@ impl AiModerator {
         let gemini_counter = Arc::new(AtomicUsize::new(0));
 
         let gemini_fast_model = get_env_var("GEMINI_FAST_MODEL")
-            .unwrap_or_else(|| "gemini-3.8-flash".to_string());
+            .map(|m| if m.contains("3.8") { "gemini-3.1-flash-lite".to_string() } else { m })
+            .unwrap_or_else(|| "gemini-3.1-flash-lite".to_string());
         let gemini_deep_model = get_env_var("GEMINI_DEEP_MODEL")
-            .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+            .map(|m| if m.contains("3.8") { "gemini-3.5-flash-lite".to_string() } else { m })
+            .unwrap_or_else(|| "gemini-3.5-flash-lite".to_string());
 
         let batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             println!(
@@ -2696,6 +2698,7 @@ impl AiModerator {
 
         let resp = http_client
             .post(&url)
+            .timeout(std::time::Duration::from_secs(16))
             .header("Content-Type", "application/json")
             .header("x-goog-api-key", api_key)
             .json(&req_body)
@@ -2742,16 +2745,17 @@ impl AiModerator {
             return Err("No Gemini keys configured".to_string());
         }
 
-        let mut models_to_try = vec![preferred_model];
+        let safe_preferred = if preferred_model.contains("3.8") || preferred_model.contains("pro") {
+            "gemini-3.1-flash-lite"
+        } else {
+            preferred_model
+        };
+
+        let mut models_to_try = vec![safe_preferred];
         for candidate in &[
-            "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
-            "gemini-3.8-flash",
-            "gemini-3.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash",
-            "gemini-3.1-pro-preview",
-            "gemini-2.5-pro",
+            "gemini-3.5-flash-lite",
+            "gemma-4-31b-it",
         ] {
             if !models_to_try.contains(candidate) {
                 models_to_try.push(candidate);

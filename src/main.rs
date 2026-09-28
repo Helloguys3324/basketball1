@@ -1554,7 +1554,7 @@ async fn main() {
 
     // High-performance HTTP client with connection pooling and optional rotating proxy
     let mut client_builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .pool_idle_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(10);
