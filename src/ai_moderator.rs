@@ -347,6 +347,65 @@ struct GroqMessageContent {
     reasoning: Option<String>,
 }
 
+#[derive(Serialize)]
+struct GeminiRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiContent<'a>>,
+    contents: Vec<GeminiContent<'a>>,
+    #[serde(rename = "generationConfig")]
+    generation_config: GeminiGenConfig,
+}
+
+#[derive(Serialize)]
+struct GeminiContent<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a str>,
+    parts: Vec<GeminiPart<'a>>,
+}
+
+#[derive(Serialize)]
+struct GeminiPart<'a> {
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct GeminiGenConfig {
+    temperature: f64,
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: u32,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponse {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+    #[serde(default)]
+    error: Option<GeminiError>,
+}
+
+#[derive(Deserialize)]
+struct GeminiError {
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: Option<GeminiContentResp>,
+}
+
+#[derive(Deserialize)]
+struct GeminiContentResp {
+    #[serde(default)]
+    parts: Vec<GeminiPartResp>,
+}
+
+#[derive(Deserialize)]
+struct GeminiPartResp {
+    #[serde(default)]
+    text: String,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BatchLogEntry {
@@ -389,6 +448,9 @@ pub struct AiModerator {
     groq_fast_model: String,
     groq_deep_model: String,
     groq_counter: Arc<AtomicUsize>,
+    gemini_key: Option<String>,
+    gemini_fast_model: String,
+    gemini_deep_model: String,
     chat_history: RwLock<HashMap<u64, VecDeque<ChatEntry>>>,
     batch_tx: Option<mpsc::UnboundedSender<OpenAiBatchRequest>>,
     groq_batch_tx: Option<mpsc::UnboundedSender<GroqBatchItemRequest>>,
@@ -474,6 +536,12 @@ impl AiModerator {
 
         let groq_counter = Arc::new(AtomicUsize::new(0));
 
+        let gemini_key = get_env_var("GEMINI_API_KEY");
+        let gemini_fast_model = get_env_var("GEMINI_FAST_MODEL")
+            .unwrap_or_else(|| "gemini-3.8-flash".to_string());
+        let gemini_deep_model = get_env_var("GEMINI_DEEP_MODEL")
+            .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+
         let batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             println!(
                 "   📦 [OPENAI BATCHING] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms)",
@@ -497,12 +565,14 @@ impl AiModerator {
         };
 
         let groq_batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            if !groq_keys.is_empty() {
+            if !groq_keys.is_empty() || gemini_key.is_some() {
                 println!(
-                    "   🤖 [GROQ BATCHING] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms)",
+                    "   🤖 [LLM ARBITER] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms) (Gemini: {}, Groq: {})",
                     groq_batch_size,
                     groq_batch_wait.as_secs_f64(),
-                    groq_batch_wait.as_millis()
+                    groq_batch_wait.as_millis(),
+                    gemini_key.is_some(),
+                    !groq_keys.is_empty()
                 );
                 let (tx, rx) = mpsc::unbounded_channel::<GroqBatchItemRequest>();
                 let client_clone = http_client.clone();
@@ -510,6 +580,9 @@ impl AiModerator {
                 let fast_clone = groq_fast_model.clone();
                 let deep_clone = groq_deep_model.clone();
                 let counter_clone = groq_counter.clone();
+                let gemini_key_clone = gemini_key.clone();
+                let gemini_fast_clone = gemini_fast_model.clone();
+                let gemini_deep_clone = gemini_deep_model.clone();
                 handle.spawn(Self::run_groq_batch_worker(
                     rx,
                     client_clone,
@@ -517,6 +590,9 @@ impl AiModerator {
                     fast_clone,
                     deep_clone,
                     counter_clone,
+                    gemini_key_clone,
+                    gemini_fast_clone,
+                    gemini_deep_clone,
                     groq_batch_size,
                     groq_batch_wait,
                 ));
@@ -535,6 +611,9 @@ impl AiModerator {
             groq_fast_model,
             groq_deep_model,
             groq_counter,
+            gemini_key,
+            gemini_fast_model,
+            gemini_deep_model,
             chat_history: RwLock::new(HashMap::new()),
             batch_tx,
             groq_batch_tx,
@@ -2562,12 +2641,143 @@ impl AiModerator {
         ImageModerationVerdict::Clean
     }
 
+    pub async fn call_gemini_static(
+        http_client: &reqwest::Client,
+        api_key: &str,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<(String, u128), String> {
+        let start_time = std::time::Instant::now();
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model, api_key
+        );
+
+        let system_instruction = if !system_prompt.trim().is_empty() {
+            Some(GeminiContent {
+                role: None,
+                parts: vec![GeminiPart { text: system_prompt }],
+            })
+        } else {
+            None
+        };
+
+        let req_body = GeminiRequest {
+            system_instruction,
+            contents: vec![GeminiContent {
+                role: Some("user"),
+                parts: vec![GeminiPart { text: user_prompt }],
+            }],
+            generation_config: GeminiGenConfig {
+                temperature: 0.0,
+                max_output_tokens: max_tokens,
+            },
+        };
+
+        let resp = http_client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&req_body)
+            .send()
+            .await
+            .map_err(|e| format!("Gemini network error: {}", e))?;
+
+        let status = resp.status();
+        let raw_text = resp.text().await.map_err(|e| format!("Gemini response read error: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!("Gemini HTTP {}: {}", status, raw_text));
+        }
+
+        let body: GeminiResponse = serde_json::from_str(&raw_text)
+            .map_err(|e| format!("Gemini JSON decode error: {} (raw: {})", e, raw_text))?;
+
+        if let Some(err) = body.error {
+            return Err(format!("Gemini API error: {}", err.message));
+        }
+
+        if let Some(cand) = body.candidates.first() {
+            if let Some(content) = &cand.content {
+                let text = content.parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("");
+                let elapsed_ms = start_time.elapsed().as_millis();
+                return Ok((text, elapsed_ms));
+            }
+        }
+
+        Err("Gemini returned empty candidates".to_string())
+    }
+
+    pub async fn call_gemini_failover_static(
+        http_client: &reqwest::Client,
+        api_key: &str,
+        preferred_model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<(String, String, u128), String> {
+        let mut models_to_try = vec![preferred_model];
+        for candidate in &[
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-pro",
+        ] {
+            if !models_to_try.contains(candidate) {
+                models_to_try.push(candidate);
+            }
+        }
+
+        for model in models_to_try {
+            match Self::call_gemini_static(http_client, api_key, model, system_prompt, user_prompt, max_tokens).await {
+                Ok((text, elapsed_ms)) => return Ok((text, model.to_string(), elapsed_ms)),
+                Err(e) => {
+                    eprintln!("[GEMINI FAILOVER] Model '{}' error: {}. Trying fallback...", model, e);
+                    continue;
+                }
+            }
+        }
+        Err("All Gemini models exhausted".to_string())
+    }
+
     async fn call_groq_failover(
         &self,
         model: &str,
         system_prompt: &str,
         user_prompt: &str,
     ) -> Result<(GroqDecision, String, u128), String> {
+        // First try Gemini if configured
+        if let Some(gemini_key) = &self.gemini_key {
+            let preferred_gemini = if model.contains("gpt-oss") || model.contains("pro") {
+                &self.gemini_deep_model
+            } else {
+                &self.gemini_fast_model
+            };
+            let max_tokens = if preferred_gemini.contains("pro") { 1024 } else { 150 };
+            match Self::call_gemini_failover_static(
+                &self.http_client,
+                gemini_key,
+                preferred_gemini,
+                system_prompt,
+                user_prompt,
+                max_tokens,
+            ).await {
+                Ok((raw_text, model_used, elapsed_ms)) => {
+                    if let Ok(decision) = Self::parse_single_decision_from_text(&raw_text, None) {
+                        return Ok((decision, format!("gemini:{}", model_used), elapsed_ms));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[LLM ARBITER] Gemini failover: {}. Falling back to Groq cluster...", e);
+                }
+            }
+        }
+
         let max_tokens = if model.contains("gpt-oss") { 1024 } else { 85 };
         let (raw_text, reasoning, model_used, elapsed_ms) = Self::call_groq_failover_static(
             &self.http_client,
@@ -2899,6 +3109,9 @@ impl AiModerator {
         groq_fast_model: String,
         groq_deep_model: String,
         groq_counter: Arc<AtomicUsize>,
+        gemini_key: Option<String>,
+        gemini_fast_model: String,
+        gemini_deep_model: String,
         batch_size: usize,
         batch_wait: Duration,
     ) {
@@ -2915,6 +3128,9 @@ impl AiModerator {
                     &groq_fast_model,
                     &groq_deep_model,
                     &groq_counter,
+                    gemini_key.as_deref(),
+                    &gemini_fast_model,
+                    &gemini_deep_model,
                 ).await;
                 continue;
             }
@@ -2935,6 +3151,9 @@ impl AiModerator {
                                         &groq_fast_model,
                                         &groq_deep_model,
                                         &groq_counter,
+                                        gemini_key.as_deref(),
+                                        &gemini_fast_model,
+                                        &gemini_deep_model,
                                     ).await;
                                     break;
                                 }
@@ -2947,6 +3166,9 @@ impl AiModerator {
                                     &groq_fast_model,
                                     &groq_deep_model,
                                     &groq_counter,
+                                    gemini_key.as_deref(),
+                                    &gemini_fast_model,
+                                    &gemini_deep_model,
                                 ).await;
                                 return;
                             }
@@ -2960,6 +3182,9 @@ impl AiModerator {
                             &groq_fast_model,
                             &groq_deep_model,
                             &groq_counter,
+                            gemini_key.as_deref(),
+                            &gemini_fast_model,
+                            &gemini_deep_model,
                         ).await;
                         break;
                     }
@@ -2975,6 +3200,9 @@ impl AiModerator {
         groq_fast_model: &str,
         groq_deep_model: &str,
         groq_counter: &AtomicUsize,
+        gemini_key: Option<&str>,
+        gemini_fast_model: &str,
+        gemini_deep_model: &str,
     ) {
         if pending.is_empty() {
             return;
@@ -2983,46 +3211,88 @@ impl AiModerator {
         let batch = std::mem::take(pending);
         let count = batch.len();
 
-        if groq_keys.is_empty() {
+        if groq_keys.is_empty() && gemini_key.is_none() {
             for item in batch {
-                let _ = item.sender.send(Err("No Groq keys configured".to_string()));
+                let _ = item.sender.send(Err("No Gemini or Groq keys configured".to_string()));
             }
             return;
         }
 
         let has_hardcore = batch.iter().any(|item| item.is_hardcore);
-        let preferred_model = if has_hardcore {
-            groq_deep_model
-        } else {
-            groq_fast_model
-        };
-
-        println!(
-            "\n📦 [GROQ BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript! (Model: {}, Hardcore/Deep: {})",
-            count,
-            preferred_model,
-            has_hardcore
-        );
-
         let combined_user_prompt = Self::build_batch_transcript_prompt(&batch);
-        let base_tokens = if preferred_model.contains("gpt-oss") { 350 } else { 120 };
-        let max_tokens = ((count * base_tokens).max(512)).min(4096) as u32;
 
-        let res = Self::call_groq_failover_static(
-            http_client,
-            groq_keys,
-            groq_counter,
-            preferred_model,
-            SERVER_RULES_BATCH_SYSTEM_PROMPT,
-            &combined_user_prompt,
-            max_tokens,
-        ).await;
+        // Try Gemini first if key is present
+        let mut eval_result: Option<(String, Option<String>, String, u128)> = None;
 
-        match res {
-            Ok((raw_text, reasoning, model_used, elapsed_ms)) => {
+        if let Some(key) = gemini_key {
+            let preferred_gemini = if has_hardcore {
+                gemini_deep_model
+            } else {
+                gemini_fast_model
+            };
+            let max_tokens = ((count * 200).max(512)).min(4096) as u32;
+
+            println!(
+                "\n✨ [GEMINI BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript! (Model: {}, Hardcore/Deep: {})",
+                count, preferred_gemini, has_hardcore
+            );
+
+            match Self::call_gemini_failover_static(
+                http_client,
+                key,
+                preferred_gemini,
+                SERVER_RULES_BATCH_SYSTEM_PROMPT,
+                &combined_user_prompt,
+                max_tokens,
+            ).await {
+                Ok((raw_text, model_used, elapsed_ms)) => {
+                    eval_result = Some((raw_text, None, format!("gemini:{}", model_used), elapsed_ms));
+                }
+                Err(e) => {
+                    eprintln!("⚠️ [GEMINI BATCH ERROR] {}. Falling back to Groq cluster...", e);
+                }
+            }
+        }
+
+        // If Gemini was not used or failed, fallback to Groq
+        if eval_result.is_none() && !groq_keys.is_empty() {
+            let preferred_groq = if has_hardcore {
+                groq_deep_model
+            } else {
+                groq_fast_model
+            };
+
+            println!(
+                "\n📦 [GROQ BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript! (Model: {}, Hardcore/Deep: {})",
+                count, preferred_groq, has_hardcore
+            );
+
+            let base_tokens = if preferred_groq.contains("gpt-oss") { 350 } else { 120 };
+            let max_tokens = ((count * base_tokens).max(512)).min(4096) as u32;
+
+            match Self::call_groq_failover_static(
+                http_client,
+                groq_keys,
+                groq_counter,
+                preferred_groq,
+                SERVER_RULES_BATCH_SYSTEM_PROMPT,
+                &combined_user_prompt,
+                max_tokens,
+            ).await {
+                Ok(res) => {
+                    eval_result = Some(res);
+                }
+                Err(e) => {
+                    eprintln!("[GROQ BATCH ERROR] Batch failed across all failovers: {}. Falling back each item.", e);
+                }
+            }
+        }
+
+        match eval_result {
+            Some((raw_text, reasoning, model_used, elapsed_ms)) => {
                 let mut decisions_map = Self::parse_batch_decisions(&raw_text, reasoning.as_deref(), count);
                 println!(
-                    "⚡ [GROQ BATCH RESULTS] Evaluated {} items in {}ms (Model: {}):",
+                    "⚡ [LLM BATCH RESULTS] Evaluated {} items in {}ms (Model: {}):",
                     count, elapsed_ms, model_used
                 );
 
@@ -3053,10 +3323,10 @@ impl AiModerator {
                     let _ = item.sender.send(Ok((decision, model_used.clone(), elapsed_ms)));
                 }
             }
-            Err(e) => {
-                eprintln!("[GROQ BATCH ERROR] Batch failed across all failovers: {}. Falling back each item.", e);
+            None => {
+                let err_msg = "Both Gemini and Groq evaluation failed or were unavailable".to_string();
                 for item in batch {
-                    let _ = item.sender.send(Err(e.clone()));
+                    let _ = item.sender.send(Err(err_msg.clone()));
                 }
             }
         }
