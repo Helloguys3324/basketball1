@@ -269,22 +269,23 @@ impl ProfanityEngine {
                 }
             }
 
-            // Sliding window merge for spaced-out characters (from profanity-destroyer / vector_db_engine)
+            // Sliding window merge for spaced-out characters (e.g. "п о ш е л   н а х у й", "s c a m", "f u c k", "k y s")
+            // ONLY merge when tokens are single characters (or 1-2 char fragments) and NOT existing clean words
             for start in 0..chunks.len() {
-                if chunks[start].len() > 3 {
+                if chunks[start].chars().count() > 2 || self.clean_words.contains(&chunks[start]) {
                     continue;
                 }
 
                 let mut combined = chunks[start].clone();
-                let mut single_count = if chunks[start].len() == 1 { 1 } else { 0 };
+                let mut single_count = if chunks[start].chars().count() == 1 { 1 } else { 0 };
 
-                for end in (start + 1)..usize::min(start + 6, chunks.len()) {
-                    if chunks[end].len() > 3 {
+                for end in (start + 1)..usize::min(start + 8, chunks.len()) {
+                    if chunks[end].chars().count() > 2 || self.clean_words.contains(&chunks[end]) {
                         break;
                     }
 
                     combined.push_str(&chunks[end]);
-                    if chunks[end].len() == 1 {
+                    if chunks[end].chars().count() == 1 {
                         single_count += 1;
                     }
 
@@ -292,8 +293,8 @@ impl ProfanityEngine {
                         break;
                     }
 
-                    // If at least two single characters were merged or combined >= 3 chars
-                    if combined.len() >= 3 && (single_count >= 2 || combined.len() >= 4) && seen.insert(combined.clone()) {
+                    // Only valid spaced-out evasion if at least 2 single characters were merged
+                    if single_count >= 2 && combined.chars().count() >= 3 && seen.insert(combined.clone()) {
                         candidates.push(Candidate {
                             text: combined.clone(),
                             obfuscated: true,
@@ -312,16 +313,18 @@ impl ProfanityEngine {
     /// Fast Damerau-Levenshtein fuzzy matching with length-bucketed pruning
     /// and clean-word false-positive suppression (identical to profanity-destroyer logic)
     fn fuzzy_match(&self, token: &str, is_obfuscated: bool) -> Option<String> {
-        if token.len() < 4 || token.len() > MAX_TOKEN_LEN {
+        // Words shorter than 5 chars MUST NEVER be fuzzy matched!
+        // For length <= 4, only exact match is safe (otherwise "for" -> "fkr", "new" -> "nfw", "hear" -> "hoer").
+        if token.chars().count() < 5 || token.len() > MAX_TOKEN_LEN {
             return None;
         }
 
-        // Suppress fuzzy matching on clean dictionary words if not obfuscated (profanity-destroyer rule)
-        if !is_obfuscated && self.clean_words.contains(token) {
+        // Suppress fuzzy matching on clean dictionary words unconditionally!
+        if self.clean_words.contains(token) {
             return None;
         }
 
-        let max_dist = if token.len() <= 4 { 1 } else { 2 };
+        let max_dist = if token.chars().count() <= 5 { 1 } else { 2 };
         let min_len = token.len().saturating_sub(max_dist);
         let max_len = token.len() + max_dist;
 
@@ -345,7 +348,7 @@ impl ProfanityEngine {
                         if dist <= 1 {
                             return Some(bad.clone());
                         }
-                        if dist == 2 && is_obfuscated {
+                        if dist == 2 && is_obfuscated && token.chars().count() >= 7 {
                             return Some(bad.clone());
                         }
                     }
@@ -512,4 +515,39 @@ mod tests {
         let res_kys = engine.scan("k   y   s");
         assert!(res_kys.is_some(), "Should catch spaced out kys");
     }
+
+    #[test]
+    fn test_false_positive_suppression() {
+        let engine = ProfanityEngine::new();
+        let innocent_phrases = [
+            "3rd or 4th for ea 10th or 11th for public",
+            "You get ea by winning a giveaway an event or handpicked for being active",
+            "I’m not wrong am i",
+            "can i hear it",
+            "Only 2 bs",
+            "How is auxluvy famous",
+            "He has the role",
+            "ive been making so much new music",
+            "lead dev for neighbors and the corner",
+            "i dont even know how to feel",
+            "I got so lucky",
+            "what's bf?",
+            "Bro how did you alr forget 😭",
+            "Sadly",
+            "Fr",
+            "Wassup",
+            "Nope",
+        ];
+
+        for phrase in &innocent_phrases {
+            let res = engine.scan(phrase);
+            assert!(
+                res.is_none(),
+                "Innocent phrase '{}' must NOT trigger profanity engine, but hit: {:?}",
+                phrase,
+                res
+            );
+        }
+    }
 }
+

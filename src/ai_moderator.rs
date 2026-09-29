@@ -1842,8 +1842,7 @@ impl AiModerator {
         let is_vector_suspicious = is_vector_suspicious || (vector_score >= 0.70 && vector_res.as_ref().map(|r| r.is_scam).unwrap_or(false));
 
         // ── Native SIMD + Sliding Window + Levenshtein Profanity & Threat Scan ──
-        let profanity_hit = self.profanity_engine.scan(trimmed)
-            .or_else(|| if has_author_context { self.profanity_engine.scan(&combined_text) } else { None });
+        let profanity_hit = self.profanity_engine.scan(trimmed);
         let has_profanity = profanity_hit.is_some();
         let has_severe_harm_keyword = has_severe_harm_keyword
             || profanity_hit.as_ref().map(|p| p.is_severe_root && (p.matched_rule.contains("убей") || p.matched_rule.contains("сдох") || p.matched_rule.contains("пристрел") || p.matched_rule.contains("зареж") || p.matched_rule.contains("kill") || p.matched_rule.contains("kys"))).unwrap_or(false);
