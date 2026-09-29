@@ -1,9 +1,45 @@
 services:
+  # 1. Official Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant/storage:/qdrant/storage:z
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
+
+  # 2. Python Semantic Vector Service (MiniLM embeddings + normalization)
+  vector_service:
+    build:
+      context: ./vector_engine
+      dockerfile: Dockerfile
+    container_name: vector_service
+    restart: unless-stopped
+    ports:
+      - "6335:6335"
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - VECTOR_SERVICE_PORT=6335
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - qdrant
+
+  # 3. Discord Anti-Scam Bot (Rust Engine)
   antiscambot:
     build: .
     container_name: antiscambot
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      - VECTOR_SERVICE_URL=http://vector_service:6335
     volumes:
       - ./mod_config.json:/app/mod_config.json
+      - ./dynamic_whitelist.txt:/app/dynamic_whitelist.txt
+    depends_on:
+      - vector_service
