@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,8 @@ const GAME_SHIELD_PATTERNS: &[&str] = &[
     "в майнкрафте", "в роблоксе", "в игре", "в кс", "в расте", "в гта", "в доте",
     "в реале а не в игре", "по игре"
 ];
+
+static OPENAI_COOLDOWN_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 const COMMON_NON_NAMES: &[&str] = &[
     "ill", "i'll", "im", "i'm", "ive", "i've", "id", "i'd",
@@ -2949,7 +2951,13 @@ impl AiModerator {
             }
         }
 
-        if batch.len() > 1 || flat_inputs.len() > 1 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let in_cooldown = now < OPENAI_COOLDOWN_UNTIL.load(Ordering::Relaxed);
+
+        if !in_cooldown && (batch.len() > 1 || flat_inputs.len() > 1) {
             println!(
                 "   📦 [OPENAI BATCH FLUSH] Moderating {} messages ({} inputs in single array) in 1 API request",
                 batch.len(),
@@ -2984,6 +2992,15 @@ impl AiModerator {
     }
 
     pub async fn call_openai_moderation_static(http_client: &reqwest::Client, api_key: &str, texts: &[&str]) -> Result<Vec<OpenAiScores>, reqwest::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if now < OPENAI_COOLDOWN_UNTIL.load(Ordering::Relaxed) {
+            return Ok(vec![OpenAiScores::default(); texts.len()]);
+        }
+
         let req_body = OpenAiBatchModRequest {
             model: "omni-moderation-latest",
             input: texts.to_vec(),
@@ -3000,7 +3017,13 @@ impl AiModerator {
         let status = resp.status();
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
-            eprintln!("[OPENAI API ERROR] Status {}: {}", status, err_text);
+            if status.as_u16() == 429 {
+                let cooldown_secs = 60;
+                OPENAI_COOLDOWN_UNTIL.store(now + cooldown_secs, Ordering::Relaxed);
+                eprintln!("[OPENAI API] 429 Rate Limit hit. Backing off OpenAI requests for {}s (falling back to native engine + LLM router).", cooldown_secs);
+            } else {
+                eprintln!("[OPENAI API ERROR] Status {}: {}", status, err_text);
+            }
             return Ok(vec![OpenAiScores::default(); texts.len()]);
         }
 
