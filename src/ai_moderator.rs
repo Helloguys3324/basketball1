@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
+use crate::profanity_engine::ProfanityEngine;
 
 // =============================================================================
 // AI MODERATOR CONFIGURATION & CONSTANTS
@@ -103,6 +104,12 @@ const SLUR_WORDS: &[&str] = &[
 #[allow(dead_code)]
 pub const SERVER_RULES_SYSTEM_PROMPT: &str = "\
 Discord Arbiter for a gaming community. Mutes only (NO BAN/KICK).\n\
+CRITICAL EVALUATION PROTOCOL (3 MANDATORY QUESTIONS BEFORE DECIDING):\n\
+Whenever any pattern, trigger, or flagged message is evaluated, the Arbiter MUST ask and resolve these 3 questions:\n\
+1. ЭТО ОСКОРБЛЯЕТ ЧЕЛОВЕКА? (Does this actually insult, degrade, harass, or inflict real harm on an actual person? Or is it victimless banter, gaming slang, self-deprecation, or a quote?)\n\
+2. МОЖЕТ ЛИ ЭТО БЫТЬ ШУТКОЙ НА СЕРВЕРЕ ГДЕ ШУТЯТ ПОЧТИ ВСЕГДА? (Could this reasonably be a joke, gaming irony, trash-talk, post-irony, meme, or friendly teasing on a Discord server where members joke almost 100% of the time? If it can reasonably be a joke or friendly banter without real malice -> ALWAYS VERDICT: ALLOW, RULE: None, MUTE: 0).\n\
+3. ЯВЛЯЕТСЯ ЛИ ЭТО ГРУБЫМ НАРУШЕНИЕМ? (Is this a genuine severe violation: actual scam/phishing/token-stealer link, real crypto drainer, publishing real personal data (doxxing/PII), explicit death threat with real-world malice, or hate speech / racial slurs?)\n\
+Autonomously determine the exact danger level based on context and intent without false positives on humor.\n\
 PUNISHMENT TIERS (SUSPICIOUS/DELETE):\n\
 1. Minor/Mild -> SUSPICIOUS(1m): Malicious chat flooding, repetitive copy-paste raid spam, provocative gender bait ('i love sexism'). NEVER punish standard banter, complaints, or single messages under Minor/Mild!\n\
 2. Mod -> SUSPICIOUS(15-30m): Explicit NSFW pornography links, deliberate toxic filter bypass. (NO mutes for gossip, rumors, or drama!)\n\
@@ -150,11 +157,20 @@ REASON:[<=8 words]";
 
 pub const SERVER_RULES_BATCH_SYSTEM_PROMPT: &str = r#"Discord Arbiter for a gaming community. You are auditing multiple flagged Discord messages from users.
 Mutes only (NO BAN/KICK).
+
+CRITICAL EVALUATION PROTOCOL (3 MANDATORY QUESTIONS BEFORE DECIDING):
+Whenever any pattern, trigger, or flagged message is evaluated, the Arbiter MUST ask and resolve these 3 questions:
+1. ЭТО ОСКОРБЛЯЕТ ЧЕЛОВЕКА? (Does this actually insult, degrade, harass, or inflict real harm on an actual person? Or is it victimless banter, gaming slang, self-deprecation, or a quote?)
+2. МОЖЕТ ЛИ ЭТО БЫТЬ ШУТКОЙ НА СЕРВЕРЕ ГДЕ ШУТЯТ ПОЧТИ ВСЕГДА? (Could this reasonably be a joke, gaming irony, trash-talk, post-irony, meme, or friendly teasing on a Discord server where members joke almost 100% of the time?)
+   -> If it can be understood as a joke, gaming banter, sarcasm, or non-malicious teasing -> VERDICT: ALLOW (RULE: None, MUTE: 0).
+3. ЯВЛЯЕТСЯ ЛИ ЭТО ГРУБЫМ НАРУШЕНИЕМ? (Is this a genuine severe violation: actual scam/phishing/token-stealer link, real crypto drainer, publishing real personal data (doxxing/PII), explicit death threat with real-world malice, or hate speech / racial slurs?)
+   -> If and ONLY if there is genuine malice or dangerous harm, autonomously determine the appropriate danger level without false positives on humor:
+
 PUNISHMENT TIERS (SUSPICIOUS/DELETE):
 1. Minor/Mild -> SUSPICIOUS(1m): Malicious chat flooding, repetitive copy-paste raid spam, provocative gender bait ('i love sexism'). NEVER punish standard banter, complaints, or single messages under Minor/Mild!
 2. Mod -> SUSPICIOUS(15-30m): Explicit NSFW pornography links, deliberate toxic filter bypass. (NO mutes for gossip, rumors, or drama!)
-3. Major -> SUSPICIOUS(60m) or DELETE(120m): Direct real-world threats, stalking, publishing or threatening to leak private personal info (doxxing/extortion), malicious impersonation, server raid invites
-4. Crit -> DELETE(1440m): Racial/hate slurs ('nga','ngga','nigga','nigger','fag','faggot'), direct death wishes ('kys','you should die'), gore, malware
+3. Major -> SUSPICIOUS(60m) or DELETE(120m): Direct real-world threats, stalking, publishing or threatening to leak private personal info (doxxing/extortion), malicious impersonation, server raid invites, phishing/scams, fake free nitro links, steam gift/trade scams, crypto drainers
+4. Crit -> DELETE(1440m): Racial/hate slurs ('nga','ngga','nigga','nigger','fag','faggot'), direct death wishes ('kys','you should die'), gore, malware, token stealers, credential theft
 QUOTES, OPINIONS, META-TALK & HYPOTHETICALS (ALLOW, RULE:None, MUTE:0):
 - Meta-talk and observations about doxxing or rules -> ALWAYS ALLOW (RULE: None, MUTE: 0).
 - Casual words ('dumb', 'stupid', 'silly', 'trash', 'noob', 'idiot') in casual conversation -> ALWAYS ALLOW.
@@ -305,6 +321,18 @@ pub struct OpenAiScores {
     pub breakdown: String,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct VectorCheckResponse {
+    pub is_scam: bool,
+    pub score: f64,
+    #[serde(default)]
+    pub threshold: f64,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub matched_text: String,
+}
+
 #[derive(Deserialize)]
 struct OpenAiModResponse {
     results: Vec<OpenAiModResult>,
@@ -443,6 +471,7 @@ pub struct GroqBatchItemRequest {
 
 pub struct AiModerator {
     http_client: reqwest::Client,
+    vector_service_url: String,
     openai_key: Option<String>,
     groq_keys: Vec<String>,
     groq_fast_model: String,
@@ -455,6 +484,8 @@ pub struct AiModerator {
     chat_history: RwLock<HashMap<u64, VecDeque<ChatEntry>>>,
     batch_tx: Option<mpsc::UnboundedSender<OpenAiBatchRequest>>,
     groq_batch_tx: Option<mpsc::UnboundedSender<GroqBatchItemRequest>>,
+    pub dynamic_whitelist: Arc<RwLock<HashSet<String>>>,
+    pub profanity_engine: Arc<ProfanityEngine>,
 }
 
 impl AiModerator {
@@ -464,7 +495,7 @@ impl AiModerator {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(default_batch_size);
 
-        let default_timeout_ms = if cfg!(test) { 100 } else { 17000 };
+        let default_timeout_ms = if cfg!(test) { 100 } else { 0 };
         let batch_timeout_ms = get_env_var("OPENAI_MODERATION_BATCH_TIMEOUT_MS")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(default_timeout_ms);
@@ -474,7 +505,7 @@ impl AiModerator {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(default_groq_batch_size);
 
-        let default_groq_timeout_ms = if cfg!(test) { 50 } else { 500 };
+        let default_groq_timeout_ms = if cfg!(test) { 50 } else { 0 };
         let groq_batch_timeout_ms = get_env_var("GROQ_MODERATION_BATCH_TIMEOUT_MS")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(default_groq_timeout_ms);
@@ -520,6 +551,8 @@ impl AiModerator {
         groq_batch_size: usize,
         groq_batch_wait: Duration,
     ) -> Self {
+        let vector_service_url = get_env_var("VECTOR_SERVICE_URL")
+            .unwrap_or_else(|| "http://127.0.0.1:6335".to_string());
         let openai_key = get_env_var("OPENAI_API_KEY");
 
         let groq_keys: Vec<String> = get_env_var("GROQ_API_KEYS")
@@ -555,12 +588,19 @@ impl AiModerator {
             .unwrap_or_else(|| "gemini-3.5-flash-lite".to_string());
 
         let batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            println!(
-                "   📦 [OPENAI BATCHING] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms)",
-                openai_batch_size,
-                openai_batch_wait.as_secs_f64(),
-                openai_batch_wait.as_millis()
-            );
+            if openai_batch_wait.is_zero() {
+                println!(
+                    "   📦 [OPENAI BATCHING] Worker initialized: max_batch = {}, interval = INSTANT (0ms)",
+                    openai_batch_size
+                );
+            } else {
+                println!(
+                    "   📦 [OPENAI BATCHING] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms)",
+                    openai_batch_size,
+                    openai_batch_wait.as_secs_f64(),
+                    openai_batch_wait.as_millis()
+                );
+            }
             let (tx, rx) = mpsc::unbounded_channel::<OpenAiBatchRequest>();
             let client_clone = http_client.clone();
             let key_clone = openai_key.clone();
@@ -578,14 +618,23 @@ impl AiModerator {
 
         let groq_batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if !groq_keys.is_empty() || !gemini_keys.is_empty() {
-                println!(
-                    "   🤖 [LLM ARBITER] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms) (Gemini Keys: {}, Groq Keys: {})",
-                    groq_batch_size,
-                    groq_batch_wait.as_secs_f64(),
-                    groq_batch_wait.as_millis(),
-                    gemini_keys.len(),
-                    groq_keys.len()
-                );
+                if groq_batch_wait.is_zero() {
+                    println!(
+                        "   🤖 [LLM ARBITER] Worker initialized: max_batch = {}, interval = INSTANT (0ms) (Gemini Keys: {}, Groq Keys: {})",
+                        groq_batch_size,
+                        gemini_keys.len(),
+                        groq_keys.len()
+                    );
+                } else {
+                    println!(
+                        "   🤖 [LLM ARBITER] Worker initialized: max_batch = {}, interval = {:.1}s ({}ms) (Gemini Keys: {}, Groq Keys: {})",
+                        groq_batch_size,
+                        groq_batch_wait.as_secs_f64(),
+                        groq_batch_wait.as_millis(),
+                        gemini_keys.len(),
+                        groq_keys.len()
+                    );
+                }
                 let (tx, rx) = mpsc::unbounded_channel::<GroqBatchItemRequest>();
                 let client_clone = http_client.clone();
                 let keys_clone = groq_keys.clone();
@@ -618,8 +667,25 @@ impl AiModerator {
             None
         };
 
+        let mut dynamic_whitelist = HashSet::new();
+        // Load persistent dynamic whitelist
+        for f in &["dynamic_whitelist.txt", r"D:\gemini\dynamic_whitelist.txt"] {
+            if let Ok(content) = std::fs::read_to_string(f) {
+                for line in content.lines() {
+                    let w = line.trim().to_lowercase();
+                    if !w.is_empty() {
+                        dynamic_whitelist.insert(w);
+                    }
+                }
+            }
+        }
+        if !dynamic_whitelist.is_empty() {
+            println!("   📋 [DYNAMIC WHITELIST] Initialized with {} learned safe phrases.", dynamic_whitelist.len());
+        }
+
         Self {
             http_client,
+            vector_service_url,
             openai_key,
             groq_keys,
             groq_fast_model,
@@ -632,6 +698,54 @@ impl AiModerator {
             chat_history: RwLock::new(HashMap::new()),
             batch_tx,
             groq_batch_tx,
+            dynamic_whitelist: Arc::new(RwLock::new(dynamic_whitelist)),
+            profanity_engine: Arc::new(ProfanityEngine::new()),
+        }
+    }
+
+    /// Dynamically learn a phrase allowed by LLM into the persistent whitelist
+    /// DISABLED by user request to prevent rogue/ambiguous phrases from polluting the whitelist.
+    pub async fn add_to_whitelist(&self, _text: &str) {
+        // AI self-learning disabled: each message is evaluated cleanly on its own context
+    }
+
+    /// Query the local L2 Vector Engine (Qdrant + MiniLM with 120,000+ scam patterns)
+    pub async fn check_vector_engine(&self, text: &str) -> Option<VectorCheckResponse> {
+        let payload = serde_json::json!({ "text": text });
+        let resp = self.http_client
+            .post(&format!("{}/check", self.vector_service_url))
+            .json(&payload)
+            .timeout(Duration::from_millis(2500))
+            .send()
+            .await
+            .ok()?;
+
+        if resp.status().is_success() {
+            resp.json::<VectorCheckResponse>().await.ok()
+        } else {
+            None
+        }
+    }
+
+    /// Dynamically train a new scam pattern into local Qdrant collection on the fly
+    #[allow(dead_code)]
+    pub async fn train_vector_engine(&self, text: &str, category: &str) -> Result<String, String> {
+        let payload = serde_json::json!({
+            "text": text,
+            "category": category
+        });
+        let resp = self.http_client
+            .post(&format!("{}/train", self.vector_service_url))
+            .json(&payload)
+            .timeout(Duration::from_millis(3000))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if resp.status().is_success() {
+            Ok("Successfully indexed pattern into local Qdrant collection".to_string())
+        } else {
+            Err(format!("Vector service error (HTTP {})", resp.status()))
         }
     }
 
@@ -770,6 +884,42 @@ impl AiModerator {
         }
 
         false
+    }
+
+    #[inline]
+    pub fn contains_suspicious_link(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        lower.contains("http://")
+            || lower.contains("https://")
+            || lower.contains("discord.gg/")
+            || lower.contains("discord.gift/")
+            || lower.contains(".gift/")
+            || lower.contains(".gift")
+            || lower.contains(".xyz")
+            || lower.contains(".top")
+            || lower.contains(".ru/")
+            || lower.contains(".com/")
+            || lower.contains("t.me/")
+            || lower.contains("steamcommunity.com")
+            || lower.contains("steampowered.com")
+            || (lower.contains("steam") && lower.contains("trade"))
+    }
+
+    #[inline]
+    pub fn contains_suspicious_keywords(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        let tokens = [
+            "free", "nitro", "claim", "airdrop", "giveaway", "wallet", "crypto",
+            "steam", "gift", "bonus", "winner", "hack", "cheat",
+            "чит", "читы", "скам", "раздача", "халява", "нитро", "дроп", "кошелек"
+        ];
+        tokens.iter().any(|&token| Self::contains_word(&lower, token))
+    }
+
+    #[inline]
+    pub fn contains_target_insult(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        TARGET_INSULTS.iter().any(|&insult| Self::contains_word(&lower, insult))
     }
 
     pub fn is_dox_meta_talk(text: &str) -> bool {
@@ -1087,6 +1237,15 @@ impl AiModerator {
         !REAL_WORLD_MALICE.iter().any(|&m| lower.contains(m))
     }
 
+    pub fn is_direct_death_wish(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        const DEATH_WISH_PATTERNS: &[&str] = &[
+            "you should die", "hope you die", "go die", "please die", "die idiot", "die noob",
+            "kys", "kill yourself", "сдохни", "умри", "убейся", "пошел сдохни"
+        ];
+        DEATH_WISH_PATTERNS.iter().any(|&p| lower.contains(p))
+    }
+
     pub fn is_gaming_pvp_callout(text: &str) -> bool {
         let clean = text
             .trim()
@@ -1314,6 +1473,7 @@ impl AiModerator {
         is_pvp_callout: bool,
         author_combined_thought: Option<&str>,
         reply_to: Option<(&str, u64, u64, &str)>,
+        pattern_trigger_note: Option<&str>,
     ) -> String {
         let mut t = format!(
             "OpenAI Flag: {} (score: {:.2}, severe: {:.2})",
@@ -1328,6 +1488,9 @@ impl AiModerator {
         if let Some(comb) = author_combined_thought {
             let short_comb = Self::safe_truncate(comb, 120);
             t.push_str(&format!(" | Author Recent Thoughts: \"{}\"", short_comb.trim().replace('\n', " // ")));
+        }
+        if let Some(pat) = pattern_trigger_note {
+            t.push_str(&format!(" | 🎯 Pattern Alert: {}", pat));
         }
         if max_score <= 0.20 {
             t.push_str(" | ⚠️ LOW TOXICITY BASELINE (<=0.20)");
@@ -1406,7 +1569,7 @@ impl AiModerator {
         let mut prompt = String::with_capacity(count * 512 + all_batch_msgs.len() * 128);
 
         prompt.push_str("══════════════════════════════════════════════════════════════════════════════\n");
-        prompt.push_str("CHRONOLOGICAL BATCH LOG (Sequential messages collected during 17-second window):\n");
+        prompt.push_str("CHRONOLOGICAL BATCH LOG (Sequential messages from chat context):\n");
         prompt.push_str("══════════════════════════════════════════════════════════════════════════════\n\n");
 
         let mut displayed_flagged: HashSet<usize> = HashSet::new();
@@ -1462,10 +1625,12 @@ impl AiModerator {
         }
 
         prompt.push_str("\n══════════════════════════════════════════════════════════════════════════════\n");
-        prompt.push_str("MODERATION EVALUATION TASK:\n");
-        prompt.push_str("Evaluate each [FLAGGED ITEM #X] inside the context of what other users said before and after it.\n");
-        prompt.push_str("Determine if each flagged message is true harmful behavior, toxic evasion, hate speech, or innocent gaming chatter/banter.\n");
-        prompt.push_str("For EVERY flagged item, output your decision block:\n\n");
+        prompt.push_str("MODERATION EVALUATION TASK (MANDATORY 3-QUESTION REASONING):\n");
+        prompt.push_str("For each flagged item or pattern match, ask:\n");
+        prompt.push_str("1. Это оскорбляет человека? (Does it target or insult a real person?)\n");
+        prompt.push_str("2. Может ли это быть шуткой на сервере где шутят почти всегда? (Could this be a joke/banter/irony on a server where people joke constantly? If so -> ALLOW!)\n");
+        prompt.push_str("3. Является ли это грубым нарушением? (Is it a severe violation like real phishing/scam, token stealer, doxxing, death wishes, or racial slurs?)\n");
+        prompt.push_str("Autonomously gauge the danger level and output your decision block for EVERY flagged item:\n\n");
         for idx in 0..count {
             let item_num = idx + 1;
             prompt.push_str(&format!(
@@ -1485,11 +1650,11 @@ impl AiModerator {
             return ModerationVerdict::Allow;
         }
 
-        // ── 1. TIER 1: OpenAI Moderation (omni-moderation-latest, $0) ────────
-        let openai_key = match &self.openai_key {
-            Some(k) => k,
-            None => return ModerationVerdict::Allow,
-        };
+        let lower_trimmed = trimmed.to_lowercase();
+        if self.dynamic_whitelist.read().unwrap().contains(&lower_trimmed) {
+            println!("   ↳ [DYNAMIC WHITELIST PASS] Message '{}' matches learned safe phrase -> ALLOW (0ms, 0 tokens)", Self::safe_truncate(trimmed, 40));
+            return ModerationVerdict::Allow;
+        }
 
         // Fetch author's recent messages in this channel within 60 seconds
         let author_past_msgs = self.get_author_recent_context(ctx.channel_id, ctx.author_id, ctx.timestamp_unix);
@@ -1500,6 +1665,51 @@ impl AiModerator {
             trimmed.to_string()
         };
 
+        // ── 0.5. LOCAL VECTOR SHIELD: Qdrant 120,000 Scam Vectors + MiniLM (<5ms, 0 API tokens) ──
+        let vector_res = self.check_vector_engine(trimmed).await;
+        let vector_score = vector_res.as_ref().map(|r| r.score).unwrap_or(0.0);
+        let mut vector_trigger_info: Option<String> = None;
+        let mut is_vector_suspicious = false;
+
+        if let Some(ref res) = vector_res {
+            let cat_lower = res.category.to_lowercase();
+            let is_hard_scam = res.is_scam && (res.score >= 0.55 || cat_lower.contains("scam") || cat_lower.contains("phish") || cat_lower.contains("fraud") || cat_lower == "local_custom_scam");
+            if is_hard_scam {
+                is_vector_suspicious = true;
+                vector_trigger_info = Some(format!(
+                    "Vector DB Match: '{}' (Cat: {}, Sim: {:.1}%)",
+                    Self::safe_truncate(&res.matched_text, 50),
+                    res.category,
+                    res.score * 100.0
+                ));
+                println!(
+                    "\n🎯 [QDRANT VECTOR MATCH -> ESCALATING TO LLM] Score: {:.4} (Threshold: {:.2}) | Cat: {} | Matched: '{}' | Msg: '{}'",
+                    res.score, res.threshold, res.category, res.matched_text, trimmed
+                );
+            }
+        }
+
+        if !is_vector_suspicious && has_author_context {
+            if let Some(res) = self.check_vector_engine(&combined_text).await {
+                let cat_lower = res.category.to_lowercase();
+                let is_hard_scam = res.is_scam && (res.score >= 0.55 || cat_lower.contains("scam") || cat_lower.contains("phish") || cat_lower.contains("fraud") || cat_lower == "local_custom_scam");
+                if is_hard_scam {
+                    is_vector_suspicious = true;
+                    vector_trigger_info = Some(format!(
+                        "Split-Message Vector Match: '{}' (Cat: {}, Sim: {:.1}%)",
+                        Self::safe_truncate(&res.matched_text, 50),
+                        res.category,
+                        res.score * 100.0
+                    ));
+                    println!(
+                        "\n🎯 [QDRANT SPLIT VECTOR MATCH -> ESCALATING TO LLM] Score: {:.4} (Threshold: {:.2}) | Cat: {} | Matched: '{}' | Msg: '{}'",
+                        res.score, res.threshold, res.category, res.matched_text, combined_text
+                    );
+                }
+            }
+        }
+
+        // ── 1. TIER 1: OpenAI Moderation (omni-moderation-latest, $0) ────────
         let inputs: Vec<String> = if has_author_context {
             vec![trimmed.to_string(), combined_text.clone()]
         } else {
@@ -1517,7 +1727,11 @@ impl AiModerator {
             reply_to: ctx.reply_to.map(|(a, _, _, t)| format!("@{}: {}", a, Self::safe_truncate(t, 50))),
         };
 
-        let (scores_list, batch_transcript) = self.check_openai_batch(openai_key, inputs, Some(meta)).await;
+        let (scores_list, batch_transcript) = if let Some(openai_key) = &self.openai_key {
+            self.check_openai_batch(openai_key, inputs, Some(meta)).await
+        } else {
+            (vec![], Arc::new(vec![]))
+        };
 
         let single_scores = scores_list.get(0).cloned().unwrap_or_default();
         let combined_scores = scores_list.get(1).cloned();
@@ -1622,16 +1836,83 @@ impl AiModerator {
             };
         }
 
-        // 1A. Clear clean content -> Instant ALLOW (only if no severe harm keywords, no provocative bait, no dox threats, no slurs, no game shield evasion, and not shut up)
-        if max_score < OPENAI_SAFE_THRESHOLD && !has_severe_harm_keyword && !has_provocative_bait && !has_dox_threat && !has_slur && !is_game_shield && !is_shut_up {
-            println!("   ↳ [SAFE] Score {:.2} < {:.2} safe threshold -> ALLOW (0 tokens spent)", max_score, OPENAI_SAFE_THRESHOLD);
+        let has_link = Self::contains_suspicious_link(trimmed);
+        let has_suspicious_kw = Self::contains_suspicious_keywords(trimmed);
+        let has_insult = Self::contains_target_insult(trimmed);
+        let is_vector_suspicious = is_vector_suspicious || (vector_score >= 0.70 && vector_res.as_ref().map(|r| r.is_scam).unwrap_or(false));
+
+        // ── Native SIMD + Sliding Window + Levenshtein Profanity & Threat Scan ──
+        let profanity_hit = self.profanity_engine.scan(trimmed)
+            .or_else(|| if has_author_context { self.profanity_engine.scan(&combined_text) } else { None });
+        let has_profanity = profanity_hit.is_some();
+        let has_severe_harm_keyword = has_severe_harm_keyword
+            || profanity_hit.as_ref().map(|p| p.is_severe_root && (p.matched_rule.contains("убей") || p.matched_rule.contains("сдох") || p.matched_rule.contains("пристрел") || p.matched_rule.contains("зареж") || p.matched_rule.contains("kill") || p.matched_rule.contains("kys"))).unwrap_or(false);
+
+        let mut pattern_notes: Vec<String> = Vec::new();
+        if let Some(ref v_info) = vector_trigger_info {
+            pattern_notes.push(v_info.clone());
+        }
+        if let Some(ref p_hit) = profanity_hit {
+            println!(
+                "   🛡️ [NATIVE PROFANITY/THREAT ENGINE] Hit rule '{}' on token '{}' (obfuscated: {}, fuzzy: {}, severe: {})",
+                p_hit.matched_rule, p_hit.detected_token, p_hit.is_obfuscated, p_hit.is_fuzzy, p_hit.is_severe_root
+            );
+            pattern_notes.push(format!("Profanity/Threat Pattern: '{}'", p_hit.matched_rule));
+        }
+        if has_link {
+            pattern_notes.push("Suspicious link/URL".to_string());
+        }
+        if has_suspicious_kw {
+            pattern_notes.push("Scam/cheat keyword".to_string());
+        }
+        if has_insult {
+            pattern_notes.push("Targeted insult".to_string());
+        }
+        if has_severe_harm_keyword {
+            pattern_notes.push("Severe harm keyword".to_string());
+        }
+        if has_dox_threat {
+            pattern_notes.push("Doxxing/threat pattern".to_string());
+        }
+        if has_slur {
+            pattern_notes.push("Slur/hate pattern".to_string());
+        }
+        let pattern_alert_str = if !pattern_notes.is_empty() {
+            Some(pattern_notes.join("; "))
+        } else {
+            None
+        };
+        let is_any_pattern_triggered = !pattern_notes.is_empty() || is_vector_suspicious;
+
+        // 1A. Clear clean content -> Instant ALLOW only if:
+        // - NO suspicious link
+        // - NO suspicious crypto/nitro/scam/cheat keywords
+        // - NO targeted insults
+        // - NO native profanity/threat patterns
+        // - NO moderate vector similarity from Qdrant
+        // - NO severe harm keywords, provocative bait, dox threats, slurs, or game shield evasion
+        if !has_link
+            && !has_suspicious_kw
+            && !has_insult
+            && !has_profanity
+            && !is_vector_suspicious
+            && !is_any_pattern_triggered
+            && !has_severe_harm_keyword
+            && !has_provocative_bait
+            && !has_dox_threat
+            && !has_slur
+            && !is_game_shield
+            && !is_shut_up
+            && (max_score < OPENAI_SAFE_THRESHOLD || scores_list.is_empty())
+        {
+            println!("   ↳ [SAFE CHAT ALLOW] Clean message ('{}') -> ALLOW (0 tokens spent)", Self::safe_truncate(trimmed, 40));
             return ModerationVerdict::Allow;
         }
 
         // 1A-2. ROBLOX & GAMING PVP / HUNTING BANTER:
         // On this server, phrases like 'I will find you and kill you', 'найду тебя и убью в роблоксе'
         // are standard in-game hunting trashtalk unless paired with real-world PII/stalking or slurs.
-        if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !Self::is_explicit_real_world_dox_threat(trimmed) {
+        if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !Self::is_explicit_real_world_dox_threat(trimmed) && !has_link && !has_suspicious_kw && !is_vector_suspicious && !has_insult && !is_any_pattern_triggered {
             println!("   ↳ [ROBLOX HUNTING ALLOW] In-game hunting trashtalk ('{}') -> ALLOW (0 tokens spent)", trimmed);
             return ModerationVerdict::Allow;
         }
@@ -1644,7 +1925,11 @@ impl AiModerator {
             || has_dox_threat
             || has_slur
             || is_violent_category
-            || is_game_shield;
+            || is_game_shield
+            || has_link
+            || is_vector_suspicious
+            || has_profanity
+            || is_any_pattern_triggered;
 
         let preferred_model = if is_hardcore_or_drama {
             &self.groq_deep_model // openai/gpt-oss-120b (120B reasoning model for drama, threats, evasions & complex context)
@@ -1672,6 +1957,7 @@ impl AiModerator {
                     is_pvp_callout,
                     if has_author_context { Some(combined_text.as_str()) } else { None },
                     ctx.reply_to,
+                    pattern_alert_str.as_deref(),
                 );
 
                 match self.evaluate_via_groq_batch(
@@ -1726,10 +2012,34 @@ impl AiModerator {
                                     mute_minutes: 120,
                                 };
                             }
+                            if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_meta {
+                                println!("   ⚠️ [PROVOCATIVE BAIT GUARD] Overriding LLM ALLOW on provocative bait ('{}') -> SUSPICIOUS(1m)", trimmed);
+                                return ModerationVerdict::FlagSuspicious {
+                                    reason: format!("Provocative gender bait / trolling: \"{}\"", trimmed),
+                                    score: if max_score > 0.3 { max_score } else { 0.5 },
+                                    category: "harassment".to_string(),
+                                    model_used: format!("Bait Guard ({})", model_used),
+                                    rule_violated: "Minor/Mild (Provocative Bait)".to_string(),
+                                    mute_minutes: 1,
+                                };
+                            }
+                            if Self::is_direct_death_wish(trimmed) && !is_meta {
+                                println!("   🚨 [DEATH WISH GUARD] Overriding LLM ALLOW for direct death wish ('{}') -> SUSPICIOUS(30m)", trimmed);
+                                return ModerationVerdict::FlagSuspicious {
+                                    reason: format!("Direct death wish/suicide incitement: \"{}\"", trimmed),
+                                    score: if max_score > 0.3 { max_score } else { 0.8 },
+                                    category: "harassment/threatening".to_string(),
+                                    model_used: format!("Death Wish Guard ({})", model_used),
+                                    rule_violated: "Crit (Death Wishes)".to_string(),
+                                    mute_minutes: 30,
+                                };
+                            }
                             println!("   ✅ [BANTER PASS] LLM verified message as safe gaming hyperbole -> ALLOW");
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if is_meta && !is_directed {
                             println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
                             let is_russian = trimmed.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
@@ -1745,24 +2055,31 @@ impl AiModerator {
                             };
                         } else if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                             println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM {} on tactical in-game callout ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
                             println!("   🛡️ [BANTER GUARD] Overriding LLM {} on standalone profanity ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                             println!("   🎭 [POST-IRONY GUARD] Overriding LLM {} on theatrical hyperbole ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
                             println!("   🛡️ [DOXX META GUARD] Overriding LLM {} on doxx meta-talk/observation ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                             println!("   🛡️ [DEV CRITIQUE GUARD] Overriding LLM {} on developer/game critique ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if (Self::is_drama_or_gossip(trimmed) || decision.rule.to_lowercase().contains("drama") || decision.reason.to_lowercase().contains("drama incitement")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                             println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM {} on gossip / drama rumor ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
                             println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM {} on in-game hunting banter ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if decision.rule.to_lowercase().contains("dox")
                             && !decision.rule.to_lowercase().contains("threat")
@@ -1770,13 +2087,26 @@ impl AiModerator {
                             && !decision.reason.to_lowercase().contains("threat")
                             && !Self::is_explicit_real_world_dox_threat(trimmed) {
                             println!("   🛡️ [DOXX GUARD] Overriding LLM {} on non-explicit doxx rule ('{}') to ALLOW.", decision.verdict, trimmed);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if max_score <= 0.20 && !has_slur && !has_provocative_bait && !has_severe_harm_keyword && !Self::is_explicit_real_world_dox_threat(trimmed) {
                             if decision.rule.contains("Minor") || decision.rule.contains("Mild") || decision.rule.to_lowercase().contains("drama") || decision.rule.to_lowercase().contains("harassment") || decision.mute_minutes <= 15 {
                                 println!("   🛡️ [LOW TOXICITY GUARD] Overriding LLM {} on low-toxicity message (score {:.2} <= 0.20, rule '{}') to ALLOW.", decision.verdict, max_score, decision.rule);
+                                self.add_to_whitelist(trimmed).await;
                                 return ModerationVerdict::Allow;
                             }
                         } else if decision.verdict.contains("DELETE") {
+                            if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
+                                println!("   ⚠️ [PROVOCATIVE BAIT GUARD] Overriding LLM DELETE on provocative bait ('{}') -> SUSPICIOUS(1m)", trimmed);
+                                return ModerationVerdict::FlagSuspicious {
+                                    reason: format!("Provocative gender bait / trolling: \"{}\"", trimmed),
+                                    score: if max_score > 0.3 { max_score } else { 0.5 },
+                                    category: "harassment".to_string(),
+                                    model_used: format!("Bait Guard ({})", model_used),
+                                    rule_violated: "Minor/Mild (Provocative Bait)".to_string(),
+                                    mute_minutes: 1,
+                                };
+                            }
                             println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
                             let model_label = if model_used.contains("120b") {
                                 format!("OpenAI + {} (120B Deep Drama Arbiter)", model_used)
@@ -1794,7 +2124,27 @@ impl AiModerator {
                                 mute_minutes: decision.mute_minutes,
                             };
                         } else {
-                            println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged for mod review + auto-timeout: {}m (Rule: {})", decision.mute_minutes, decision.rule);
+                            if is_vector_suspicious || decision.reason.to_lowercase().contains("scam") || decision.rule.to_lowercase().contains("scam") {
+                                let model_label = if model_used.contains("120b") {
+                                    format!("OpenAI + {} (120B Deep Drama Arbiter)", model_used)
+                                } else if model_used.contains("20b") {
+                                    format!("OpenAI + {} (20B Safety Arbiter)", model_used)
+                                } else {
+                                    format!("OpenAI + {} Guard", model_used)
+                                };
+                                println!("   🚨 [SCAM PURGE] Confirmed scam pattern in flagged message -> DELETE({}m)", if decision.mute_minutes > 0 { decision.mute_minutes } else { 120 });
+                                return ModerationVerdict::DeleteConfirmed {
+                                    reason: format!("Scam / phishing link: {}", decision.reason),
+                                    score: if max_score > 0.5 { max_score } else { 0.95 },
+                                    category: "scam".to_string(),
+                                    model_used: model_label,
+                                    rule_violated: "Major (Scam/Phishing)".to_string(),
+                                    mute_minutes: if decision.mute_minutes > 0 { decision.mute_minutes } else { 120 },
+                                };
+                            }
+                            let effective_mute = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { 1 } else { decision.mute_minutes };
+                            let effective_rule = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { "Minor/Mild (Provocative Bait)".to_string() } else { decision.rule };
+                            println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged for mod review + auto-timeout: {}m (Rule: {})", effective_mute, effective_rule);
                             let model_label = if model_used.contains("120b") {
                                 format!("{} (120B Deep Drama Arbiter)", model_used)
                             } else if model_used.contains("20b") {
@@ -1807,8 +2157,8 @@ impl AiModerator {
                                 score: max_score,
                                 category: top_cat,
                                 model_used: model_label,
-                                rule_violated: decision.rule,
-                                mute_minutes: decision.mute_minutes,
+                                rule_violated: effective_rule,
+                                mute_minutes: effective_mute,
                             };
                         }
                     }
@@ -1942,26 +2292,39 @@ impl AiModerator {
         }
 
         // ── 2. SMART GREY-ZONE PRE-FILTER (0.45 ..= 0.82) ─────────────────────
-        if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && max_score < 0.75 {
+        if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_vector_suspicious && !is_any_pattern_triggered && max_score < 0.75 {
             println!("   ↳ [DEV CRITIQUE PRE-FILTER] 3rd-party dev / game critique (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
-        if Self::is_dox_meta_talk(trimmed) && !has_dox_threat && !has_slur && max_score < 0.75 {
+        if Self::is_dox_meta_talk(trimmed) && !has_dox_threat && !has_slur && !is_vector_suspicious && !is_any_pattern_triggered && max_score < 0.75 {
             println!("   ↳ [DOXX META PRE-FILTER] Meta-talk about doxxing (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
-        if Self::is_drama_or_gossip(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && max_score < 0.75 {
+        if Self::is_drama_or_gossip(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_vector_suspicious && !is_any_pattern_triggered && max_score < 0.75 {
             println!("   ↳ [DRAMA PRE-FILTER] Chat gossip / drama rumor (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
 
         // ONLY bypass if it's general non-violent gaming frustration (e.g. "fuck this lag")
-        if !is_directed && !is_violent_category && !has_severe_harm_keyword && !has_provocative_bait && !has_dox_threat && !has_slur && !is_game_shield && max_score < 0.60 {
+        if !is_directed
+            && !has_link
+            && !has_suspicious_kw
+            && !has_insult
+            && !is_vector_suspicious
+            && !is_any_pattern_triggered
+            && !is_violent_category
+            && !has_severe_harm_keyword
+            && !has_provocative_bait
+            && !has_dox_threat
+            && !has_slur
+            && !is_game_shield
+            && max_score < 0.60
+        {
             println!("   ↳ [PRE-FILTER] General gaming frustration / non-directed (score {:.2}) -> ALLOW (0 tokens spent)", max_score);
             return ModerationVerdict::Allow;
         }
 
-        if self.groq_keys.is_empty() {
+        if self.groq_keys.is_empty() && self.gemini_keys.is_empty() {
             if has_dox_threat && !is_meta {
                 return ModerationVerdict::DeleteConfirmed {
                     reason: format!("Doxxing, blackmail, or personal info leak threat detected: \"{}\"", trimmed),
@@ -1979,6 +2342,16 @@ impl AiModerator {
                     category: if top_cat.is_empty() { "violence".to_string() } else { top_cat },
                     model_used: "Local Severe Keyword Guard".to_string(),
                     rule_violated: "Major (Threats/Harm)".to_string(),
+                    mute_minutes: 60,
+                };
+            }
+            if is_vector_suspicious {
+                return ModerationVerdict::DeleteConfirmed {
+                    reason: vector_trigger_info.clone().unwrap_or_else(|| "Local Vector / Scam Pattern Match".to_string()),
+                    score: if vector_score > 0.1 { vector_score } else { 0.85 },
+                    category: "vector_db/scam".to_string(),
+                    model_used: "Local Vector Shield Fallback".to_string(),
+                    rule_violated: "Major (Scam/Phishing)".to_string(),
                     mute_minutes: 60,
                 };
             }
@@ -2002,6 +2375,7 @@ impl AiModerator {
             is_pvp_callout,
             if has_author_context { Some(combined_text.as_str()) } else { None },
             ctx.reply_to,
+            pattern_alert_str.as_deref(),
         );
 
         match self.evaluate_via_groq_batch(
@@ -2022,8 +2396,20 @@ impl AiModerator {
                     model_used, elapsed_ms, decision.verdict, decision.rule, decision.mute_minutes, decision.reason
                 );
                 if decision.verdict.contains("DELETE") || (has_slur && !is_meta) {
+                    if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_meta {
+                        println!("   ⚠️ [PROVOCATIVE BAIT GUARD] Overriding LLM DELETE on provocative bait ('{}') -> SUSPICIOUS(1m)", trimmed);
+                        return ModerationVerdict::FlagSuspicious {
+                            reason: format!("Provocative gender bait / trolling: \"{}\"", trimmed),
+                            score: if max_score > 0.3 { max_score } else { 0.5 },
+                            category: "harassment".to_string(),
+                            model_used: format!("Bait Guard ({})", model_used),
+                            rule_violated: "Minor/Mild (Provocative Bait)".to_string(),
+                            mute_minutes: 1,
+                        };
+                    }
                     if is_meta && !is_directed {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
@@ -2041,30 +2427,37 @@ impl AiModerator {
                     }
                     if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                         println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM DELETE on tactical in-game callout ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🛡️ [BANTER GUARD] Overriding LLM DELETE on standalone profanity ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🎭 [POST-IRONY GUARD] Overriding LLM DELETE on theatrical hyperbole ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
                         println!("   🛡️ [DOXX META GUARD] Overriding LLM DELETE on doxx meta-talk/observation to ALLOW.");
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                         println!("   🛡️ [DEV CRITIQUE GUARD] Overriding LLM DELETE on developer/game critique to ALLOW.");
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if (Self::is_drama_or_gossip(trimmed) || decision.rule.to_lowercase().contains("drama") || decision.reason.to_lowercase().contains("drama incitement")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                         println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM DELETE on gossip / drama rumor to ALLOW.");
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
                         println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM DELETE on in-game hunting banter ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if decision.rule.to_lowercase().contains("dox")
@@ -2073,11 +2466,22 @@ impl AiModerator {
                         && !decision.reason.to_lowercase().contains("threat")
                         && !Self::is_explicit_real_world_dox_threat(trimmed) {
                         println!("   🛡️ [DOXX GUARD] Overriding LLM DELETE on non-explicit doxx rule ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
-                    if max_score <= 0.20 && !has_slur && !has_provocative_bait && !has_severe_harm_keyword && !Self::is_explicit_real_world_dox_threat(trimmed) {
+                    if max_score <= 0.20
+                        && !has_link
+                        && !has_suspicious_kw
+                        && !has_insult
+                        && !is_vector_suspicious
+                        && !has_slur
+                        && !has_provocative_bait
+                        && !has_severe_harm_keyword
+                        && !Self::is_explicit_real_world_dox_threat(trimmed)
+                    {
                         if decision.rule.contains("Minor") || decision.rule.contains("Mild") || decision.rule.to_lowercase().contains("drama") || decision.rule.to_lowercase().contains("harassment") || decision.mute_minutes <= 15 {
                             println!("   🛡️ [LOW TOXICITY GUARD] Overriding LLM DELETE on low-toxicity message (score {:.2} <= 0.20, rule '{}') to ALLOW.", max_score, decision.rule);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         }
                     }
@@ -2103,6 +2507,7 @@ impl AiModerator {
                 } else if decision.verdict.contains("SUSPICIOUS") {
                     if is_meta && !is_directed {
                         println!("   🛡️ [META GUARD] Overriding LLM {} on undirected meta-discussion / quote to ALLOW.", decision.verdict);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if is_shut_up && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_game_shield {
@@ -2120,43 +2525,72 @@ impl AiModerator {
                     }
                     if is_pvp_callout && !has_slur && !is_game_shield && !has_dox_threat {
                         println!("   🎮 [PVP CALLOUT GUARD] Overriding LLM SUSPICIOUS on tactical in-game callout ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_standalone_profanity(trimmed) && !has_severe_harm_keyword && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🛡️ [BANTER GUARD] Overriding LLM SUSPICIOUS on standalone profanity ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_theatrical_hyperbole(trimmed) && !has_dox_threat && !has_slur && !is_game_shield {
                         println!("   🎭 [POST-IRONY GUARD] Overriding LLM SUSPICIOUS on theatrical hyperbole ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_dox_meta_talk(trimmed) && !has_slur && !has_dox_threat {
                         println!("   🛡️ [DOXX META GUARD] Overriding LLM SUSPICIOUS on doxx meta-talk/observation to ALLOW.");
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_3rd_party_dev_or_game_critique(trimmed) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                         println!("   🛡️ [DEV CRITIQUE GUARD] Overriding LLM SUSPICIOUS on developer/game critique to ALLOW.");
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if (Self::is_drama_or_gossip(trimmed) || decision.rule.to_lowercase().contains("drama") || decision.reason.to_lowercase().contains("drama incitement")) && !has_slur && !has_dox_threat && !has_severe_harm_keyword {
                         println!("   🛡️ [DRAMA / GOSSIP GUARD] Overriding LLM SUSPICIOUS on gossip / drama rumor to ALLOW.");
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !has_dox_threat {
                         println!("   🎮 [ROBLOX HUNTING GUARD] Overriding LLM SUSPICIOUS on in-game hunting banter ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if decision.rule.to_lowercase().contains("dox") && !Self::is_explicit_real_world_dox_threat(trimmed) {
                         println!("   🛡️ [DOXX GUARD] Overriding LLM SUSPICIOUS on non-explicit doxx rule ('{}') to ALLOW.", trimmed);
+                        self.add_to_whitelist(trimmed).await;
                         return ModerationVerdict::Allow;
                     }
                     if max_score <= 0.20 && !has_slur && !has_provocative_bait && !has_severe_harm_keyword && !Self::is_explicit_real_world_dox_threat(trimmed) {
                         if decision.rule.contains("Minor") || decision.rule.contains("Mild") || decision.rule.to_lowercase().contains("drama") || decision.rule.to_lowercase().contains("harassment") || decision.mute_minutes <= 15 {
                             println!("   🛡️ [LOW TOXICITY GUARD] Overriding LLM SUSPICIOUS on low-toxicity message (score {:.2} <= 0.20, rule '{}') to ALLOW.", max_score, decision.rule);
+                            self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         }
                     }
-                    println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", decision.mute_minutes, decision.rule);
+                    if is_vector_suspicious || decision.reason.to_lowercase().contains("scam") || decision.rule.to_lowercase().contains("scam") {
+                        let model_label = if model_used.contains("120b") {
+                            format!("{} (120B Deep Drama Arbiter)", model_used)
+                        } else if model_used.contains("20b") {
+                            format!("{} (20B Safety Arbiter)", model_used)
+                        } else {
+                            format!("{} (Fast Context)", model_used)
+                        };
+                        println!("   🚨 [SCAM PURGE] Confirmed scam pattern in flagged message -> DELETE({}m)", if decision.mute_minutes > 0 { decision.mute_minutes } else { 120 });
+                        return ModerationVerdict::DeleteConfirmed {
+                            reason: format!("Scam / phishing link: {}", decision.reason),
+                            score: if max_score > 0.5 { max_score } else { 0.95 },
+                            category: "scam".to_string(),
+                            model_used: model_label,
+                            rule_violated: "Major (Scam/Phishing)".to_string(),
+                            mute_minutes: if decision.mute_minutes > 0 { decision.mute_minutes } else { 120 },
+                        };
+                    }
+                    let effective_mute = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { 1 } else { decision.mute_minutes };
+                    let effective_rule = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { "Minor/Mild (Provocative Bait)".to_string() } else { decision.rule };
+                    println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged grey-zone violation! Mute: {}m (Rule: {})", effective_mute, effective_rule);
                     let model_label = if model_used.contains("120b") {
                         format!("{} (120B Deep Drama Arbiter)", model_used)
                     } else if model_used.contains("20b") {
@@ -2169,8 +2603,8 @@ impl AiModerator {
                         score: max_score,
                         category: top_cat,
                         model_used: model_label,
-                        rule_violated: decision.rule,
-                        mute_minutes: decision.mute_minutes,
+                        rule_violated: effective_rule,
+                        mute_minutes: effective_mute,
                     }
                 } else {
                     if has_slur && !is_meta {
@@ -2206,7 +2640,41 @@ impl AiModerator {
                             mute_minutes: 120,
                         };
                     }
+                    if has_severe_harm_keyword && !is_pvp_callout && !is_meta && !Self::is_game_hunting_or_pvp_threat(trimmed) {
+                        println!("   🚨 [SEVERE HARM GUARD] Overriding LLM ALLOW for severe harm threat ('{}') -> DeleteConfirmed(120m)", trimmed);
+                        return ModerationVerdict::DeleteConfirmed {
+                            reason: format!("Severe harm or death threat detected: \"{}\"", trimmed),
+                            score: if max_score > 0.5 { max_score } else { 0.95 },
+                            category: "violence".to_string(),
+                            model_used: format!("Severe Harm Guard ({})", model_used),
+                            rule_violated: "Major (Threats/Harm)".to_string(),
+                            mute_minutes: 120,
+                        };
+                    }
+                    if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_meta {
+                        println!("   ⚠️ [PROVOCATIVE BAIT GUARD] Overriding LLM ALLOW on provocative bait ('{}') -> SUSPICIOUS(1m)", trimmed);
+                        return ModerationVerdict::FlagSuspicious {
+                            reason: format!("Provocative gender bait / trolling: \"{}\"", trimmed),
+                            score: if max_score > 0.3 { max_score } else { 0.5 },
+                            category: "harassment".to_string(),
+                            model_used: format!("Bait Guard ({})", model_used),
+                            rule_violated: "Minor/Mild (Provocative Bait)".to_string(),
+                            mute_minutes: 1,
+                        };
+                    }
+                    if Self::is_direct_death_wish(trimmed) && !is_meta {
+                        println!("   🚨 [DEATH WISH GUARD] Overriding LLM ALLOW for direct death wish ('{}') -> SUSPICIOUS(30m)", trimmed);
+                        return ModerationVerdict::FlagSuspicious {
+                            reason: format!("Direct death wish/suicide incitement: \"{}\"", trimmed),
+                            score: if max_score > 0.3 { max_score } else { 0.8 },
+                            category: "harassment/threatening".to_string(),
+                            model_used: format!("Death Wish Guard ({})", model_used),
+                            rule_violated: "Crit (Death Wishes)".to_string(),
+                            mute_minutes: 30,
+                        };
+                    }
                     println!("   ✅ [ALLOW] Grey-zone message allowed by LLM.");
+                    self.add_to_whitelist(trimmed).await;
                     ModerationVerdict::Allow
                 }
             }
@@ -2410,7 +2878,7 @@ impl AiModerator {
             total_inputs += first_req.inputs.len();
             pending.push(first_req);
 
-            if total_inputs >= batch_size {
+            if total_inputs >= batch_size || batch_wait.is_zero() {
                 Self::flush_batch(&mut pending, &mut total_inputs, &http_client, openai_key.as_deref()).await;
                 continue;
             }
@@ -2700,6 +3168,7 @@ impl AiModerator {
             .post(&url)
             .timeout(std::time::Duration::from_secs(16))
             .header("Content-Type", "application/json")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .header("x-goog-api-key", api_key)
             .json(&req_body)
             .send()
@@ -2746,16 +3215,18 @@ impl AiModerator {
         }
 
         let safe_preferred = if preferred_model.contains("3.8") || preferred_model.contains("pro") {
-            "gemini-3.1-flash-lite"
+            "gemini-3.5-flash-lite"
         } else {
             preferred_model
         };
 
         let mut models_to_try = vec![safe_preferred];
         for candidate in &[
-            "gemini-3.1-flash-lite",
             "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-flash-lite-latest",
             "gemma-4-31b-it",
+            "gemini-2.5-flash-lite",
         ] {
             if !models_to_try.contains(candidate) {
                 models_to_try.push(candidate);
@@ -2785,14 +3256,37 @@ impl AiModerator {
         system_prompt: &str,
         user_prompt: &str,
     ) -> Result<(GroqDecision, String, u128), String> {
-        // First try Gemini if configured
+        // Try Groq cluster first (120B reasoning model or fast 27B model)
+        if !self.groq_keys.is_empty() {
+            let max_tokens = if model.contains("gpt-oss") { 1024 } else { 200 };
+            match Self::call_groq_failover_static(
+                &self.http_client,
+                &self.groq_keys,
+                &self.groq_counter,
+                model,
+                system_prompt,
+                user_prompt,
+                max_tokens,
+            ).await {
+                Ok((raw_text, reasoning, model_used, elapsed_ms)) => {
+                    if let Ok(decision) = Self::parse_single_decision_from_text(&raw_text, reasoning.as_deref()) {
+                        return Ok((decision, model_used, elapsed_ms));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[LLM ARBITER] Groq error: {}. Falling back to Gemini...", e);
+                }
+            }
+        }
+
+        // Fallback to Gemini if configured
         if !self.gemini_keys.is_empty() {
             let preferred_gemini = if model.contains("gpt-oss") || model.contains("pro") {
                 &self.gemini_deep_model
             } else {
                 &self.gemini_fast_model
             };
-            let max_tokens = if preferred_gemini.contains("pro") { 1024 } else { 150 };
+            let max_tokens = if preferred_gemini.contains("pro") { 1024 } else { 250 };
             match Self::call_gemini_failover_static(
                 &self.http_client,
                 &self.gemini_keys,
@@ -2808,24 +3302,12 @@ impl AiModerator {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[LLM ARBITER] Gemini failover: {}. Falling back to Groq cluster...", e);
+                    eprintln!("[LLM ARBITER] Gemini failover error: {}", e);
                 }
             }
         }
 
-        let max_tokens = if model.contains("gpt-oss") { 1024 } else { 85 };
-        let (raw_text, reasoning, model_used, elapsed_ms) = Self::call_groq_failover_static(
-            &self.http_client,
-            &self.groq_keys,
-            &self.groq_counter,
-            model,
-            system_prompt,
-            user_prompt,
-            max_tokens,
-        ).await?;
-
-        let decision = Self::parse_single_decision_from_text(&raw_text, reasoning.as_deref())?;
-        Ok((decision, model_used, elapsed_ms))
+        Err("All Groq and Gemini models exhausted".to_string())
     }
 
     pub async fn call_groq_failover_static(
@@ -3156,7 +3638,7 @@ impl AiModerator {
         while let Some(first_req) = rx.recv().await {
             pending.push(first_req);
 
-            if pending.len() >= batch_size {
+            if pending.len() >= batch_size || batch_wait.is_zero() {
                 Self::flush_groq_batch(
                     &mut pending,
                     &http_client,
@@ -3262,19 +3744,53 @@ impl AiModerator {
         let has_hardcore = batch.iter().any(|item| item.is_hardcore);
         let combined_user_prompt = Self::build_batch_transcript_prompt(&batch);
 
-        // Try Gemini first if keys are present
+        // Try Groq cluster first (120B reasoning model or fast 27B model)
         let mut eval_result: Option<(String, Option<String>, String, u128)> = None;
 
-        if !gemini_keys.is_empty() {
+        if !groq_keys.is_empty() {
+            let preferred_groq = if has_hardcore {
+                groq_deep_model
+            } else {
+                groq_fast_model
+            };
+
+            println!(
+                "\n📦 [GROQ BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript! (Model: {}, Hardcore/Deep: {})",
+                count, preferred_groq, has_hardcore
+            );
+
+            let base_tokens = if preferred_groq.contains("gpt-oss") { 800 } else { 200 };
+            let max_tokens = ((count * base_tokens).max(800)).min(4096) as u32;
+
+            match Self::call_groq_failover_static(
+                http_client,
+                groq_keys,
+                groq_counter,
+                preferred_groq,
+                SERVER_RULES_BATCH_SYSTEM_PROMPT,
+                &combined_user_prompt,
+                max_tokens,
+            ).await {
+                Ok(res) => {
+                    eval_result = Some(res);
+                }
+                Err(e) => {
+                    eprintln!("[GROQ BATCH ERROR] Groq failed across all keys: {}. Falling back to Gemini...", e);
+                }
+            }
+        }
+
+        // If Groq was not used or failed, fallback to Gemini
+        if eval_result.is_none() && !gemini_keys.is_empty() {
             let preferred_gemini = if has_hardcore {
                 gemini_deep_model
             } else {
                 gemini_fast_model
             };
-            let max_tokens = ((count * 200).max(512)).min(4096) as u32;
+            let max_tokens = ((count * 250).max(512)).min(4096) as u32;
 
             println!(
-                "\n✨ [GEMINI BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript! (Model: {}, Hardcore/Deep: {})",
+                "\n✨ [GEMINI BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript via Gemini! (Model: {}, Hardcore/Deep: {})",
                 count, preferred_gemini, has_hardcore
             );
 
@@ -3291,41 +3807,7 @@ impl AiModerator {
                     eval_result = Some((raw_text, None, format!("gemini:{}", model_used), elapsed_ms));
                 }
                 Err(e) => {
-                    eprintln!("⚠️ [GEMINI BATCH ERROR] {}. Falling back to Groq cluster...", e);
-                }
-            }
-        }
-
-        // If Gemini was not used or failed, fallback to Groq
-        if eval_result.is_none() && !groq_keys.is_empty() {
-            let preferred_groq = if has_hardcore {
-                groq_deep_model
-            } else {
-                groq_fast_model
-            };
-
-            println!(
-                "\n📦 [GROQ BATCH FLUSH] Evaluating {} flagged messages with chronological batch transcript! (Model: {}, Hardcore/Deep: {})",
-                count, preferred_groq, has_hardcore
-            );
-
-            let base_tokens = if preferred_groq.contains("gpt-oss") { 350 } else { 120 };
-            let max_tokens = ((count * base_tokens).max(512)).min(4096) as u32;
-
-            match Self::call_groq_failover_static(
-                http_client,
-                groq_keys,
-                groq_counter,
-                preferred_groq,
-                SERVER_RULES_BATCH_SYSTEM_PROMPT,
-                &combined_user_prompt,
-                max_tokens,
-            ).await {
-                Ok(res) => {
-                    eval_result = Some(res);
-                }
-                Err(e) => {
-                    eprintln!("[GROQ BATCH ERROR] Batch failed across all failovers: {}. Falling back each item.", e);
+                    eprintln!("⚠️ [GEMINI BATCH ERROR] Gemini failover failed: {}", e);
                 }
             }
         }
@@ -4451,6 +4933,68 @@ REASON: Friendly banter
         assert_eq!(d.verdict, "ALLOW");
         assert_eq!(d.rule, "None");
         assert_eq!(d.mute_minutes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_check_message_local_vector_scam() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(1),
+            guild_name: Some("Test Guild".to_string()),
+            channel_id: 100,
+            channel_name: Some("general".to_string()),
+            message_id: 200,
+            timestamp_unix: 1700000000,
+            author_name: "Scammer",
+            author_id: 300,
+            author_nick: None,
+            account_age_days: Some(1),
+            server_member_days: Some(0),
+            roles_count: 0,
+            content: "fr3333 d!sc0rd n!tr000 c1ick h3r3 n0w",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'fr3333 d!sc0rd n!tr000 c1ick h3r3 n0w': {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::DeleteConfirmed { .. }),
+            "Expected DeleteConfirmed from vector DB for obfuscated nitro scam, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_message_local_vector_clean() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(1),
+            guild_name: Some("Test Guild".to_string()),
+            channel_id: 100,
+            channel_name: Some("general".to_string()),
+            message_id: 201,
+            timestamp_unix: 1700000001,
+            author_name: "GoodUser",
+            author_id: 301,
+            author_nick: None,
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "Hey everyone, who wants to play basketball or counter-strike tonight?",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for clean gaming chat: {:?}\n", verdict);
+        assert!(
+            matches!(verdict, ModerationVerdict::Allow),
+            "Expected ALLOW for clean gaming chat, got {:?}",
+            verdict
+        );
     }
 }
 

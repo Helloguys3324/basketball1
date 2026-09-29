@@ -19,6 +19,7 @@ mod config;
 use config::ConfigStore;
 
 mod mod_actions;
+mod profanity_engine;
 
 use serenity::model::application::Interaction;
 

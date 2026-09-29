@@ -1,0 +1,6 @@
+# Persistent whitelist (manual additions only - AI auto-learning disabled)
+it's a game
+join back
+i survived
+hi
+bleh

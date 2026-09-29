@@ -21,7 +21,12 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /usr/src/antiscambot/target/release/antiscambot /app/antiscambot
 
-# Copy default config if present
+# Copy config, dictionaries, and image templates
 COPY mod_config.json* ./
+COPY rust_dict.txt* ./
+COPY whitelist.txt* ./
+COPY dynamic_whitelist.txt* ./
+COPY scam_vectors.json* ./
+COPY scam_templates/ ./scam_templates/
 
 CMD ["/app/antiscambot"]
