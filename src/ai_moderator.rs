@@ -133,6 +133,7 @@ SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
   Boasting, expressing opinions, casual critique ('They would think your dumb', 'you played bad', '1v1 me on mid', 'im gonna destroy/smash/wreck you in 1v1', 'fuck you bro haha', 'ez game', 'you played like trash').\n\
   Standalone casual profanity and common gaming insults ('fuck you', 'fuck u', 'stfu', 'fuck off', 'screw you', 'bitch', 'asshole', 'idiot', 'dumb') WITHOUT death wishes (kys/die) and WITHOUT slurs -> ALWAYS ALLOW (RULE: None, MUTE: 0). NEVER classify standalone 'fuck you' or 'stfu' as Harassment or Minor/Mild!\n\
   POST-IRONY, THEATRICAL HYPERBOLE & DRAMATIC TRASHTALK ('i will eviscerate you', 'i will obliterate you', 'im gonna demolish/annihilate/vaporize you', 'i will tear you to pieces', 'я тебя расщеплю на атомы/разорву/сотру в порошок'): These are 100% POST-IRONIC JOKES and comic gaming exaggeration between members, NOT credible real-world violence! Real threats involve real-world stalking, doxxing, addresses, weapons, or dates. NEVER punish cartoonish/fantasy threats like 'i will eviscerate you'! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
+  PLAYFUL WARNINGS & HYPERBOLIC BANTER ('say yo one more time and ur done for', 'say that again and you\'re cooked', 'ur done for', 'you\'re done for', 'ur cooked', 'you\'re cooked', 'you\'re toast', 'it\'s over for you', 'тебе конец', 'тебе хана'): Standard conversational memes, comedic teasing, and harmless exaggeration between Discord members. They are NEVER credible threats of real-world violence! Unless accompanied by real-world personal information, physical addresses, weapons, or extortion, ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
   IN-GAME 'KILL' & PVP TRASHTALK ('i will kill you', 'im gonna kill you', 'let me kill you', 'i will kill you if you throw', 'i will kill you in 1v1'): When the conversation context involves games, matches, ranks, characters, PvP, gameplay, anime, or gaming banter ('stop stealing my kills', 'one match till rankup', '1v1 me', 'playing together'): These refer to IN-GAME CHARACTER DEATH or gaming frustration between players, NOT real-world murder! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). Only punish 'kill' if it threatens REAL-WORLD physical harm (e.g. 'i know where you live and will kill you', real-life stalking, weapons, dates).\n\
   THIRD-PERSON GAMING CALLOUTS & PVP DIRECTIVES ('kill him', 'kill her', 'kill them', 'kill it', 'shoot him', 'get him', 'focus him', 'finish him', 'убей его', 'добивай', 'завали его'): These are standard tactical PvP/gaming callouts, spectator banter, or stream clip reactions referring to opponents, in-game characters, bosses, or enemies! They are NEVER real-world death threats! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). NEVER classify 'kill him/her/them' as Direct death threat, Harassment, or Violence!\n\
   ROBLOX & GAMING PVP / HUNTING BANTER ('I will find you and kill you', 'im gonna find u and kill u in roblox', 'найду тебя и убью'): In this Discord community, members constantly play Roblox and competitive multiplayer games. Phrases like 'I will find you and kill you', 'im gonna find you and destroy you in roblox', 'найду тебя на сервере и убью' are completely standard in-game hunting trashtalk referring to finding the player's avatar in Roblox or hunting them in a match! ALWAYS analyze context deeply. Unless someone specifies REAL-WORLD personal details (real physical address, city, street, school, phone, real full name, swatting, IRL weapons, leaked IP) or demands real-world extortion/money, statements like 'I will find you and kill you' must be treated as in-game Roblox hunting banter! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
@@ -183,6 +184,7 @@ QUOTES, OPINIONS, META-TALK & HYPOTHETICALS (ALLOW, RULE:None, MUTE:0):
 - Roblox / Gaming hunting trashtalk ('I will find you and kill you in roblox', 'найду тебя на сервере и убью') -> ALWAYS ALLOW (RULE: None, MUTE: 0).
 - Standalone casual profanity ('fuck you', 'stfu') WITHOUT death wishes and WITHOUT slurs -> ALWAYS ALLOW.
 - Post-irony, theatrical hyperbole & dramatic exaggeration ('i will eviscerate you', 'я тебя расщеплю на атомы') -> ALWAYS ALLOW.
+- Playful warnings & hyperbolic banter ('say yo one more time and ur done for', 'ur cooked', 'you\'re done for', 'тебе конец') -> ALWAYS ALLOW (RULE: None, MUTE: 0).
 - Fake-game shield evasion ('kys in minecraft', 'die in roblox', 'burn your house in rust') -> SUSPICIOUS(60m) or DELETE(120m).
 CRITICAL OUTPUT FORMAT:
 You MUST evaluate EACH item independently and output a dedicated block for EVERY [ITEM <number>] in the batch in order:
@@ -1224,7 +1226,13 @@ impl AiModerator {
             "disintegrate", "atomize", "vaporize", "turn into dust",
             "fold you like a lawn chair", "tear you to pieces", "rip you apart",
             "выпотрошу", "расщеплю", "сотру в порошок", "на атомы", "порву как грелку",
-            "разорву на куски", "размажу по стенке"
+            "разорву на куски", "размажу по стенке",
+            "done for", "ur done for", "you're done for", "youre done for",
+            "ur cooked", "you're cooked", "youre cooked",
+            "you're finished", "ur finished", "youre finished",
+            "you're toast", "ur toast", "youre toast",
+            "dead to me", "it's over for you", "its over for you",
+            "тебе хана", "тебе крышка", "тебе конец"
         ];
         let has_hyperbole = HYPERBOLE_WORDS.iter().any(|&w| lower.contains(w));
         if !has_hyperbole {
@@ -1915,6 +1923,12 @@ impl AiModerator {
         // are standard in-game hunting trashtalk unless paired with real-world PII/stalking or slurs.
         if Self::is_game_hunting_or_pvp_threat(trimmed) && !has_slur && !Self::is_explicit_real_world_dox_threat(trimmed) && !has_link && !has_suspicious_kw && !is_vector_suspicious && !has_insult && !is_any_pattern_triggered {
             println!("   ↳ [ROBLOX HUNTING ALLOW] In-game hunting trashtalk ('{}') -> ALLOW (0 tokens spent)", trimmed);
+            return ModerationVerdict::Allow;
+        }
+
+        // 1A-3. THEATRICAL HYPERBOLE & PLAYFUL POST-IRONIC BANTER:
+        if Self::is_theatrical_hyperbole(trimmed) && !has_slur && !has_dox_threat && !has_link && !has_suspicious_kw && !is_vector_suspicious && !has_insult {
+            println!("   ↳ [THEATRICAL HYPERBOLE ALLOW] Playful post-ironic banter ('{}') -> ALLOW (0 tokens spent)", trimmed);
             return ModerationVerdict::Allow;
         }
 
@@ -4225,6 +4239,9 @@ mod tests {
         assert!(AiModerator::is_theatrical_hyperbole("<@12345> i will obliterate you"));
         assert!(AiModerator::is_theatrical_hyperbole("im gonna annihilate you in 1v1"));
         assert!(AiModerator::is_theatrical_hyperbole("я тебя сотру в порошок"));
+        assert!(AiModerator::is_theatrical_hyperbole("say yo one more time and ur done for"));
+        assert!(AiModerator::is_theatrical_hyperbole("say that again and you're cooked"));
+        assert!(AiModerator::is_theatrical_hyperbole("тебе хана"));
         // Not safe if real-world doxxing or severe violence
         assert!(!AiModerator::is_theatrical_hyperbole("i will eviscerate you and i know where you live"));
         assert!(!AiModerator::is_theatrical_hyperbole("regular message"));
@@ -4255,6 +4272,33 @@ mod tests {
         let verdict = moderator.check_message(&ctx).await;
         println!("\n>>> LIVE TEST VERDICT for 'i will eviscerate you': {:?}\n", verdict);
         assert!(matches!(verdict, ModerationVerdict::Allow), "Expected 'i will eviscerate you' to be ALLOW, got {:?}", verdict);
+    }
+
+    #[tokio::test]
+    async fn test_check_message_say_yo_done_for() {
+        let client = reqwest::Client::new();
+        let moderator = AiModerator::new(client);
+        let ctx = MessageContext {
+            guild_id: Some(123456789),
+            guild_name: Some("Gaming Arena".to_string()),
+            channel_id: 1,
+            channel_name: Some("lounge".to_string()),
+            message_id: 11,
+            timestamp_unix: 1727376000,
+            author_name: "voidyxkm",
+            author_id: 1494872075142299761,
+            author_nick: Some("voidyxkm".to_string()),
+            account_age_days: Some(30),
+            server_member_days: Some(10),
+            roles_count: 1,
+            content: "say yo one more time and ur done for",
+            reply_to: None,
+            mentions: &[],
+            attachments_info: &[],
+        };
+        let verdict = moderator.check_message(&ctx).await;
+        println!("\n>>> LIVE TEST VERDICT for 'say yo one more time and ur done for': {:?}\n", verdict);
+        assert!(matches!(verdict, ModerationVerdict::Allow), "Expected 'say yo one more time and ur done for' to be ALLOW, got {:?}", verdict);
     }
 
     #[tokio::test]
