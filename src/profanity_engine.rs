@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::PathBuf;
 
 const MAX_CANDIDATES: usize = 128;
 const MAX_TOKEN_LEN: usize = 28;
@@ -48,37 +48,51 @@ impl Default for ProfanityEngine {
 }
 
 impl ProfanityEngine {
+    fn resolve_file_path(candidates: &[&str]) -> Option<PathBuf> {
+        for candidate in candidates {
+            let p = PathBuf::from(candidate);
+            if p.exists() {
+                return Some(p);
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    let candidate_path = parent.join(candidate);
+                    if candidate_path.exists() {
+                        return Some(candidate_path);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn new() -> Self {
         let mut dict = HashSet::new();
 
-        // 1. Try loading profanity dictionary from multiple standard paths
+        // 1. Try loading profanity dictionary from multiple standard portable paths
         let paths = [
             "rust_dict.txt",
-            r"D:\antiscambot\rust_dict.txt",
-            r"D:\gemini\rust_dict.txt",
-            r"vector_engine\rust_dict.txt",
+            "vector_engine/rust_dict.txt",
+            "../rust_dict.txt",
         ];
 
         let mut loaded_from_file = false;
-        for p in &paths {
-            if Path::new(p).exists() {
-                if let Ok(file) = File::open(p) {
-                    let reader = BufReader::new(file);
-                    for line in reader.lines().flatten() {
-                        let trimmed = line.trim().to_lowercase();
-                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                            dict.insert(trimmed);
-                        }
+        if let Some(p) = Self::resolve_file_path(&paths) {
+            if let Ok(file) = File::open(&p) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten() {
+                    let trimmed = line.trim().to_lowercase();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        dict.insert(trimmed);
                     }
-                    if !dict.is_empty() {
-                        loaded_from_file = true;
-                        println!(
-                            "   🛡️ [PROFANITY ENGINE] Ingested {} profanity/threat rules from '{}'",
-                            dict.len(),
-                            p
-                        );
-                        break;
-                    }
+                }
+                if !dict.is_empty() {
+                    loaded_from_file = true;
+                    println!(
+                        "   🛡️ [PROFANITY ENGINE] Ingested {} profanity/threat rules from '{}'",
+                        dict.len(),
+                        p.display()
+                    );
                 }
             }
         }
@@ -107,28 +121,25 @@ impl ProfanityEngine {
         let mut clean_words = HashSet::new();
         let clean_paths = [
             "whitelist.txt",
-            r"D:\antiscambot\whitelists\profanity_destroyer_whitelist.txt",
-            r"D:\gemini\profanity-destroyer\src\database\whitelist.txt",
-            r"whitelists\profanity_destroyer_whitelist.txt",
+            "whitelists/profanity_destroyer_whitelist.txt",
+            "vector_engine/whitelist.txt",
+            "../whitelist.txt",
         ];
-        for cp in &clean_paths {
-            if Path::new(cp).exists() {
-                if let Ok(file) = File::open(cp) {
-                    let reader = BufReader::new(file);
-                    for line in reader.lines().flatten() {
-                        let w = line.trim().to_lowercase();
-                        if !w.is_empty() && !dict.contains(&w) {
-                            clean_words.insert(w);
-                        }
+        if let Some(cp) = Self::resolve_file_path(&clean_paths) {
+            if let Ok(file) = File::open(&cp) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten() {
+                    let w = line.trim().to_lowercase();
+                    if !w.is_empty() && !dict.contains(&w) {
+                        clean_words.insert(w);
                     }
-                    if !clean_words.is_empty() {
-                        println!(
-                            "   📖 [PROFANITY ENGINE] Loaded {} clean dictionary words to guard against fuzzy false positives from '{}'",
-                            clean_words.len(),
-                            cp
-                        );
-                        break;
-                    }
+                }
+                if !clean_words.is_empty() {
+                    println!(
+                        "   📖 [PROFANITY ENGINE] Loaded {} clean dictionary words to guard against fuzzy false positives from '{}'",
+                        clean_words.len(),
+                        cp.display()
+                    );
                 }
             }
         }

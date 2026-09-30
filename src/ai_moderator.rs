@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -201,7 +201,10 @@ RULE:[Rule name or None]
 MUTE_MINUTES:[0|1|15|30|60|120|1440]
 REASON:[<=8 words]"#;
 
-pub fn get_env_var(name: &str) -> Option<String> {
+static ENV_CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+fn init_env_cache() -> HashMap<String, String> {
+    let mut map = HashMap::new();
     let env_paths = [
         PathBuf::from(".env"),
         if let Ok(exe) = env::current_exe() {
@@ -211,7 +214,6 @@ pub fn get_env_var(name: &str) -> Option<String> {
         },
     ];
 
-    let prefix = format!("{}=", name);
     for path in &env_paths {
         if path.exists() {
             if let Ok(content) = fs::read_to_string(path) {
@@ -220,20 +222,21 @@ pub fn get_env_var(name: &str) -> Option<String> {
                     if line.starts_with('#') || line.is_empty() {
                         continue;
                     }
-                    if let Some(val) = line.strip_prefix(&prefix) {
-                        let cleaned = val.trim().trim_matches('"').trim_matches('\'');
-                        if !cleaned.is_empty() {
-                            if name == "OPENAI_API_KEY" && cleaned.starts_with("gsk_") {
-                                continue;
-                            }
-                            return Some(cleaned.to_string());
+                    if let Some((k, v)) = line.split_once('=') {
+                        let key = k.trim().to_string();
+                        let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                        if !key.is_empty() && !val.is_empty() {
+                            map.entry(key).or_insert(val);
                         }
                     }
                 }
             }
         }
     }
+    map
+}
 
+pub fn get_env_var(name: &str) -> Option<String> {
     if let Ok(val) = env::var(name) {
         let trimmed = val.trim().to_string();
         if !trimmed.is_empty() {
@@ -244,6 +247,15 @@ pub fn get_env_var(name: &str) -> Option<String> {
             }
         }
     }
+
+    let cache = ENV_CACHE.get_or_init(init_env_cache);
+    if let Some(val) = cache.get(name) {
+        if name == "OPENAI_API_KEY" && val.starts_with("gsk_") {
+            return None;
+        }
+        return Some(val.clone());
+    }
+
     None
 }
 
@@ -726,13 +738,29 @@ impl AiModerator {
         };
 
         let mut dynamic_whitelist = HashSet::new();
-        // Load persistent dynamic whitelist
-        for f in &["dynamic_whitelist.txt", r"D:\gemini\dynamic_whitelist.txt"] {
-            if let Ok(content) = std::fs::read_to_string(f) {
-                for line in content.lines() {
-                    let w = line.trim().to_lowercase();
-                    if !w.is_empty() {
-                        dynamic_whitelist.insert(w);
+        // Load persistent dynamic whitelist using portable resolution
+        let wl_candidates = [
+            PathBuf::from("dynamic_whitelist.txt"),
+            PathBuf::from("vector_engine/dynamic_whitelist.txt"),
+        ];
+        let mut wl_paths = wl_candidates.to_vec();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                wl_paths.push(parent.join("dynamic_whitelist.txt"));
+                wl_paths.push(parent.join("vector_engine/dynamic_whitelist.txt"));
+            }
+        }
+        for path in &wl_paths {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    for line in content.lines() {
+                        let w = line.trim().to_lowercase();
+                        if !w.is_empty() {
+                            dynamic_whitelist.insert(w);
+                        }
+                    }
+                    if !dynamic_whitelist.is_empty() {
+                        break;
                     }
                 }
             }
@@ -830,7 +858,13 @@ impl AiModerator {
         if history.len() > MAX_CHANNELS_TRACKED {
             history.retain(|_, v| !v.is_empty());
             if history.len() > MAX_CHANNELS_TRACKED {
-                history.clear();
+                // Evict only the least recently active channel (oldest timestamp)
+                if let Some((&oldest_cid, _)) = history
+                    .iter()
+                    .min_by_key(|(_, q)| q.back().map(|e| e.timestamp_unix).unwrap_or(0))
+                {
+                    history.remove(&oldest_cid);
+                }
             }
         }
         let queue = history.entry(channel_id).or_insert_with(|| VecDeque::with_capacity(MAX_CONTEXT_HISTORY + 2));
@@ -938,17 +972,21 @@ impl AiModerator {
         for (i, _) in text_lower.match_indices(&target_lower) {
             let prev_ok = if i == 0 {
                 true
-            } else {
-                let prev_char = text_lower[..i].chars().last();
+            } else if text_lower.is_char_boundary(i) {
+                let prev_char = text_lower[..i].chars().next_back();
                 prev_char.map(|c| !c.is_alphanumeric()).unwrap_or(true)
+            } else {
+                false
             };
 
             let end_idx = i + t_len;
             let next_ok = if end_idx >= text_lower.len() {
                 true
-            } else {
+            } else if text_lower.is_char_boundary(end_idx) {
                 let next_char = text_lower[end_idx..].chars().next();
                 next_char.map(|c| !c.is_alphanumeric()).unwrap_or(true)
+            } else {
+                false
             };
 
             if prev_ok && next_ok {
@@ -3354,6 +3392,8 @@ impl AiModerator {
 
         let mut models_to_try = vec![safe_preferred];
         for candidate in &[
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
             "gemini-flash-lite-latest",
@@ -3769,14 +3809,16 @@ impl AiModerator {
         }
 
         let mut models_to_try = vec![model];
-        if !models_to_try.contains(&"openai/gpt-oss-120b") {
-            models_to_try.push("openai/gpt-oss-120b");
-        }
-        if !models_to_try.contains(&"qwen/qwen3.8-27b") {
-            models_to_try.push("qwen/qwen3.8-27b");
-        }
-        if !models_to_try.contains(&"openai/gpt-oss-20b") {
-            models_to_try.push("openai/gpt-oss-20b");
+        for candidate in &[
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+            "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+        ] {
+            if !models_to_try.contains(candidate) {
+                models_to_try.push(candidate);
+            }
         }
 
         let start_idx = groq_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
