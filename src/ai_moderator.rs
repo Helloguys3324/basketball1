@@ -60,6 +60,11 @@ const GAME_SHIELD_PATTERNS: &[&str] = &[
 
 static OPENAI_COOLDOWN_UNTIL: AtomicU64 = AtomicU64::new(0);
 
+const EXTREME_REAL_HARM_KEYWORDS: &[&str] = &[
+    "burn alive", "burned alive", "сжечь заживо", "расчленить", "расчленю",
+    "slit your throat", "перережу горло", "вскрою горло", "сожгу твой дом", "сожгу тебя заживо"
+];
+
 const COMMON_NON_NAMES: &[&str] = &[
     "ill", "i'll", "im", "i'm", "ive", "i've", "id", "i'd",
     "someone", "somone", "somebody", "something", "nobody", "anyone", "anything",
@@ -134,6 +139,9 @@ SMART BANTER vs FAKE-GAME SHIELD BYPASS:\n\
   Standalone casual profanity and common gaming insults ('fuck you', 'fuck u', 'stfu', 'fuck off', 'screw you', 'bitch', 'asshole', 'idiot', 'dumb') WITHOUT death wishes (kys/die) and WITHOUT slurs -> ALWAYS ALLOW (RULE: None, MUTE: 0). NEVER classify standalone 'fuck you' or 'stfu' as Harassment or Minor/Mild!\n\
   POST-IRONY, THEATRICAL HYPERBOLE & DRAMATIC TRASHTALK ('i will eviscerate you', 'i will obliterate you', 'im gonna demolish/annihilate/vaporize you', 'i will tear you to pieces', 'я тебя расщеплю на атомы/разорву/сотру в порошок'): These are 100% POST-IRONIC JOKES and comic gaming exaggeration between members, NOT credible real-world violence! Real threats involve real-world stalking, doxxing, addresses, weapons, or dates. NEVER punish cartoonish/fantasy threats like 'i will eviscerate you'! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
   PLAYFUL WARNINGS & HYPERBOLIC BANTER ('say yo one more time and ur done for', 'say that again and you\'re cooked', 'ur done for', 'you\'re done for', 'ur cooked', 'you\'re cooked', 'you\'re toast', 'it\'s over for you', 'тебе конец', 'тебе хана'): Standard conversational memes, comedic teasing, and harmless exaggeration between Discord members. They are NEVER credible threats of real-world violence! Unless accompanied by real-world personal information, physical addresses, weapons, or extortion, ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
+  CASUAL SLANG & POPULAR IDIOMS ('hoes', 'thot', 'simp', 'bitch', 'no hoes', 'u get loads of hoes', 'hoes mad', 'bros before hoes'): These are standard internet/hip-hop slang and comedic memes, NOT hate speech or racial slurs! NEVER classify 'hoes', 'loads of hoes', or 'bitch' as Crit or Hate Speech! Phrases like 'u get loads of hoes', 'bros before hoes', 'no hoes' -> ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
+  FICTIONAL PLOTS, ANIME/MANGA NARRATIVE & SPOILERS ('||...||'): Recounting anime/manga/movie storylines, fiction, or spoilers in '||...||' (e.g. cannibalism, killings/dies in Chainsaw Man, Tokyo Ghoul, Hunter x Hunter quests like 'kill 5 chrollo') is fictional storytelling and RPG discussion, NOT real-world violence! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
+  SENDING IN-GAME CHARACTERS / ROBLOX STANDS ('i\'m sending current aba wb after u', 'sending mahoraga after you', 'sending goku after u'): In Roblox anime games (ABA = Anime Battle Arena, WB = Whitebeard), players constantly joke about sending in-game characters/avatars after each other in-game. This is 100% in-game gaming trashtalk, NOT real-world physical violence! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
   IN-GAME 'KILL' & PVP TRASHTALK ('i will kill you', 'im gonna kill you', 'let me kill you', 'i will kill you if you throw', 'i will kill you in 1v1'): When the conversation context involves games, matches, ranks, characters, PvP, gameplay, anime, or gaming banter ('stop stealing my kills', 'one match till rankup', '1v1 me', 'playing together'): These refer to IN-GAME CHARACTER DEATH or gaming frustration between players, NOT real-world murder! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). Only punish 'kill' if it threatens REAL-WORLD physical harm (e.g. 'i know where you live and will kill you', real-life stalking, weapons, dates).\n\
   THIRD-PERSON GAMING CALLOUTS & PVP DIRECTIVES ('kill him', 'kill her', 'kill them', 'kill it', 'shoot him', 'get him', 'focus him', 'finish him', 'убей его', 'добивай', 'завали его'): These are standard tactical PvP/gaming callouts, spectator banter, or stream clip reactions referring to opponents, in-game characters, bosses, or enemies! They are NEVER real-world death threats! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0). NEVER classify 'kill him/her/them' as Direct death threat, Harassment, or Violence!\n\
   ROBLOX & GAMING PVP / HUNTING BANTER ('I will find you and kill you', 'im gonna find u and kill u in roblox', 'найду тебя и убью'): In this Discord community, members constantly play Roblox and competitive multiplayer games. Phrases like 'I will find you and kill you', 'im gonna find you and destroy you in roblox', 'найду тебя на сервере и убью' are completely standard in-game hunting trashtalk referring to finding the player's avatar in Roblox or hunting them in a match! ALWAYS analyze context deeply. Unless someone specifies REAL-WORLD personal details (real physical address, city, street, school, phone, real full name, swatting, IRL weapons, leaked IP) or demands real-world extortion/money, statements like 'I will find you and kill you' must be treated as in-game Roblox hunting banter! ALWAYS VERDICT: ALLOW (RULE: None, MUTE: 0).\n\
@@ -1086,7 +1094,10 @@ impl AiModerator {
             || (lower.contains("найду тебя") && (lower.contains("убью") || lower.contains("уничтожу")))
             || (lower.contains("find you") && (lower.contains("kill") || lower.contains("destroy")))
             || (lower.contains("kill you") && (lower.contains("if you throw") || lower.contains("in 1v1") || lower.contains("if you feed") || lower.contains("if we lose") || lower.contains("if you miss")))
-            || (lower.contains("убью") && (lower.contains("если сольешь") || lower.contains("если проиграем") || lower.contains("в 1v1") || lower.contains("1 на 1")));
+            || (lower.contains("убью") && (lower.contains("если сольешь") || lower.contains("если проиграем") || lower.contains("в 1v1") || lower.contains("1 на 1")))
+            || (lower.contains("sending") && (lower.contains("after u") || lower.contains("after you")))
+            || lower.contains("aba wb")
+            || (lower.contains("we gonna kill you") || lower.contains("we're gonna kill you") || lower.contains("im gonna kill you") || lower.contains("i will kill you"));
 
         if !has_hunting_phrase {
             return false;
@@ -1166,6 +1177,10 @@ impl AiModerator {
         ];
 
         if META_PREFIXES.iter().any(|prefix| trimmed_lower.starts_with(prefix)) {
+            return true;
+        }
+
+        if trimmed_lower.starts_with("||") && trimmed_lower.ends_with("||") {
             return true;
         }
 
@@ -2157,8 +2172,23 @@ impl AiModerator {
                                     mute_minutes: if decision.mute_minutes > 0 { decision.mute_minutes } else { 120 },
                                 };
                             }
-                            let effective_mute = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { 1 } else { decision.mute_minutes };
-                            let effective_rule = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { "Minor/Mild (Provocative Bait)".to_string() } else { decision.rule };
+                            let mut effective_mute = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { 1 } else { decision.mute_minutes };
+                            let mut effective_rule = if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword { "Minor/Mild (Provocative Bait)".to_string() } else { decision.rule };
+
+                            // Prevent false Crit 1440m on casual slang like 'u get loads of hoes'
+                            if (effective_rule.contains("Crit") || effective_mute >= 1440) && !has_slur {
+                                let lower_msg = trimmed.to_lowercase();
+                                if lower_msg.contains("hoes") || lower_msg.contains("hoe") || lower_msg.contains("thot") || lower_msg.contains("simp") {
+                                    if lower_msg.contains("get loads of hoes") || lower_msg.contains("loads of hoes") || lower_msg.contains("no hoes") || lower_msg.contains("bros before hoes") || lower_msg.contains("got hoes") || lower_msg.contains("hoes mad") {
+                                        println!("   🛡️ [SLANG BANTER GUARD] Overriding false Crit on casual slang ('{}') to ALLOW.", trimmed);
+                                        self.add_to_whitelist(trimmed).await;
+                                        return ModerationVerdict::Allow;
+                                    } else {
+                                        effective_mute = 10;
+                                        effective_rule = "Minor/Mod (Slang)".to_string();
+                                    }
+                                }
+                            }
                             println!("   ⚠️ [AI VERDICT: SUSPICIOUS] Flagged for mod review + auto-timeout: {}m (Rule: {})", effective_mute, effective_rule);
                             let model_label = if model_used.contains("120b") {
                                 format!("{} (120B Deep Drama Arbiter)", model_used)
@@ -2500,8 +2530,23 @@ impl AiModerator {
                             return ModerationVerdict::Allow;
                         }
                     }
-                    let effective_mute = if has_slur { 1440 } else { decision.mute_minutes };
-                    let effective_rule = if has_slur { "Crit (Slurs)".to_string() } else { decision.rule };
+                    let mut effective_mute = if has_slur { 1440 } else { decision.mute_minutes };
+                    let mut effective_rule = if has_slur { "Crit (Slurs)".to_string() } else { decision.rule };
+
+                    // Prevent false Crit 1440m on casual slang like 'u get loads of hoes'
+                    if (effective_rule.contains("Crit") || effective_mute >= 1440) && !has_slur {
+                        let lower_msg = trimmed.to_lowercase();
+                        if lower_msg.contains("hoes") || lower_msg.contains("hoe") || lower_msg.contains("thot") || lower_msg.contains("simp") {
+                            if lower_msg.contains("get loads of hoes") || lower_msg.contains("loads of hoes") || lower_msg.contains("no hoes") || lower_msg.contains("bros before hoes") || lower_msg.contains("got hoes") || lower_msg.contains("hoes mad") {
+                                println!("   🛡️ [SLANG BANTER GUARD] Overriding false Crit on casual slang ('{}') to ALLOW.", trimmed);
+                                self.add_to_whitelist(trimmed).await;
+                                return ModerationVerdict::Allow;
+                            } else {
+                                effective_mute = 10;
+                                effective_rule = "Minor/Mod (Slang)".to_string();
+                            }
+                        }
+                    }
                     let effective_reason = if has_slur { format!("Racial/hate slur or masked evasion detected in message: \"{}\"", trimmed) } else { decision.reason };
                     println!("   🚨 [AI VERDICT: DELETE] Confirmed severe violation in grey zone! Mute: {}m (Rule: {})", effective_mute, effective_rule);
                     let model_label = if model_used.contains("120b") {
@@ -2655,10 +2700,11 @@ impl AiModerator {
                             mute_minutes: 120,
                         };
                     }
-                    if has_severe_harm_keyword && !is_pvp_callout && !is_meta && !Self::is_game_hunting_or_pvp_threat(trimmed) {
-                        println!("   🚨 [SEVERE HARM GUARD] Overriding LLM ALLOW for severe harm threat ('{}') -> DeleteConfirmed(120m)", trimmed);
+                    let has_extreme_harm = EXTREME_REAL_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
+                    if has_extreme_harm && !is_meta && !Self::is_theatrical_hyperbole(trimmed) {
+                        println!("   🚨 [SEVERE HARM GUARD] Overriding LLM ALLOW for extreme real-world violence threat ('{}') -> DeleteConfirmed(120m)", trimmed);
                         return ModerationVerdict::DeleteConfirmed {
-                            reason: format!("Severe harm or death threat detected: \"{}\"", trimmed),
+                            reason: format!("Extreme real-world violence threat detected: \"{}\"", trimmed),
                             score: if max_score > 0.5 { max_score } else { 0.95 },
                             category: "violence".to_string(),
                             model_used: format!("Severe Harm Guard ({})", model_used),
@@ -4703,6 +4749,8 @@ mod tests {
         assert!(AiModerator::is_game_hunting_or_pvp_threat("im gonna find u and kill u"));
         assert!(AiModerator::is_game_hunting_or_pvp_threat("найду тебя и убью в роблоксе"));
         assert!(AiModerator::is_game_hunting_or_pvp_threat("найду тебя на сервере и убью"));
+        assert!(AiModerator::is_game_hunting_or_pvp_threat("i'm sending current aba wb after u"));
+        assert!(AiModerator::is_game_hunting_or_pvp_threat("We gonna kill you man"));
 
         // If real-world address/IRL indicators exist, it's NOT just game hunting!
         assert!(!AiModerator::is_game_hunting_or_pvp_threat("I will find your house in real life and kill you"));
