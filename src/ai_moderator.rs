@@ -409,6 +409,8 @@ struct GroqMessageContent {
     content: String,
     #[serde(default)]
     reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3439,11 +3441,11 @@ impl AiModerator {
 
         let mut models_to_try = vec![preferred_model];
         for candidate in &[
-            "deepseek-ai/deepseek-v4.1-flash",
-            "meta/llama-3.3-70b-instruct",
-            "deepseek-ai/deepseek-r1",
-            "nvidia/llama-3.1-nemotron-70b-instruct",
-            "mistralai/mistral-large-2-instruct",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            "meta/llama-3.2-11b-vision-instruct",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "openai/gpt-oss-20b",
         ] {
             if !models_to_try.contains(candidate) {
                 models_to_try.push(candidate);
@@ -3490,7 +3492,16 @@ impl AiModerator {
                                 if let Ok(body) = serde_json::from_str::<GroqChatResponse>(&raw_json) {
                                     if let Some(choice) = body.choices.first() {
                                         let elapsed_ms = start_time.elapsed().as_millis();
-                                        return Ok((choice.message.content.clone(), target_model.to_string(), elapsed_ms));
+                                        let text_out = if !choice.message.content.trim().is_empty() {
+                                            choice.message.content.clone()
+                                        } else if let Some(ref r) = choice.message.reasoning_content {
+                                            r.clone()
+                                        } else if let Some(ref r) = choice.message.reasoning {
+                                            r.clone()
+                                        } else {
+                                            choice.message.content.clone()
+                                        };
+                                        return Ok((text_out, target_model.to_string(), elapsed_ms));
                                     }
                                 }
                             }
@@ -3813,8 +3824,6 @@ impl AiModerator {
             "openai/gpt-oss-120b",
             "qwen/qwen3.8-27b",
             "openai/gpt-oss-20b",
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
         ] {
             if !models_to_try.contains(candidate) {
                 models_to_try.push(candidate);
