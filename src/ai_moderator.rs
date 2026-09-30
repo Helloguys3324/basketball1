@@ -3392,13 +3392,13 @@ impl AiModerator {
 
         let mut models_to_try = vec![safe_preferred];
         for candidate in &[
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
             "gemini-flash-lite-latest",
-            "gemma-4-31b-it",
             "gemini-2.5-flash-lite",
+            "gemma-4-31b-it",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
         ] {
             if !models_to_try.contains(candidate) {
                 models_to_try.push(candidate);
