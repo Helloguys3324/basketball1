@@ -64,7 +64,6 @@ const EXTREME_REAL_HARM_KEYWORDS: &[&str] = &[
     "burn alive", "burned alive", "сжечь заживо", "расчленить", "расчленю",
     "slit your throat", "перережу горло", "вскрою горло", "сожгу твой дом", "сожгу тебя заживо"
 ];
-
 const COMMON_NON_NAMES: &[&str] = &[
     "ill", "i'll", "im", "i'm", "ive", "i've", "id", "i'd",
     "someone", "somone", "somebody", "something", "nobody", "anyone", "anything",
@@ -2020,39 +2019,6 @@ impl AiModerator {
                                     mute_minutes: 1440,
                                 };
                             }
-                            if (top_cat == "hate" || top_cat == "hate/threatening" || cat_breakdown.contains("hate: 0.8") || cat_breakdown.contains("hate: 0.9") || cat_breakdown.contains("hate: 1.0") || cat_breakdown.contains("hate/threatening: 0.8") || cat_breakdown.contains("hate/threatening: 0.9") || cat_breakdown.contains("hate/threatening: 1.0")) && max_score > 0.80 && !is_meta {
-                                println!("   🚨 [HATE SPEECH GUARD] Overriding LLM ALLOW for severe hate speech/hate-threatening violation (score {:.2}) -> DELETE(1440m)", max_score);
-                                return ModerationVerdict::DeleteConfirmed {
-                                    reason: format!("{}: Hate speech inciting violence or racial hatred", top_cat),
-                                    score: max_score,
-                                    category: top_cat,
-                                    model_used: format!("OpenAI Omni-Mod Guard ({})", model_used),
-                                    rule_violated: "Crit (Hate Speech)".to_string(),
-                                    mute_minutes: 1440,
-                                };
-                            }
-                            if has_dox_threat && !is_meta {
-                                println!("   🚨 [DOX GUARD] Overriding LLM ALLOW for direct doxxing/extortion threat ('{}') -> DELETE(120m)", trimmed);
-                                return ModerationVerdict::DeleteConfirmed {
-                                    reason: format!("Doxxing, blackmail, or personal info leak threat detected: \"{}\"", trimmed),
-                                    score: if max_score > 0.5 { max_score } else { 0.95 },
-                                    category: "harassment/threatening".to_string(),
-                                    model_used: format!("Dox Guard ({})", model_used),
-                                    rule_violated: "Major (Threats/Doxx)".to_string(),
-                                    mute_minutes: 120,
-                                };
-                            }
-                            if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_meta {
-                                println!("   ⚠️ [PROVOCATIVE BAIT GUARD] Overriding LLM ALLOW on provocative bait ('{}') -> SUSPICIOUS(1m)", trimmed);
-                                return ModerationVerdict::FlagSuspicious {
-                                    reason: format!("Provocative gender bait / trolling: \"{}\"", trimmed),
-                                    score: if max_score > 0.3 { max_score } else { 0.5 },
-                                    category: "harassment".to_string(),
-                                    model_used: format!("Bait Guard ({})", model_used),
-                                    rule_violated: "Minor/Mild (Provocative Bait)".to_string(),
-                                    mute_minutes: 1,
-                                };
-                            }
                             if Self::is_direct_death_wish(trimmed) && !is_meta {
                                 println!("   🚨 [DEATH WISH GUARD] Overriding LLM ALLOW for direct death wish ('{}') -> SUSPICIOUS(30m)", trimmed);
                                 return ModerationVerdict::FlagSuspicious {
@@ -2064,7 +2030,34 @@ impl AiModerator {
                                     mute_minutes: 30,
                                 };
                             }
-                            println!("   ✅ [BANTER PASS] LLM verified message as safe gaming hyperbole -> ALLOW");
+                            let is_split_real_threat = (combined_lower.contains("find you") || combined_lower.contains("find u") || combined_lower.contains("найду"))
+                                && (combined_lower.contains("shoot") || combined_lower.contains("пристрелю") || combined_lower.contains("stab") || combined_lower.contains("зарежу"))
+                                && !is_meta
+                                && !Self::is_game_hunting_or_pvp_threat(&combined_text);
+                            if is_split_real_threat {
+                                println!("   🚨 [SPLIT THREAT GUARD] Overriding LLM ALLOW for author-split physical threat ('{}') -> DeleteConfirmed(120m)", combined_text);
+                                return ModerationVerdict::DeleteConfirmed {
+                                    reason: format!("Split physical violence/stalking threat detected across messages: \"{}\"", combined_text),
+                                    score: 0.95,
+                                    category: "violence".to_string(),
+                                    model_used: format!("Split Threat Guard ({})", model_used),
+                                    rule_violated: "Major (Threats/Harm)".to_string(),
+                                    mute_minutes: 120,
+                                };
+                            }
+                            let has_extreme_harm = EXTREME_REAL_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
+                            if has_extreme_harm && !is_meta && !Self::is_theatrical_hyperbole(trimmed) {
+                                println!("   🚨 [EXTREME HARM GUARD] Overriding LLM ALLOW for extreme violence threat ('{}') -> DeleteConfirmed(120m)", trimmed);
+                                return ModerationVerdict::DeleteConfirmed {
+                                    reason: format!("Extreme real-world violence threat detected: \"{}\"", trimmed),
+                                    score: if max_score > 0.5 { max_score } else { 0.95 },
+                                    category: "violence".to_string(),
+                                    model_used: format!("Extreme Harm Guard ({})", model_used),
+                                    rule_violated: "Major (Threats/Harm)".to_string(),
+                                    mute_minutes: 120,
+                                };
+                            }
+                            println!("   ✅ [ALLOW] Message allowed by LLM.");
                             self.add_to_whitelist(trimmed).await;
                             return ModerationVerdict::Allow;
                         } else if is_meta && !is_directed {
@@ -2678,18 +2671,22 @@ impl AiModerator {
                             mute_minutes: 1440,
                         };
                     }
-                    if has_dox_threat && !is_meta {
-                        println!("   🚨 [DOX GUARD] Overriding LLM ALLOW for direct doxxing/extortion threat in grey zone ('{}') -> DELETE(120m)", trimmed);
-                        return ModerationVerdict::DeleteConfirmed {
-                            reason: format!("Doxxing, blackmail, or personal info leak threat detected: \"{}\"", trimmed),
-                            score: if max_score > 0.5 { max_score } else { 0.95 },
+                    if Self::is_direct_death_wish(trimmed) && !is_meta {
+                        println!("   🚨 [DEATH WISH GUARD] Overriding LLM ALLOW for direct death wish ('{}') -> SUSPICIOUS(30m)", trimmed);
+                        return ModerationVerdict::FlagSuspicious {
+                            reason: format!("Direct death wish/suicide incitement: \"{}\"", trimmed),
+                            score: if max_score > 0.3 { max_score } else { 0.8 },
                             category: "harassment/threatening".to_string(),
-                            model_used: format!("Dox Guard ({})", model_used),
-                            rule_violated: "Major (Threats/Doxx)".to_string(),
-                            mute_minutes: 120,
+                            model_used: format!("Death Wish Guard ({})", model_used),
+                            rule_violated: "Crit (Death Wishes)".to_string(),
+                            mute_minutes: 30,
                         };
                     }
-                    if (combined_lower.contains("find you") || combined_lower.contains("find u") || combined_lower.contains("найду")) && (combined_lower.contains("shoot") || combined_lower.contains("пристрелю") || combined_lower.contains("stab") || combined_lower.contains("зарежу")) && !is_meta {
+                    let is_split_real_threat = (combined_lower.contains("find you") || combined_lower.contains("find u") || combined_lower.contains("найду"))
+                        && (combined_lower.contains("shoot") || combined_lower.contains("пристрелю") || combined_lower.contains("stab") || combined_lower.contains("зарежу"))
+                        && !is_meta
+                        && !Self::is_game_hunting_or_pvp_threat(&combined_text);
+                    if is_split_real_threat {
                         println!("   🚨 [SPLIT THREAT GUARD] Overriding LLM ALLOW for author-split physical threat ('{}') -> DeleteConfirmed(120m)", combined_text);
                         return ModerationVerdict::DeleteConfirmed {
                             reason: format!("Split physical violence/stalking threat detected across messages: \"{}\"", combined_text),
@@ -2702,36 +2699,14 @@ impl AiModerator {
                     }
                     let has_extreme_harm = EXTREME_REAL_HARM_KEYWORDS.iter().any(|k| lower.contains(k));
                     if has_extreme_harm && !is_meta && !Self::is_theatrical_hyperbole(trimmed) {
-                        println!("   🚨 [SEVERE HARM GUARD] Overriding LLM ALLOW for extreme real-world violence threat ('{}') -> DeleteConfirmed(120m)", trimmed);
+                        println!("   🚨 [EXTREME HARM GUARD] Overriding LLM ALLOW for extreme violence threat ('{}') -> DeleteConfirmed(120m)", trimmed);
                         return ModerationVerdict::DeleteConfirmed {
                             reason: format!("Extreme real-world violence threat detected: \"{}\"", trimmed),
                             score: if max_score > 0.5 { max_score } else { 0.95 },
                             category: "violence".to_string(),
-                            model_used: format!("Severe Harm Guard ({})", model_used),
+                            model_used: format!("Extreme Harm Guard ({})", model_used),
                             rule_violated: "Major (Threats/Harm)".to_string(),
                             mute_minutes: 120,
-                        };
-                    }
-                    if has_provocative_bait && !has_slur && !has_dox_threat && !has_severe_harm_keyword && !is_meta {
-                        println!("   ⚠️ [PROVOCATIVE BAIT GUARD] Overriding LLM ALLOW on provocative bait ('{}') -> SUSPICIOUS(1m)", trimmed);
-                        return ModerationVerdict::FlagSuspicious {
-                            reason: format!("Provocative gender bait / trolling: \"{}\"", trimmed),
-                            score: if max_score > 0.3 { max_score } else { 0.5 },
-                            category: "harassment".to_string(),
-                            model_used: format!("Bait Guard ({})", model_used),
-                            rule_violated: "Minor/Mild (Provocative Bait)".to_string(),
-                            mute_minutes: 1,
-                        };
-                    }
-                    if Self::is_direct_death_wish(trimmed) && !is_meta {
-                        println!("   🚨 [DEATH WISH GUARD] Overriding LLM ALLOW for direct death wish ('{}') -> SUSPICIOUS(30m)", trimmed);
-                        return ModerationVerdict::FlagSuspicious {
-                            reason: format!("Direct death wish/suicide incitement: \"{}\"", trimmed),
-                            score: if max_score > 0.3 { max_score } else { 0.8 },
-                            category: "harassment/threatening".to_string(),
-                            model_used: format!("Death Wish Guard ({})", model_used),
-                            rule_violated: "Crit (Death Wishes)".to_string(),
-                            mute_minutes: 30,
                         };
                     }
                     println!("   ✅ [ALLOW] Grey-zone message allowed by LLM.");
