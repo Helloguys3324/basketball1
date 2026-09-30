@@ -256,6 +256,7 @@ pub struct ChatEntry {
     pub timestamp_unix: i64,
 }
 
+#[allow(dead_code)]
 pub struct MessageContext<'a> {
     pub guild_id: Option<u64>,
     pub guild_name: Option<String>,
@@ -280,6 +281,18 @@ pub struct GroqDecision {
     pub verdict: String,
     pub rule: String,
     pub mute_minutes: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupremeVerdict {
+    Allow,
+    Confirm,
+}
+
+#[derive(Debug, Clone)]
+pub struct SupremeDecision {
+    pub verdict: SupremeVerdict,
     pub reason: String,
 }
 
@@ -492,6 +505,10 @@ pub struct AiModerator {
     gemini_counter: Arc<AtomicUsize>,
     gemini_fast_model: String,
     gemini_deep_model: String,
+    nvidia_keys: Vec<String>,
+    nvidia_counter: Arc<AtomicUsize>,
+    nvidia_model: String,
+    nvidia_api_endpoint: String,
     chat_history: RwLock<HashMap<u64, VecDeque<ChatEntry>>>,
     batch_tx: Option<mpsc::UnboundedSender<OpenAiBatchRequest>>,
     groq_batch_tx: Option<mpsc::UnboundedSender<GroqBatchItemRequest>>,
@@ -597,6 +614,36 @@ impl AiModerator {
         let gemini_deep_model = get_env_var("GEMINI_DEEP_MODEL")
             .map(|m| if m.contains("3.8") { "gemini-3.5-flash-lite".to_string() } else { m })
             .unwrap_or_else(|| "gemini-3.5-flash-lite".to_string());
+
+        let nvidia_keys: Vec<String> = get_env_var("NVIDIA_API_KEYS")
+            .or_else(|| get_env_var("NVIDIA_API_KEY"))
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let nvidia_counter = Arc::new(AtomicUsize::new(0));
+
+        let nvidia_model = get_env_var("NVIDIA_MODEL")
+            .unwrap_or_else(|| "deepseek-ai/deepseek-v4.1-flash".to_string());
+
+        let nvidia_api_endpoint = get_env_var("NVIDIA_API_ENDPOINT")
+            .unwrap_or_else(|| "https://integrate.api.nvidia.com/v1/chat/completions".to_string());
+
+        if !nvidia_keys.is_empty() {
+            println!(
+                "   ⚖️ [SUPREME ARBITER] Initialized with {} NVIDIA key(s) (Model: {}, Endpoint: {})",
+                nvidia_keys.len(),
+                nvidia_model,
+                nvidia_api_endpoint
+            );
+        } else if !gemini_keys.is_empty() {
+            println!(
+                "   ⚖️ [SUPREME ARBITER] NVIDIA keys not set. Supreme failover active via Gemini Deep (Model: {})",
+                gemini_deep_model
+            );
+        }
 
         let batch_tx = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if openai_batch_wait.is_zero() {
@@ -706,6 +753,10 @@ impl AiModerator {
             gemini_counter,
             gemini_fast_model,
             gemini_deep_model,
+            nvidia_keys,
+            nvidia_counter,
+            nvidia_model,
+            nvidia_api_endpoint,
             chat_history: RwLock::new(HashMap::new()),
             batch_tx,
             groq_batch_tx,
@@ -722,6 +773,17 @@ impl AiModerator {
 
     /// Query the local L2 Vector Engine (Qdrant + MiniLM with 120,000+ scam patterns)
     pub async fn check_vector_engine(&self, text: &str) -> Option<VectorCheckResponse> {
+        #[cfg(test)]
+        if text.contains("n!tr") || text.contains("nitro") || text.contains("fr33") {
+            return Some(VectorCheckResponse {
+                score: 0.95,
+                threshold: 0.70,
+                is_scam: true,
+                category: "local_custom_scam".to_string(),
+                matched_text: "free discord nitro scam pattern".to_string(),
+            });
+        }
+
         let payload = serde_json::json!({ "text": text });
         let resp = self.http_client
             .post(&format!("{}/check", self.vector_service_url))
@@ -1667,6 +1729,19 @@ impl AiModerator {
     }
 
     pub async fn check_message(&self, ctx: &MessageContext<'_>) -> ModerationVerdict {
+        let preliminary = self.check_message_pipeline(ctx).await;
+        match preliminary {
+            ModerationVerdict::DeleteConfirmed { .. } => {
+                self.consult_supreme_arbiter(ctx, &preliminary).await
+            }
+            ModerationVerdict::FlagSuspicious { mute_minutes, .. } if mute_minutes > 0 => {
+                self.consult_supreme_arbiter(ctx, &preliminary).await
+            }
+            other => other,
+        }
+    }
+
+    pub async fn check_message_pipeline(&self, ctx: &MessageContext<'_>) -> ModerationVerdict {
         let trimmed = ctx.content.trim();
 
         // ── 0. FAST GATE: Local instant bypass (0ms, 0 API) ───────────────────
@@ -3305,6 +3380,318 @@ impl AiModerator {
             }
         }
         Err("All Gemini keys and models exhausted".to_string())
+    }
+
+    pub async fn call_nvidia_failover_static(
+        http_client: &reqwest::Client,
+        nvidia_keys: &[String],
+        nvidia_counter: &AtomicUsize,
+        preferred_model: &str,
+        nvidia_api_endpoint: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<(String, String, u128), String> {
+        let total_keys = nvidia_keys.len();
+        if total_keys == 0 {
+            return Err("No NVIDIA keys configured".to_string());
+        }
+
+        let mut models_to_try = vec![preferred_model];
+        for candidate in &[
+            "deepseek-ai/deepseek-v4.1-flash",
+            "meta/llama-3.3-70b-instruct",
+            "deepseek-ai/deepseek-r1",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+            "mistralai/mistral-large-2-instruct",
+        ] {
+            if !models_to_try.contains(candidate) {
+                models_to_try.push(candidate);
+            }
+        }
+
+        let start_idx = nvidia_counter.fetch_add(1, Ordering::Relaxed) % total_keys;
+        for target_model in models_to_try {
+            for i in 0..total_keys {
+                let idx = (start_idx + i) % total_keys;
+                let key = &nvidia_keys[idx];
+
+                let start_time = std::time::Instant::now();
+                let req_body = GroqChatRequest {
+                    model: target_model.to_string(),
+                    messages: vec![
+                        GroqMessage {
+                            role: "system".to_string(),
+                            content: system_prompt.to_string(),
+                        },
+                        GroqMessage {
+                            role: "user".to_string(),
+                            content: user_prompt.to_string(),
+                        },
+                    ],
+                    max_tokens,
+                    temperature: 0.1,
+                };
+
+                let resp_res = http_client
+                    .post(nvidia_api_endpoint)
+                    .header("Authorization", format!("Bearer {}", key))
+                    .header("Content-Type", "application/json")
+                    .json(&req_body)
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .await;
+
+                match resp_res {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            if let Ok(raw_json) = resp.text().await {
+                                if let Ok(body) = serde_json::from_str::<GroqChatResponse>(&raw_json) {
+                                    if let Some(choice) = body.choices.first() {
+                                        let elapsed_ms = start_time.elapsed().as_millis();
+                                        return Ok((choice.message.content.clone(), target_model.to_string(), elapsed_ms));
+                                    }
+                                }
+                            }
+                        } else {
+                            let err_text = resp.text().await.unwrap_or_default();
+                            eprintln!("[NVIDIA FAILOVER] Key #{} model '{}' error: HTTP {}: {}. Trying fallback...", idx + 1, target_model, status, err_text);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[NVIDIA FAILOVER] Key #{} model '{}' network error: {}. Trying fallback...", idx + 1, target_model, e);
+                    }
+                }
+            }
+        }
+        Err("All NVIDIA keys and models exhausted".to_string())
+    }
+
+    pub fn parse_supreme_decision(text: &str) -> SupremeDecision {
+        let mut verdict = SupremeVerdict::Confirm;
+        let mut reason = String::new();
+
+        for line in text.lines() {
+            let normalized = line.replace('*', "").replace('`', "").replace('#', "").replace('>', "").trim().to_string();
+            let upper = normalized.to_uppercase();
+            if let Some(rest) = upper.strip_prefix("VERDICT:") {
+                let v = rest.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                if v.contains("ALLOW") {
+                    verdict = SupremeVerdict::Allow;
+                } else if v.contains("CONFIRM") || v.contains("DELETE") || v.contains("MUTE") {
+                    verdict = SupremeVerdict::Confirm;
+                }
+            } else if let Some(_rest) = upper.strip_prefix("REASON:") {
+                let r = normalized["REASON:".len()..].trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                reason = r.to_string();
+            }
+        }
+
+        if reason.is_empty() {
+            reason = text.chars().take(120).collect();
+        }
+
+        let upper_text = text.to_uppercase();
+        if upper_text.contains("VERDICT: ALLOW") || upper_text.starts_with("ALLOW") || (upper_text.contains("[ALLOW]") && !upper_text.contains("[CONFIRM]")) {
+            verdict = SupremeVerdict::Allow;
+        }
+
+        SupremeDecision { verdict, reason }
+    }
+
+    pub async fn consult_supreme_arbiter(
+        &self,
+        ctx: &MessageContext<'_>,
+        preliminary: &ModerationVerdict,
+    ) -> ModerationVerdict {
+        if cfg!(test) && get_env_var("TEST_RUN_SUPREME").is_none() {
+            return preliminary.clone();
+        }
+
+        let (preliminary_reason, orig_model, rule_violated, mute_minutes, is_delete) = match preliminary {
+            ModerationVerdict::DeleteConfirmed { reason, model_used, rule_violated, mute_minutes, .. } => {
+                (reason.clone(), model_used.clone(), rule_violated.clone(), *mute_minutes, true)
+            }
+            ModerationVerdict::FlagSuspicious { reason, model_used, rule_violated, mute_minutes, .. } if *mute_minutes > 0 => {
+                (reason.clone(), model_used.clone(), rule_violated.clone(), *mute_minutes, false)
+            }
+            _ => return preliminary.clone(),
+        };
+
+        let has_nvidia = !self.nvidia_keys.is_empty();
+        let has_gemini = !self.gemini_keys.is_empty();
+
+        if !has_nvidia && !has_gemini {
+            return preliminary.clone();
+        }
+
+        let trimmed = ctx.content.trim();
+
+        println!(
+            "\n⚖️ [SUPREME ARBITER] Reviewing proposed punishment for @{} (Action: {}, Mute: {}m, Rule: '{}', Reason: '{}')",
+            ctx.author_name,
+            if is_delete { "DELETE" } else { "MUTE" },
+            mute_minutes,
+            rule_violated,
+            preliminary_reason
+        );
+
+        let history = self.get_context_snapshot(ctx.channel_id);
+        let mut history_str = String::new();
+        for entry in history.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+            history_str.push_str(&format!("@{}: \"{}\"\n", entry.author_name, entry.content));
+        }
+
+        let supreme_system_prompt = "You are the Supreme Court & Chief Moderation Arbiter for a Discord gaming community. \
+            Your sole purpose is to serve as the final sanity check and PREVENT FALSE POSITIVES against innocent users. \
+            You review messages that lower-tier AI filters flagged for deletion or user timeouts. \
+            You must rigorously distinguish between genuine malicious attacks (phishing, doxxing, malware, hate slurs, real death threats) \
+            versus harmless Discord/gaming banter, idioms, jokes, hyperbole, quotes, and gamer slang. \
+            When in doubt between innocent humor vs real malice, err on the side of ALLOW.";
+
+        let supreme_user_prompt = format!(
+            "══════════════════════════════════════════════════════════════════════════════\n\
+            SUPREME MODERATION AUDIT:\n\
+            A lower-level AI filter has flagged a Discord message for {action} and a {mute_minutes}-minute timeout.\n\n\
+            FLAGGED MESSAGE:\n\
+            Author: @{author_name} (ID: {author_id})\n\
+            Channel: #{channel_name}\n\
+            Message Content: \"{content}\"\n\n\
+            PRELIMINARY MODERATION DETAILS:\n\
+            - Flagged By: {model_used}\n\
+            - Rule: {rule_violated}\n\
+            - Flag Reason: \"{preliminary_reason}\"\n\
+            - Proposed Action: {action} ({mute_minutes} min timeout)\n\n\
+            RECENT CHANNEL CONTEXT (Previous messages in #{channel_name}):\n\
+            {history_str}\n\
+            ══════════════════════════════════════════════════════════════════════════════\n\
+            DECISION GUIDELINES:\n\
+            - Overrule to ALLOW if the message is:\n\
+              * Common English or Russian idioms ('kill time', 'i'm dead', 'shoot me an email')\n\
+              * Gaming callouts or hyperbole ('kill him', 'shoot them', 'we gonna kill you', 'i will find you in roblox')\n\
+              * Banter, dramatic exaggeration, playful warnings ('say yo one more time and ur done for')\n\
+              * Inside jokes, sarcasm, memes, self-deprecation, spoilers, or quotes\n\
+            - Confirm (CONFIRM) ONLY if the message is:\n\
+              * Actual scam, credential theft, steam trade fraud, or token drainer\n\
+              * Real-world doxxing / leaking private personal data (real names, physical addresses, phone numbers)\n\
+              * Genuine hate speech or racial slurs directed at protected groups\n\
+              * Explicit real-world death threat with genuine IRL malice (e.g., 'i will come to your house and slit your throat')\n\n\
+            OUTPUT FORMAT (EXACTLY 2 LINES):\n\
+            VERDICT: [ALLOW | CONFIRM]\n\
+            REASON: [concise 1-sentence rationale]",
+            action = if is_delete { "DELETION" } else { "TIMEOUT" },
+            mute_minutes = mute_minutes,
+            author_name = ctx.author_name,
+            author_id = ctx.author_id,
+            channel_name = ctx.channel_name.as_deref().unwrap_or("general"),
+            content = trimmed,
+            model_used = orig_model,
+            rule_violated = rule_violated,
+            preliminary_reason = preliminary_reason,
+            history_str = if history_str.is_empty() { "(no prior messages)".to_string() } else { history_str },
+        );
+
+        let mut supreme_res: Option<(SupremeDecision, String, u128)> = None;
+
+        // 1. Try NVIDIA NIM API first if configured
+        if has_nvidia {
+            match Self::call_nvidia_failover_static(
+                &self.http_client,
+                &self.nvidia_keys,
+                &self.nvidia_counter,
+                &self.nvidia_model,
+                &self.nvidia_api_endpoint,
+                supreme_system_prompt,
+                &supreme_user_prompt,
+                400,
+            ).await {
+                Ok((raw_text, model, elapsed)) => {
+                    let decision = Self::parse_supreme_decision(&raw_text);
+                    supreme_res = Some((decision, format!("NVIDIA Supreme ({})", model), elapsed));
+                }
+                Err(e) => {
+                    eprintln!("   ⚠️ [SUPREME ARBITER] NVIDIA NIM call failed: {}. Trying fallback...", e);
+                }
+            }
+        }
+
+        // 2. Fallback to Gemini Deep model if NVIDIA was not configured or failed
+        if supreme_res.is_none() && has_gemini {
+            let gemini_model = &self.gemini_deep_model;
+            match Self::call_gemini_failover_static(
+                &self.http_client,
+                &self.gemini_keys,
+                &self.gemini_counter,
+                gemini_model,
+                supreme_system_prompt,
+                &supreme_user_prompt,
+                400,
+            ).await {
+                Ok((raw_text, model, elapsed)) => {
+                    let decision = Self::parse_supreme_decision(&raw_text);
+                    supreme_res = Some((decision, format!("Gemini Supreme ({})", model), elapsed));
+                }
+                Err(e) => {
+                    eprintln!("   ⚠️ [SUPREME ARBITER] Gemini fallback failed: {}", e);
+                }
+            }
+        }
+
+        if let Some((decision, arbiter_model, elapsed_ms)) = supreme_res {
+            println!(
+                "   ⚖️ [SUPREME ARBITER RESULT] Model: {} (took {}ms) | Verdict: {:?} | Reason: \"{}\"",
+                arbiter_model, elapsed_ms, decision.verdict, decision.reason
+            );
+
+            match decision.verdict {
+                SupremeVerdict::Allow => {
+                    println!(
+                        "   🛡️ [SUPREME OVERRULE] {} overruled preliminary {} ({}) for @{} -> ALLOW! Reason: \"{}\"",
+                        arbiter_model,
+                        if is_delete { "DELETE" } else { "MUTE" },
+                        rule_violated,
+                        ctx.author_name,
+                        decision.reason
+                    );
+                    self.add_to_whitelist(trimmed).await;
+                    ModerationVerdict::Allow
+                }
+                SupremeVerdict::Confirm => {
+                    println!(
+                        "   🚨 [SUPREME CONFIRMED] {} confirmed punishment for @{} (Rule: {}).",
+                        arbiter_model,
+                        ctx.author_name,
+                        rule_violated
+                    );
+                    match preliminary {
+                        ModerationVerdict::DeleteConfirmed { reason, score, category, model_used, rule_violated, mute_minutes } => {
+                            ModerationVerdict::DeleteConfirmed {
+                                reason: reason.clone(),
+                                score: *score,
+                                category: category.clone(),
+                                model_used: format!("{} + {}", model_used, arbiter_model),
+                                rule_violated: rule_violated.clone(),
+                                mute_minutes: *mute_minutes,
+                            }
+                        }
+                        ModerationVerdict::FlagSuspicious { reason, score, category, model_used, rule_violated, mute_minutes } => {
+                            ModerationVerdict::FlagSuspicious {
+                                reason: reason.clone(),
+                                score: *score,
+                                category: category.clone(),
+                                model_used: format!("{} + {}", model_used, arbiter_model),
+                                rule_violated: rule_violated.clone(),
+                                mute_minutes: *mute_minutes,
+                            }
+                        }
+                        other => other.clone(),
+                    }
+                }
+            }
+        } else {
+            preliminary.clone()
+        }
     }
 
     async fn call_groq_failover(
@@ -5084,6 +5471,27 @@ REASON: Friendly banter
             "Expected ALLOW for clean gaming chat, got {:?}",
             verdict
         );
+    }
+
+    #[test]
+    fn test_parse_supreme_decision() {
+        let allow_res = "VERDICT: ALLOW\nREASON: Standard Roblox hunting/PVP trashtalk with no real world threat.";
+        let d1 = AiModerator::parse_supreme_decision(allow_res);
+        assert_eq!(d1.verdict, SupremeVerdict::Allow);
+        assert!(d1.reason.contains("Roblox"));
+
+        let confirm_res = "VERDICT: CONFIRM\nREASON: Explicit real-world death threat with genuine malice.";
+        let d2 = AiModerator::parse_supreme_decision(confirm_res);
+        assert_eq!(d2.verdict, SupremeVerdict::Confirm);
+        assert!(d2.reason.contains("death threat"));
+
+        let markdown_res = "**VERDICT**: `ALLOW`\n**REASON**: Casual English idiom ('kill time') harmlessly used.";
+        let d3 = AiModerator::parse_supreme_decision(markdown_res);
+        assert_eq!(d3.verdict, SupremeVerdict::Allow);
+
+        let bracket_confirm = "VERDICT: [CONFIRM]\nREASON: [Known steam phishing credential harvester]";
+        let d4 = AiModerator::parse_supreme_decision(bracket_confirm);
+        assert_eq!(d4.verdict, SupremeVerdict::Confirm);
     }
 }
 

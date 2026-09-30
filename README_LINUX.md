@@ -139,3 +139,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable antiscambot
 sudo systemctl start antiscambot
 ```
+
+---
+
+## ⚖️ Tier 4: NVIDIA NIM Supreme Court (Двойная проверка DELETE & MUTE)
+
+В бота интегрирован верховный арбитр на базе **NVIDIA NIM API** (модель deepseek-ai/deepseek-v4.1-flash или meta/llama-3.3-70b-instruct):
+- **Срабатывает ТОЛЬКО при удалении (DELETE) или муте (MUTE)** — таких сообщений в день немного, поэтому лимиты расходуются минимально.
+- **Предотвращает ложные баны**: отличает геймерский сленг, идиомы ('kill time', 'say yo one more time and ur done for', 'найду в роблоксе') от реальных угроз и скама. Если это шутка или безобидная игра — отменяет наказание (OVERRULE -> ALLOW).
+- **Настройка в .env**:
+  `nv
+  NVIDIA_API_KEY=nvapi-xxxxxxxxxxxxxxxxx
+  NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash
+  `
