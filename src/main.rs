@@ -773,8 +773,8 @@ impl EventHandler for Handler {
         // ── 0. AI TEXT MODERATION (Runs before / in parallel to image scan) ──
         if !msg.content.trim().is_empty() {
             // Pre-fill channel context history from Discord if local buffer is empty (e.g. fresh reboot)
-            if self.ai_moderator.get_history_count(msg.channel_id.get()) < 6 {
-                let get_msgs = serenity::builder::GetMessages::new().before(msg.id).limit(10);
+            if self.ai_moderator.get_history_count(msg.channel_id.get()) < 30 {
+                let get_msgs = serenity::builder::GetMessages::new().before(msg.id).limit(30);
                 if let Ok(recent) = msg.channel_id.messages(&ctx.http, get_msgs).await {
                     for m in recent.into_iter().rev() {
                         if !m.content.trim().is_empty() {

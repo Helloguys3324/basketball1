@@ -17,7 +17,7 @@ const OPENAI_SAFE_THRESHOLD: f64 = 0.45;
 const OPENAI_SEVERE_THRESHOLD: f64 = 0.82;
 const OPENAI_CATEGORY_SEVERE_THRESHOLD: f64 = 0.70;
 
-const MAX_CONTEXT_HISTORY: usize = 8;
+const MAX_CONTEXT_HISTORY: usize = 30;
 const MAX_CHANNELS_TRACKED: usize = 300;
 
 // Hostility markers for gamer chat analysis
@@ -1704,17 +1704,21 @@ impl AiModerator {
             let line_no = log_idx + 1;
             if let Some(&(item_num, ref item)) = flagged_map.get(&entry.message_id) {
                 displayed_flagged.insert(item_num);
+                prompt.push_str("\n╔══════════════════════════════════════════════════════════════════════════════╗\n");
                 prompt.push_str(&format!(
-                    "[{}] #{} | >>> [FLAGGED ITEM #{}] <<< @{}: \"{}\"\n",
-                    line_no,
-                    entry.channel_name,
+                    "║ >>> [FLAGGED ITEM #{}] <<< @{}: \"{}\"\n",
                     item_num,
                     entry.author_name,
                     entry.content.trim()
                 ));
+                prompt.push_str(&format!(
+                    "║ 🎯 TARGET MESSAGE BEING ANALYZED (Line [{}], Channel: #{}, Author ID: {})\n",
+                    line_no, entry.channel_name, entry.author_id
+                ));
                 if !item.telemetry_chunk.is_empty() {
-                    prompt.push_str(&format!("    ↳ [Telemetry: {}]\n", item.telemetry_chunk.trim()));
+                    prompt.push_str(&format!("║ ↳ Telemetry: {}\n", item.telemetry_chunk.trim()));
                 }
+                prompt.push_str("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
             } else {
                 let short_c = Self::safe_truncate(&entry.content, 90);
                 let rep_str = if let Some(ref r) = entry.reply_to {
@@ -1737,16 +1741,21 @@ impl AiModerator {
         for (idx, item) in batch.iter().enumerate() {
             let item_num = idx + 1;
             if !displayed_flagged.contains(&item_num) {
+                prompt.push_str("\n╔══════════════════════════════════════════════════════════════════════════════╗\n");
                 prompt.push_str(&format!(
-                    "\n>>> [FLAGGED ITEM #{}] <<< #{} | @{}: \"{}\"\n",
+                    "║ >>> [FLAGGED ITEM #{}] <<< @{}: \"{}\"\n",
                     item_num,
-                    item.channel_name,
                     item.author_name,
                     item.trimmed_content.trim()
                 ));
+                prompt.push_str(&format!(
+                    "║ 🎯 TARGET MESSAGE BEING ANALYZED (Channel: #{}, Author ID: {})\n",
+                    item.channel_name, item.author_id
+                ));
                 if !item.telemetry_chunk.is_empty() {
-                    prompt.push_str(&format!("    ↳ [Telemetry: {}]\n", item.telemetry_chunk.trim()));
+                    prompt.push_str(&format!("║ ↳ Telemetry: {}\n", item.telemetry_chunk.trim()));
                 }
+                prompt.push_str("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
             }
         }
 
@@ -1759,9 +1768,15 @@ impl AiModerator {
         prompt.push_str("Autonomously gauge the danger level and output your decision block for EVERY flagged item:\n\n");
         for idx in 0..count {
             let item_num = idx + 1;
+            let target_hint = if let Some(req) = batch.get(idx) {
+                format!(" -> TARGET TO EVALUATE: @{}: \"{}\"", req.author_name, Self::safe_truncate(&req.trimmed_content, 80))
+            } else {
+                String::new()
+            };
             prompt.push_str(&format!(
-                "[ITEM {}]\nVERDICT: [ALLOW|SUSPICIOUS|DELETE]\nRULE: [Crit|Major|Minor/Mild|None]\nMUTE_MINUTES: [0|1|15|30|60|120|1440]\nREASON: [concise rationale]\n\n",
-                item_num
+                "[ITEM {}]{}\nVERDICT: [ALLOW|SUSPICIOUS|DELETE]\nRULE: [Crit|Major|Minor/Mild|None]\nMUTE_MINUTES: [0|1|15|30|60|120|1440]\nREASON: [concise rationale]\n\n",
+                item_num,
+                target_hint
             ));
         }
 
@@ -3590,7 +3605,7 @@ impl AiModerator {
 
         let history = self.get_context_snapshot(ctx.channel_id);
         let mut history_str = String::new();
-        for entry in history.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+        for entry in history.iter().rev().take(30).collect::<Vec<_>>().into_iter().rev() {
             history_str.push_str(&format!("@{}: \"{}\"\n", entry.author_name, entry.content));
         }
 
