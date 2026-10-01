@@ -905,7 +905,7 @@ impl AiModerator {
         history.get(&channel_id).map(|q| q.len()).unwrap_or(0)
     }
 
-    fn get_context_snapshot(&self, channel_id: u64) -> Vec<ChatEntry> {
+    pub fn get_context_snapshot(&self, channel_id: u64) -> Vec<ChatEntry> {
         let history = self.chat_history.read().unwrap();
         if let Some(queue) = history.get(&channel_id) {
             queue.iter().rev().take(MAX_CONTEXT_HISTORY).cloned().collect::<Vec<_>>().into_iter().rev().collect()
@@ -2184,6 +2184,17 @@ impl AiModerator {
                                     category: "violence".to_string(),
                                     model_used: format!("Extreme Harm Guard ({})", model_used),
                                     rule_violated: "Major (Threats/Harm)".to_string(),
+                                    mute_minutes: 120,
+                                };
+                            }
+                            if has_dox_threat && !is_meta && Self::is_explicit_real_world_dox_threat(trimmed) {
+                                println!("   🚨 [DOX THREAT GUARD] Overriding LLM ALLOW for explicit doxx/extortion threat ('{}') -> DeleteConfirmed(120m)", trimmed);
+                                return ModerationVerdict::DeleteConfirmed {
+                                    reason: format!("Doxxing, extortion or threat to leak private personal information detected: \"{}\"", trimmed),
+                                    score: if max_score > 0.5 { max_score } else { 0.95 },
+                                    category: "harassment/threatening".to_string(),
+                                    model_used: format!("Dox Threat Guard ({})", model_used),
+                                    rule_violated: "Major (Threats/Doxx)".to_string(),
                                     mute_minutes: 120,
                                 };
                             }

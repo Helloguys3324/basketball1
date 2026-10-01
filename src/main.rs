@@ -941,6 +941,7 @@ impl EventHandler for Handler {
                     }
 
                     if let Some(mod_chan) = self.config.get_mod_channel() {
+                        let context_history = self.ai_moderator.get_context_snapshot(msg.channel_id.get());
                         mod_actions::send_mod_alert(
                             &ctx.http,
                             mod_chan,
@@ -957,6 +958,7 @@ impl EventHandler for Handler {
                             score,
                             &category,
                             &model_used,
+                            &context_history,
                         )
                         .await;
                         println!("   📬 [MOD LOGS] Incident alert sent to staff channel.");
@@ -1044,6 +1046,7 @@ impl EventHandler for Handler {
                     }
 
                     if let Some(mod_chan) = self.config.get_mod_channel() {
+                        let context_history = self.ai_moderator.get_context_snapshot(msg.channel_id.get());
                         mod_actions::send_mod_alert(
                             &ctx.http,
                             mod_chan,
@@ -1060,6 +1063,7 @@ impl EventHandler for Handler {
                             score,
                             &category,
                             &model_used,
+                            &context_history,
                         )
                         .await;
                         println!("   📬 [MOD LOGS] Interactive review card sent to staff channel.");
@@ -1260,6 +1264,7 @@ impl EventHandler for Handler {
                 }
 
                 if let Some(mod_chan) = self.config.get_mod_channel() {
+                    let context_history = self.ai_moderator.get_context_snapshot(msg.channel_id.get());
                     mod_actions::send_mod_alert(
                         &ctx.http,
                         mod_chan,
@@ -1276,6 +1281,7 @@ impl EventHandler for Handler {
                         score,
                         &category,
                         "OpenAI Multimodal omni-moderation",
+                        &context_history,
                     ).await;
                 }
 
