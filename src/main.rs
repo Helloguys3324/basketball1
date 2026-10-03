@@ -838,7 +838,8 @@ impl EventHandler for Handler {
                         let channel_last = cooldowns.get(&channel_id).copied();
                         let user_last = cooldowns.get(&user_id).copied();
 
-                        let is_channel_on_cd = channel_last.map(|t| now.duration_since(t) < Duration::from_secs(5)).unwrap_or(false);
+                        // 3-minute global cooldown (180s) across the entire channel + per-user to prevent spam
+                        let is_channel_on_cd = channel_last.map(|t| now.duration_since(t) < Duration::from_secs(180)).unwrap_or(false);
                         let is_user_on_cd = user_last.map(|t| now.duration_since(t) < cd_duration).unwrap_or(false);
 
                         if !is_channel_on_cd && !is_user_on_cd {
@@ -855,7 +856,7 @@ impl EventHandler for Handler {
                             "\n🎮 [EARLY ACCESS FAQ] Triggered by {} ({}) in channel {}",
                             msg.author.name, msg.author.id, msg.channel_id
                         );
-                        let ea_response = "**__How to obtain EA (Early Access), as of right now.__**\n\n• **Win a event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**\n• **DM Decay to purchase**";
+                        let ea_response = "**__How to obtain EA (Early Access), as of right now:__**\n\n• **Win an event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**\n• **Apply for Content Creator** in <#1389403842843508796>\n  └ *Requirements: YouTube (5k subs / 2.5k avg views) • TikTok (5k followers / 10k avg views) • Streamer (15 avg viewers)*\n• **DM Decay to buy (price is negotiable)**\n\nℹ️ *EA testing runs from October 4th – 11th (October 3rd – 10th depending on your timezone). During Early Access, you will be able to encounter many popular content creators!*";
                         let sent_result = match msg.reply(&ctx.http, ea_response).await {
                             Ok(m) => Ok(m),
                             Err(_) => msg.channel_id.say(&ctx.http, ea_response).await,
@@ -865,7 +866,7 @@ impl EventHandler for Handler {
                             let http = ctx.http.clone();
                             let channel_id = msg.channel_id;
                             tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                tokio::time::sleep(Duration::from_secs(18)).await;
                                 let _ = channel_id.delete_message(&http, bot_msg.id).await;
                             });
                         }
