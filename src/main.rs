@@ -78,7 +78,6 @@ pub fn is_creator(user_id: UserId) -> bool {
 
 // Role threshold IDs (only members below these roles are affected)
 pub const EA_ROLE_THRESHOLD: u64 = 1008406101022228490;
-pub const SHUT_UP_ROLE_THRESHOLD: u64 = 1272585150592450592;
 
 // Environment variable or .env file (NEVER hardcode tokens in git!)
 fn get_token() -> String {
@@ -727,19 +726,19 @@ fn is_member_below_role(
     user_id: UserId,
     target_role_id: u64,
 ) -> bool {
-    // If user is creator, allow them to trigger for testing verification
+    // 1. Server creator is never "below" any role
     if is_creator(user_id) {
-        return true;
+        return false;
     }
 
     let target_role_id = RoleId::new(target_role_id);
 
-    // If the user directly has the target role, they are NOT below it
+    // 2. If the user directly has the target role, they are NOT below it
     if member_roles.contains(&target_role_id) {
         return false;
     }
 
-    // Fast in-memory cache path
+    // 3. Fast in-memory cache path
     if let Some(guild) = ctx.cache.guild(guild_id) {
         if guild.owner_id == user_id {
             return false;
@@ -754,16 +753,13 @@ fn is_member_below_role(
             }
         }
 
-        // Check role position in role hierarchy against staff roles
+        // Check role position in role hierarchy:
+        // Any role with position >= target_pos means the member is equal or higher
         if let Some(target_role) = guild.roles.get(&target_role_id) {
             let target_pos = target_role.position;
             for role_id in member_roles {
                 if let Some(r) = guild.roles.get(role_id) {
-                    let is_staff_role = r.permissions.contains(Permissions::MANAGE_MESSAGES)
-                        || r.permissions.contains(Permissions::MODERATE_MEMBERS)
-                        || r.permissions.contains(Permissions::BAN_MEMBERS)
-                        || r.permissions.contains(Permissions::KICK_MEMBERS);
-                    if r.position >= target_pos && is_staff_role {
+                    if r.position >= target_pos {
                         return false;
                     }
                 }
@@ -813,11 +809,16 @@ impl EventHandler for Handler {
             Vec::new()
         };
 
-        let is_admin = if let Some(gid) = msg.guild_id {
+        let is_admin = is_creator(msg.author.id) || if let Some(gid) = msg.guild_id {
             is_administrator(&ctx, gid, &member_roles, msg.author.id)
         } else {
-            is_creator(msg.author.id)
+            false
         };
+
+        // Guaranteed immunity — server creator (Sasageyo) & admins
+        if is_admin {
+            return;
+        }
 
         // ── 0.0 EARLY ACCESS FAQ AUTO-REPLY ──
         if let Some(guild_id) = msg.guild_id {
@@ -1196,26 +1197,13 @@ impl EventHandler for Handler {
                         msg.timestamp.unix_timestamp(),
                     );
 
-                    // Only warn members below role 1272585150592450592 (SHUT_UP_ROLE_THRESHOLD)
-                    if let Some(guild_id) = msg.guild_id {
-                        if !is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, SHUT_UP_ROLE_THRESHOLD) {
-                            println!("   🛡️ [SHUT UP IMMUNITY] User {} ({}) has role {} or higher -> Skipping warning.", msg.author.name, msg.author.id, SHUT_UP_ROLE_THRESHOLD);
-                            return;
-                        }
-                    }
-
-                    // Check cooldown per user (3 minutes / 180 seconds, or 5s for creator) so repeated silencing doesn't spam the chat
+                    // Check cooldown per user (15 seconds) so repeated silencing doesn't spam the chat
                     let should_warn = {
                         let mut cooldowns = self.warn_cooldowns.write().unwrap();
                         let now = Instant::now();
-                        let cd_duration = if is_creator(msg.author.id) {
-                            Duration::from_secs(5)
-                        } else {
-                            Duration::from_secs(180)
-                        };
                         let key = msg.author.id.get();
                         if let Some(last_time) = cooldowns.get(&key) {
-                            if now.duration_since(*last_time) < cd_duration {
+                            if now.duration_since(*last_time) < Duration::from_secs(15) {
                                 false
                             } else {
                                 cooldowns.insert(key, now);
