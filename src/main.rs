@@ -56,7 +56,8 @@ const WARN_USER_IN_CHAT: bool = true;
 const WARN_EXPIRE_SECONDS: u64 = 6;
 const AUTO_TIMEOUT_MINUTES: u64 = 60;
 const IGNORE_BOTS: bool = true;
-const IGNORE_ADMINS: bool = true; // Set to true: admins are completely ignored and never touched
+#[allow(dead_code)]
+const IGNORE_ADMINS: bool = true; // Admin immunity is checked contextually in mod actions
 const MAX_IMAGE_SIZE: u32 = 5 * 1024 * 1024; // 5 MB
 
 // ── Aggressive Multi-Image Burst Mode (Scamer Pack Detection) ────────────────
@@ -69,6 +70,11 @@ const BURST_SIFT_MIN_INLIERS: usize = 35;
 
 // Guaranteed immunity — server creator (Sasageyo)
 const SASAGEYO_ID: u64 = 612573096343240734;
+
+#[inline]
+pub fn is_creator(user_id: UserId) -> bool {
+    user_id.get() == SASAGEYO_ID || user_id.get() == 314781447037747200
+}
 
 // Role threshold IDs (only members below these roles are affected)
 pub const EA_ROLE_THRESHOLD: u64 = 1008406101022228490;
@@ -685,48 +691,28 @@ async fn download_image(
 // ADMIN / IMMUNITY CHECK (Fast-path cached)
 // =============================================================================
 
-async fn is_administrator(ctx: &Context, guild_id: GuildId, user_id: UserId) -> bool {
-    // 1. Guaranteed immunity for server creator (Sasageyo)
-    if user_id.get() == SASAGEYO_ID {
+fn is_administrator(
+    ctx: &Context,
+    guild_id: GuildId,
+    member_roles: &[RoleId],
+    user_id: UserId,
+) -> bool {
+    // 1. Guaranteed immunity for server creator
+    if is_creator(user_id) {
         return true;
     }
 
-    // 2. Fast cache path: zero network calls
+    // 2. Fast in-memory cache path: zero network calls
     if let Some(guild) = ctx.cache.guild(guild_id) {
         if guild.owner_id == user_id {
             return true;
         }
-        if let Some(member) = guild.members.get(&user_id) {
-            for role_id in &member.roles {
-                if let Some(role) = guild.roles.get(role_id) {
-                    if role.permissions.contains(Permissions::ADMINISTRATOR) {
-                        return true;
-                    }
+
+        for role_id in member_roles {
+            if let Some(role) = guild.roles.get(role_id) {
+                if role.permissions.contains(Permissions::ADMINISTRATOR) {
+                    return true;
                 }
-            }
-            return false;
-        }
-    }
-
-    // 3. Fallback to Discord REST API if not found in cache
-    let member = match ctx.http.get_member(guild_id, user_id).await {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    let guild = match ctx.http.get_guild(guild_id).await {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-
-    if guild.owner_id == user_id {
-        return true;
-    }
-
-    for role_id in &member.roles {
-        if let Some(role) = guild.roles.get(role_id) {
-            if role.permissions.contains(Permissions::ADMINISTRATOR) {
-                return true;
             }
         }
     }
@@ -734,16 +720,16 @@ async fn is_administrator(ctx: &Context, guild_id: GuildId, user_id: UserId) -> 
     false
 }
 
-async fn is_member_below_role(
+fn is_member_below_role(
     ctx: &Context,
     guild_id: GuildId,
     member_roles: &[RoleId],
     user_id: UserId,
     target_role_id: u64,
 ) -> bool {
-    // 1. Server creator is never "below" any role
-    if user_id.get() == SASAGEYO_ID {
-        return false;
+    // If user is creator, allow them to trigger for testing verification
+    if is_creator(user_id) {
+        return true;
     }
 
     let target_role_id = RoleId::new(target_role_id);
@@ -753,7 +739,7 @@ async fn is_member_below_role(
         return false;
     }
 
-    // 2. Fast cache path: zero network calls
+    // Fast in-memory cache path
     if let Some(guild) = ctx.cache.guild(guild_id) {
         if guild.owner_id == user_id {
             return false;
@@ -768,12 +754,16 @@ async fn is_member_below_role(
             }
         }
 
-        // Check role position in role hierarchy
+        // Check role position in role hierarchy against staff roles
         if let Some(target_role) = guild.roles.get(&target_role_id) {
             let target_pos = target_role.position;
             for role_id in member_roles {
                 if let Some(r) = guild.roles.get(role_id) {
-                    if r.position >= target_pos {
+                    let is_staff_role = r.permissions.contains(Permissions::MANAGE_MESSAGES)
+                        || r.permissions.contains(Permissions::MODERATE_MEMBERS)
+                        || r.permissions.contains(Permissions::BAN_MEMBERS)
+                        || r.permissions.contains(Permissions::KICK_MEMBERS);
+                    if r.position >= target_pos && is_staff_role {
                         return false;
                     }
                 }
@@ -782,32 +772,7 @@ async fn is_member_below_role(
         }
     }
 
-    // 3. Fallback via HTTP REST API if not found in cache
-    if let Ok(guild) = ctx.http.get_guild(guild_id).await {
-        if guild.owner_id == user_id {
-            return false;
-        }
-        for role_id in member_roles {
-            if let Some(r) = guild.roles.get(role_id) {
-                if r.permissions.contains(Permissions::ADMINISTRATOR) {
-                    return false;
-                }
-            }
-        }
-        if let Some(target_role) = guild.roles.get(&target_role_id) {
-            let target_pos = target_role.position;
-            for role_id in member_roles {
-                if let Some(r) = guild.roles.get(role_id) {
-                    if r.position >= target_pos {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-    }
-
-    // Fallback: if role not found at all, check if user has the role directly
+    // Fallback: if role not found in cache, check if user directly has the role
     !member_roles.contains(&target_role_id)
 }
 
@@ -838,43 +803,42 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Guaranteed immunity — server creator
-        if msg.author.id.get() == SASAGEYO_ID {
-            return;
-        }
+        let member_roles = if let Some(ref m) = msg.member {
+            m.roles.clone()
+        } else if let Some(gid) = msg.guild_id {
+            ctx.cache.guild(gid)
+                .and_then(|g| g.members.get(&msg.author.id).map(|m| m.roles.clone()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
-        // Ignore admins
-        if IGNORE_ADMINS {
-            if let Some(guild_id) = msg.guild_id {
-                if is_administrator(&ctx, guild_id, msg.author.id).await {
-                    return;
-                }
-            }
-        }
+        let is_admin = if let Some(gid) = msg.guild_id {
+            is_administrator(&ctx, gid, &member_roles, msg.author.id)
+        } else {
+            is_creator(msg.author.id)
+        };
 
         // ── 0.0 EARLY ACCESS FAQ AUTO-REPLY ──
         if let Some(guild_id) = msg.guild_id {
             if AiModerator::is_early_access_query(&msg.content) {
-                let member_roles = if let Some(ref m) = msg.member {
-                    m.roles.clone()
-                } else if let Some(guild) = ctx.cache.guild(guild_id) {
-                    guild.members.get(&msg.author.id).map(|m| m.roles.clone()).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                if is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, EA_ROLE_THRESHOLD).await {
+                if is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, EA_ROLE_THRESHOLD) {
                     let channel_id = msg.channel_id.get();
                     let user_id = msg.author.id.get();
                     let should_send = {
                         let mut cooldowns = self.ea_cooldowns.write().unwrap();
                         let now = Instant::now();
-                        // 3-minute cooldown (180s) on both channel and user to prevent chat flood
+                        let cd_duration = if is_creator(msg.author.id) {
+                            Duration::from_secs(5)
+                        } else {
+                            Duration::from_secs(180)
+                        };
+
                         let channel_last = cooldowns.get(&channel_id).copied();
                         let user_last = cooldowns.get(&user_id).copied();
 
-                        let is_channel_on_cd = channel_last.map(|t| now.duration_since(t) < Duration::from_secs(180)).unwrap_or(false);
-                        let is_user_on_cd = user_last.map(|t| now.duration_since(t) < Duration::from_secs(180)).unwrap_or(false);
+                        let is_channel_on_cd = channel_last.map(|t| now.duration_since(t) < Duration::from_secs(5)).unwrap_or(false);
+                        let is_user_on_cd = user_last.map(|t| now.duration_since(t) < cd_duration).unwrap_or(false);
 
                         if !is_channel_on_cd && !is_user_on_cd {
                             cooldowns.insert(channel_id, now);
@@ -906,7 +870,7 @@ impl EventHandler for Handler {
                         }
                         return;
                     } else {
-                        println!("   ⏳ [EARLY ACCESS FAQ] Cooldown active (3 min) -> Skipping duplicate reply.");
+                        println!("   ⏳ [EARLY ACCESS FAQ] Cooldown active -> Skipping duplicate reply.");
                         return;
                     }
                 } else {
@@ -1029,7 +993,7 @@ impl EventHandler for Handler {
                         msg.channel_id, msg.author.name, msg.author.id, rule_violated, mute_minutes, score, reason, msg.content
                     );
 
-                    if AUTO_DELETE {
+                    if AUTO_DELETE && !is_admin {
                         let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
                     }
 
@@ -1037,7 +1001,7 @@ impl EventHandler for Handler {
                     let action_taken = if mute_minutes > 0 {
                         let mut applied = false;
                         if let Some(guild_id) = msg.guild_id {
-                            if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                            if !is_admin {
                                 let now_secs = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
@@ -1057,10 +1021,10 @@ impl EventHandler for Handler {
                             format!("🔇 Timed out for {} min under rule: **{}** (AI intuition called for action!)", mute_minutes, rule_violated)
                         } else {
                             println!("   🛡️ [TIMEOUT SKIPPED] User @{} has admin immunity.", msg.author.name);
-                            format!("🗑️ Message removed under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
+                            format!("🗑️ Message flagged under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
                         }
                     } else {
-                        format!("🗑️ Message removed under rule: **{}** (AI intuition issued a warning without timeout)", rule_violated)
+                        format!("🗑️ Message flagged under rule: **{}** (AI intuition issued a warning without timeout)", rule_violated)
                     };
 
                     if WARN_USER_IN_CHAT {
@@ -1109,7 +1073,7 @@ impl EventHandler for Handler {
                         println!("   📬 [MOD LOGS] Incident alert sent to staff channel.");
                     }
 
-                    // Message deleted for toxic text, skip image checking
+                    // Message handled for toxic text, skip image checking
                     return;
                 }
                 ModerationVerdict::FlagSuspicious {
@@ -1134,7 +1098,7 @@ impl EventHandler for Handler {
                         msg.timestamp.unix_timestamp(),
                     );
 
-                    if AUTO_DELETE {
+                    if AUTO_DELETE && !is_admin {
                         let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
                     }
 
@@ -1142,7 +1106,7 @@ impl EventHandler for Handler {
                     let action_taken = if mute_minutes > 0 {
                         let mut applied = false;
                         if let Some(guild_id) = msg.guild_id {
-                            if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                            if !is_admin {
                                 let now_secs = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
@@ -1162,10 +1126,10 @@ impl EventHandler for Handler {
                             format!("🔇 Timed out for {} min under rule: **{}** (AI intuition called for action!)", mute_minutes, rule_violated)
                         } else {
                             println!("   🛡️ [TIMEOUT SKIPPED] User @{} has admin immunity.", msg.author.name);
-                            format!("🗑️ Message removed under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
+                            format!("🗑️ Message flagged under rule: **{}** (Admin immunity / timeout skipped)", rule_violated)
                         }
                     } else {
-                        format!("🗑️ Message removed under rule: **{}** (AI intuition issued a warning without timeout)", rule_violated)
+                        format!("🗑️ Message flagged under rule: **{}** (AI intuition issued a warning without timeout)", rule_violated)
                     };
 
                     if WARN_USER_IN_CHAT {
@@ -1214,7 +1178,7 @@ impl EventHandler for Handler {
                         println!("   📬 [MOD LOGS] Interactive review card sent to staff channel.");
                     }
 
-                    // Message deleted, skip image checking
+                    // Message handled, skip image checking
                     return;
                 }
                 ModerationVerdict::WarnOnly { reason, warning_text } => {
@@ -1234,27 +1198,24 @@ impl EventHandler for Handler {
 
                     // Only warn members below role 1272585150592450592 (SHUT_UP_ROLE_THRESHOLD)
                     if let Some(guild_id) = msg.guild_id {
-                        let member_roles = if let Some(ref m) = msg.member {
-                            m.roles.clone()
-                        } else if let Some(guild) = ctx.cache.guild(guild_id) {
-                            guild.members.get(&msg.author.id).map(|m| m.roles.clone()).unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-
-                        if !is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, SHUT_UP_ROLE_THRESHOLD).await {
+                        if !is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, SHUT_UP_ROLE_THRESHOLD) {
                             println!("   🛡️ [SHUT UP IMMUNITY] User {} ({}) has role {} or higher -> Skipping warning.", msg.author.name, msg.author.id, SHUT_UP_ROLE_THRESHOLD);
                             return;
                         }
                     }
 
-                    // Check cooldown per user (3 minutes / 180 seconds) so repeated silencing doesn't spam the chat
+                    // Check cooldown per user (3 minutes / 180 seconds, or 5s for creator) so repeated silencing doesn't spam the chat
                     let should_warn = {
                         let mut cooldowns = self.warn_cooldowns.write().unwrap();
                         let now = Instant::now();
+                        let cd_duration = if is_creator(msg.author.id) {
+                            Duration::from_secs(5)
+                        } else {
+                            Duration::from_secs(180)
+                        };
                         let key = msg.author.id.get();
                         if let Some(last_time) = cooldowns.get(&key) {
-                            if now.duration_since(*last_time) < Duration::from_secs(180) {
+                            if now.duration_since(*last_time) < cd_duration {
                                 false
                             } else {
                                 cooldowns.insert(key, now);
@@ -1378,7 +1339,7 @@ impl EventHandler for Handler {
                     msg.author.name, msg.author.id, msg.channel_id, category, score, details
                 );
 
-                if AUTO_DELETE {
+                if AUTO_DELETE && !is_admin {
                     let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
                 }
 
@@ -1400,7 +1361,7 @@ impl EventHandler for Handler {
                 let mut action_taken = "🔞 Image removed (NSFW / Explicit content)".to_string();
                 if AUTO_TIMEOUT_MINUTES > 0 {
                     if let Some(guild_id) = msg.guild_id {
-                        if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                        if !is_admin {
                             let now_secs = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
@@ -1472,7 +1433,7 @@ impl EventHandler for Handler {
                 );
 
                 // ── 1. Delete scam message ───────────────────────────────
-                if AUTO_DELETE {
+                if AUTO_DELETE && !is_admin {
                     let _ = msg.channel_id.delete_message(&ctx.http, msg.id).await;
                 }
 
@@ -1495,7 +1456,7 @@ impl EventHandler for Handler {
                 // ── 3. Timeout user ──────────────────────────────────────
                 if AUTO_TIMEOUT_MINUTES > 0 {
                     if let Some(guild_id) = msg.guild_id {
-                        if !is_administrator(&ctx, guild_id, msg.author.id).await {
+                        if !is_admin {
                             let now_secs = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
@@ -1755,10 +1716,11 @@ async fn main() {
         ea_cooldowns: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    // Minimal Discord Gateway intents
+    // Discord Gateway intents
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILD_MEMBERS;
+        | GatewayIntents::GUILD_MEMBERS
+        | GatewayIntents::GUILDS;
 
     println!("[INFO] Connecting to Discord Gateway...");
 
@@ -1772,3 +1734,16 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_creator() {
+        assert!(is_creator(UserId::new(SASAGEYO_ID)));
+        assert!(is_creator(UserId::new(314781447037747200)));
+        assert!(!is_creator(UserId::new(123456789012345678)));
+    }
+}
+
