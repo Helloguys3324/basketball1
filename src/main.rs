@@ -33,7 +33,7 @@ use serenity::async_trait;
 use serenity::builder::EditMember;
 use serenity::model::channel::Message;
 use serenity::model::gateway::{GatewayIntents, Ready};
-use serenity::model::id::{GuildId, UserId};
+use serenity::model::id::{GuildId, RoleId, UserId};
 use serenity::model::Permissions;
 use serenity::model::Timestamp;
 use serenity::prelude::*;
@@ -69,6 +69,10 @@ const BURST_SIFT_MIN_INLIERS: usize = 35;
 
 // Guaranteed immunity — server creator (Sasageyo)
 const SASAGEYO_ID: u64 = 612573096343240734;
+
+// Role threshold IDs (only members below these roles are affected)
+pub const EA_ROLE_THRESHOLD: u64 = 1008406101022228490;
+pub const SHUT_UP_ROLE_THRESHOLD: u64 = 1272585150592450592;
 
 // Environment variable or .env file (NEVER hardcode tokens in git!)
 fn get_token() -> String {
@@ -730,6 +734,83 @@ async fn is_administrator(ctx: &Context, guild_id: GuildId, user_id: UserId) -> 
     false
 }
 
+async fn is_member_below_role(
+    ctx: &Context,
+    guild_id: GuildId,
+    member_roles: &[RoleId],
+    user_id: UserId,
+    target_role_id: u64,
+) -> bool {
+    // 1. Server creator is never "below" any role
+    if user_id.get() == SASAGEYO_ID {
+        return false;
+    }
+
+    let target_role_id = RoleId::new(target_role_id);
+
+    // If the user directly has the target role, they are NOT below it
+    if member_roles.contains(&target_role_id) {
+        return false;
+    }
+
+    // 2. Fast cache path: zero network calls
+    if let Some(guild) = ctx.cache.guild(guild_id) {
+        if guild.owner_id == user_id {
+            return false;
+        }
+
+        // If member has Administrator on any of their roles, they are NOT below
+        for role_id in member_roles {
+            if let Some(r) = guild.roles.get(role_id) {
+                if r.permissions.contains(Permissions::ADMINISTRATOR) {
+                    return false;
+                }
+            }
+        }
+
+        // Check role position in role hierarchy
+        if let Some(target_role) = guild.roles.get(&target_role_id) {
+            let target_pos = target_role.position;
+            for role_id in member_roles {
+                if let Some(r) = guild.roles.get(role_id) {
+                    if r.position >= target_pos {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }
+
+    // 3. Fallback via HTTP REST API if not found in cache
+    if let Ok(guild) = ctx.http.get_guild(guild_id).await {
+        if guild.owner_id == user_id {
+            return false;
+        }
+        for role_id in member_roles {
+            if let Some(r) = guild.roles.get(role_id) {
+                if r.permissions.contains(Permissions::ADMINISTRATOR) {
+                    return false;
+                }
+            }
+        }
+        if let Some(target_role) = guild.roles.get(&target_role_id) {
+            let target_pos = target_role.position;
+            for role_id in member_roles {
+                if let Some(r) = guild.roles.get(role_id) {
+                    if r.position >= target_pos {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }
+
+    // Fallback: if role not found at all, check if user has the role directly
+    !member_roles.contains(&target_role_id)
+}
+
 // =============================================================================
 // DISCORD EVENT HANDLER
 // =============================================================================
@@ -739,6 +820,7 @@ struct Handler {
     ai_moderator: AiModerator,
     config: Arc<ConfigStore>,
     warn_cooldowns: Arc<RwLock<HashMap<u64, Instant>>>,
+    ea_cooldowns: Arc<RwLock<HashMap<u64, Instant>>>,
 }
 
 #[async_trait]
@@ -766,6 +848,59 @@ impl EventHandler for Handler {
             if let Some(guild_id) = msg.guild_id {
                 if is_administrator(&ctx, guild_id, msg.author.id).await {
                     return;
+                }
+            }
+        }
+
+        // ── 0.0 EARLY ACCESS FAQ AUTO-REPLY ──
+        if let Some(guild_id) = msg.guild_id {
+            if AiModerator::is_early_access_query(&msg.content) {
+                let member_roles = if let Some(ref m) = msg.member {
+                    m.roles.clone()
+                } else if let Some(guild) = ctx.cache.guild(guild_id) {
+                    guild.members.get(&msg.author.id).map(|m| m.roles.clone()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                if is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, EA_ROLE_THRESHOLD).await {
+                    let channel_id = msg.channel_id.get();
+                    let user_id = msg.author.id.get();
+                    let should_send = {
+                        let mut cooldowns = self.ea_cooldowns.write().unwrap();
+                        let now = Instant::now();
+                        // 3-minute cooldown (180s) on both channel and user to prevent chat flood
+                        let channel_last = cooldowns.get(&channel_id).copied();
+                        let user_last = cooldowns.get(&user_id).copied();
+
+                        let is_channel_on_cd = channel_last.map(|t| now.duration_since(t) < Duration::from_secs(180)).unwrap_or(false);
+                        let is_user_on_cd = user_last.map(|t| now.duration_since(t) < Duration::from_secs(180)).unwrap_or(false);
+
+                        if !is_channel_on_cd && !is_user_on_cd {
+                            cooldowns.insert(channel_id, now);
+                            cooldowns.insert(user_id, now);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_send {
+                        println!(
+                            "\n🎮 [EARLY ACCESS FAQ] Triggered by {} ({}) in channel {}",
+                            msg.author.name, msg.author.id, msg.channel_id
+                        );
+                        let ea_response = "**__How to obtain EA (Early Access), as of right now.__**\n\n• **Win a event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**";
+                        if let Err(_) = msg.reply(&ctx.http, ea_response).await {
+                            let _ = msg.channel_id.say(&ctx.http, ea_response).await;
+                        }
+                        return;
+                    } else {
+                        println!("   ⏳ [EARLY ACCESS FAQ] Cooldown active (3 min) -> Skipping duplicate reply.");
+                        return;
+                    }
+                } else {
+                    println!("   🛡️ [EARLY ACCESS FAQ] User {} has EA role ({}) or higher -> Skipping.", msg.author.name, EA_ROLE_THRESHOLD);
                 }
             }
         }
@@ -1087,13 +1222,29 @@ impl EventHandler for Handler {
                         msg.timestamp.unix_timestamp(),
                     );
 
-                    // Check cooldown per user (15 seconds) so repeated silencing doesn't spam the chat
+                    // Only warn members below role 1272585150592450592 (SHUT_UP_ROLE_THRESHOLD)
+                    if let Some(guild_id) = msg.guild_id {
+                        let member_roles = if let Some(ref m) = msg.member {
+                            m.roles.clone()
+                        } else if let Some(guild) = ctx.cache.guild(guild_id) {
+                            guild.members.get(&msg.author.id).map(|m| m.roles.clone()).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+
+                        if !is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, SHUT_UP_ROLE_THRESHOLD).await {
+                            println!("   🛡️ [SHUT UP IMMUNITY] User {} ({}) has role {} or higher -> Skipping warning.", msg.author.name, msg.author.id, SHUT_UP_ROLE_THRESHOLD);
+                            return;
+                        }
+                    }
+
+                    // Check cooldown per user (3 minutes / 180 seconds) so repeated silencing doesn't spam the chat
                     let should_warn = {
                         let mut cooldowns = self.warn_cooldowns.write().unwrap();
                         let now = Instant::now();
                         let key = msg.author.id.get();
                         if let Some(last_time) = cooldowns.get(&key) {
-                            if now.duration_since(*last_time) < Duration::from_secs(15) {
+                            if now.duration_since(*last_time) < Duration::from_secs(180) {
                                 false
                             } else {
                                 cooldowns.insert(key, now);
@@ -1591,6 +1742,7 @@ async fn main() {
         ai_moderator,
         config,
         warn_cooldowns: Arc::new(RwLock::new(HashMap::new())),
+        ea_cooldowns: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Minimal Discord Gateway intents

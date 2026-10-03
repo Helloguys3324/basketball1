@@ -1481,6 +1481,307 @@ impl AiModerator {
         })
     }
 
+    pub fn is_early_access_query(text: &str) -> bool {
+        let clean = text.trim();
+        if clean.is_empty() || clean.len() > 150 {
+            return false;
+        }
+
+        let lower = clean.to_lowercase();
+
+        // Severe forbidden keywords (slurs/doxx/kys should NOT be answered with EA info)
+        if Self::contains_slur(&lower) || SEVERE_HARM_KEYWORDS.iter().any(|k| Self::contains_word(&lower, k)) {
+            return false;
+        }
+
+        // Normalize: replace punctuation with space, keep alphanumeric characters
+        let normalized: String = lower
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+            .collect();
+
+        let words: Vec<&str> = normalized.split_whitespace().collect();
+        if words.is_empty() {
+            return false;
+        }
+
+        // Standalone target check ("ea", "еа", "early access", "tester", etc.)
+        let has_ea_word = words.iter().any(|&w| w == "ea" || w == "еа");
+        let has_early_access = normalized.contains("early access")
+            || normalized.contains("earlyaccess")
+            || normalized.contains("early acc")
+            || normalized.contains("эрли аксес")
+            || normalized.contains("эрлиаксес")
+            || normalized.contains("ерли аксес");
+        let has_tester = words.iter().any(|&w| {
+            w == "tester"
+                || w == "testers"
+                || w == "testing"
+                || w == "тестер"
+                || w == "тестера"
+                || w == "тестером"
+                || w == "тестеры"
+                || w == "тестерку"
+        });
+
+        let has_target = has_ea_word || has_early_access || has_tester;
+        if !has_target {
+            return false;
+        }
+
+        // Direct matching phrases
+        const DIRECT_PATTERNS: &[&str] = &[
+            // English short & direct phrases
+            "get ea",
+            "obtain ea",
+            "how to get ea",
+            "how do i get ea",
+            "how can i get ea",
+            "how to obtain ea",
+            "how do i obtain ea",
+            "how can i obtain ea",
+            "how to join ea",
+            "how do i join ea",
+            "how can i join ea",
+            "how to enter ea",
+            "how to receive ea",
+            "how to gain ea",
+            "how to access ea",
+            "how to earn ea",
+            "how to win ea",
+            "how to unlock ea",
+            "how get ea",
+            "how obtain ea",
+            "where to get ea",
+            "where do i get ea",
+            "where can i get ea",
+            "where get ea",
+            "where is ea",
+            "can i get ea",
+            "can i have ea",
+            "can we get ea",
+            "can you get ea",
+            "can u get ea",
+            "how do you get ea",
+            "how do u get ea",
+            "how you get ea",
+            "how u get ea",
+            "how does one get ea",
+            "how does someone get ea",
+            "way to get ea",
+            "ways to get ea",
+            "any way to get ea",
+            "is there a way to get ea",
+            "how to play ea",
+            "how do i play ea",
+            "how can i play ea",
+            "how to get into ea",
+            "how to get in ea",
+            "how do i get into ea",
+            "how to qualify for ea",
+            "when can i get ea",
+            "when do we get ea",
+            "how to get ea role",
+            "how do i get ea role",
+            "how to get the ea role",
+            "how to get tester",
+            "how do i get tester",
+            "how can i get tester",
+            "how to be tester",
+            "how to be a tester",
+            "how to become tester",
+            "how to become a tester",
+            "how to get tester role",
+            "how to get the tester role",
+            "how do i get tester role",
+            "how to get ea key",
+            "how to get ea pass",
+            "want ea",
+            "i want ea",
+            "give me ea",
+            "give ea",
+            "need ea",
+            "i need ea",
+            "access to ea",
+            // Early access long forms
+            "get early access",
+            "obtain early access",
+            "how to get early access",
+            "how do i get early access",
+            "how can i get early access",
+            "how to obtain early access",
+            "how do i obtain early access",
+            "how can i obtain early access",
+            "how to join early access",
+            "how to enter early access",
+            "how to receive early access",
+            "how to gain early access",
+            "how to earn early access",
+            "how get early access",
+            "where to get early access",
+            "where can i get early access",
+            "can i get early access",
+            "can i have early access",
+            "how do you get early access",
+            "how do u get early access",
+            "how you get early access",
+            "how u get early access",
+            "way to get early access",
+            "ways to get early access",
+            "how to play early access",
+            "how to get into early access",
+            "how to access early access",
+            "want early access",
+            "i want early access",
+            // Russian phrases
+            "как получить ea",
+            "как получить еа",
+            "как получить early access",
+            "как получить эрли аксес",
+            "как достать ea",
+            "как достать еа",
+            "как достать early access",
+            "где взять ea",
+            "где взять еа",
+            "где взять early access",
+            "где получить ea",
+            "где получить еа",
+            "как стать тестером",
+            "как быть тестером",
+            "как попасть в тестеры",
+            "как попасть на тестера",
+            "как получить тестера",
+            "как получить роль тестера",
+            "как получить тестерку",
+            "как попасть в ea",
+            "как попасть в еа",
+            "как попасть в early access",
+            "как зайти в ea",
+            "как зайти в early access",
+            "как зайти на ea",
+            "как играть в ea",
+            "как поиграть в ea",
+            "как поиграть в early access",
+            "можно получить ea",
+            "можно ли получить ea",
+            "можно мне ea",
+            "можно получить еа",
+            "получить ea",
+            "получить еа",
+            "получить early access",
+            "достать ea",
+            "хочу ea",
+            "хочу еа",
+            "хочу early access",
+            "хочу стать тестером",
+        ];
+
+        if DIRECT_PATTERNS.iter().any(|&p| normalized.contains(p)) {
+            return true;
+        }
+
+        // Inquiries: question/intent prefixes
+        const INQUIRY_PREFIXES: &[&str] = &[
+            "how to get",
+            "how do i get",
+            "how can i get",
+            "how do you get",
+            "how do u get",
+            "how you get",
+            "how u get",
+            "how get",
+            "how to obtain",
+            "how do i obtain",
+            "how can i obtain",
+            "how obtain",
+            "how to join",
+            "how do i join",
+            "how can i join",
+            "how join",
+            "how to enter",
+            "how do i enter",
+            "how enter",
+            "how to earn",
+            "how earn",
+            "how to win",
+            "how win",
+            "how to unlock",
+            "how unlock",
+            "how to receive",
+            "how receive",
+            "how to acquire",
+            "how acquire",
+            "how to access",
+            "where to get",
+            "where do i get",
+            "where can i get",
+            "where get",
+            "where to find",
+            "where can i find",
+            "can i get",
+            "can i have",
+            "can i join",
+            "can i enter",
+            "can i play",
+            "can we get",
+            "can you get",
+            "can u get",
+            "way to get",
+            "ways to get",
+            "any way to get",
+            "is there a way to get",
+            "how to play",
+            "how play",
+            "how to be",
+            "how to become",
+            "how do i become",
+            "how can i become",
+            "how to get into",
+            "how to qualify",
+            "when can i get",
+            "how does one get",
+            "i want to get",
+            "want to get",
+            "want to join",
+            "wanna get",
+            "wanna join",
+            // Russian prefixes
+            "как получить",
+            "как достать",
+            "где достать",
+            "где взять",
+            "где найти",
+            "где получить",
+            "как попасть",
+            "как зайти",
+            "как стать",
+            "как быть",
+            "как поиграть",
+            "как играть",
+            "можно получить",
+            "можно ли получить",
+            "можно мне",
+            "хочу получить",
+            "хочу попасть",
+            "хочу стать",
+        ];
+
+        if INQUIRY_PREFIXES.iter().any(|&ip| normalized.contains(ip)) {
+            return true;
+        }
+
+        // Action verbs in proximity with target
+        const ACTION_VERBS: &[&str] = &[
+            "get", "obtain", "acquire", "unlock", "join", "enter", "access",
+            "получить", "достать", "взять", "попасть", "зайти"
+        ];
+        if words.iter().any(|&w| ACTION_VERBS.contains(&w)) && (has_ea_word || has_early_access) {
+            return true;
+        }
+
+        false
+    }
+
     pub fn contains_slur(text: &str) -> bool {
         let lower = text.to_lowercase();
         // Check exact words split by non-alphanumeric characters
@@ -4930,6 +5231,59 @@ mod tests {
         // Severe forbidden cases (must not be treated as mere silencing)
         assert!(!AiModerator::is_shut_up_or_silencing("shut up kys"));
         assert!(!AiModerator::is_shut_up_or_silencing("заткнись и сдохни"));
+    }
+
+    #[test]
+    fn test_is_early_access_query_unit() {
+        // Direct phrase matches (English)
+        assert!(AiModerator::is_early_access_query("how to get ea"));
+        assert!(AiModerator::is_early_access_query("how to get ea?"));
+        assert!(AiModerator::is_early_access_query("get ea"));
+        assert!(AiModerator::is_early_access_query("obtain ea"));
+        assert!(AiModerator::is_early_access_query("how do i get ea"));
+        assert!(AiModerator::is_early_access_query("how can i get ea"));
+        assert!(AiModerator::is_early_access_query("where to get ea"));
+        assert!(AiModerator::is_early_access_query("where can i get ea?"));
+        assert!(AiModerator::is_early_access_query("can i get ea"));
+        assert!(AiModerator::is_early_access_query("can i have ea?"));
+        assert!(AiModerator::is_early_access_query("how to obtain ea"));
+        assert!(AiModerator::is_early_access_query("how do i obtain ea"));
+        assert!(AiModerator::is_early_access_query("how to get early access"));
+        assert!(AiModerator::is_early_access_query("how do i get early access?"));
+        assert!(AiModerator::is_early_access_query("how can i get early access"));
+        assert!(AiModerator::is_early_access_query("get early access"));
+        assert!(AiModerator::is_early_access_query("obtain early access"));
+        assert!(AiModerator::is_early_access_query("how to get into ea"));
+        assert!(AiModerator::is_early_access_query("how to join early access"));
+        assert!(AiModerator::is_early_access_query("how to become a tester"));
+        assert!(AiModerator::is_early_access_query("how to get tester"));
+        assert!(AiModerator::is_early_access_query("how to get tester role"));
+        assert!(AiModerator::is_early_access_query("is there a way to get ea?"));
+        assert!(AiModerator::is_early_access_query("yo anyone know how to get ea"));
+        assert!(AiModerator::is_early_access_query("i want ea"));
+        assert!(AiModerator::is_early_access_query("give me ea please"));
+
+        // Russian queries
+        assert!(AiModerator::is_early_access_query("как получить ea"));
+        assert!(AiModerator::is_early_access_query("как получить еа?"));
+        assert!(AiModerator::is_early_access_query("как получить early access"));
+        assert!(AiModerator::is_early_access_query("где взять ea"));
+        assert!(AiModerator::is_early_access_query("как попасть в ea"));
+        assert!(AiModerator::is_early_access_query("как стать тестером"));
+        assert!(AiModerator::is_early_access_query("получить ea"));
+        assert!(AiModerator::is_early_access_query("можно получить ea?"));
+
+        // Negative cases (must NOT trigger)
+        assert!(!AiModerator::is_early_access_query("i have ea"));
+        assert!(!AiModerator::is_early_access_query("ea is so cool"));
+        assert!(!AiModerator::is_early_access_query("ea sports it's in the game"));
+        assert!(!AiModerator::is_early_access_query("we beat the boss easily")); // "ea" in "beat", "easily"
+        assert!(!AiModerator::is_early_access_query("clean your room"));
+        assert!(!AiModerator::is_early_access_query("what did you eat?"));
+        assert!(!AiModerator::is_early_access_query("how to reach level 10")); // "ea" in "reach"
+        assert!(!AiModerator::is_early_access_query("how to deal with this boss")); // "ea" in "deal"
+        assert!(!AiModerator::is_early_access_query("how to speak clear")); // "ea" in "speak"
+        assert!(!AiModerator::is_early_access_query("hello everyone"));
     }
 
     #[tokio::test]
