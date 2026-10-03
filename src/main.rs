@@ -76,8 +76,10 @@ pub fn is_creator(user_id: UserId) -> bool {
     user_id.get() == SASAGEYO_ID || user_id.get() == 314781447037747200
 }
 
-// Role threshold IDs (only members below these roles are affected)
-pub const EA_ROLE_THRESHOLD: u64 = 1008406101022228490;
+// Roles permitted to trigger Early Access FAQ (only members with these roles, limit 3 times per week)
+pub const EA_ALLOWED_ROLES: [u64; 2] = [1278403962181255273, 1133172641960833235];
+pub const EA_WEEKLY_LIMIT: usize = 3;
+pub const ONE_WEEK_SECS: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
 
 // Environment variable or .env file (NEVER hardcode tokens in git!)
 fn get_token() -> String {
@@ -719,6 +721,7 @@ fn is_administrator(
     false
 }
 
+#[allow(dead_code)]
 fn is_member_below_role(
     ctx: &Context,
     guild_id: GuildId,
@@ -772,9 +775,59 @@ fn is_member_below_role(
     !member_roles.contains(&target_role_id)
 }
 
+// Checks if member's highest assigned role in the guild hierarchy is one of allowed_roles
+fn is_highest_role_one_of(
+    ctx: &Context,
+    guild_id: GuildId,
+    member_roles: &[RoleId],
+    allowed_roles: &[u64],
+) -> bool {
+    if let Some(guild) = ctx.cache.guild(guild_id) {
+        let highest_role = member_roles
+            .iter()
+            .filter_map(|r| guild.roles.get(r))
+            .max_by_key(|r| r.position);
+
+        if let Some(highest) = highest_role {
+            return allowed_roles.contains(&highest.id.get());
+        } else {
+            return false;
+        }
+    }
+
+    // Fallback if guild not cached: check if member directly has any of the allowed roles
+    member_roles.iter().any(|r| allowed_roles.contains(&r.get()))
+}
+
 // =============================================================================
 // DISCORD EVENT HANDLER
 // =============================================================================
+
+// Helper functions for persistent weekly EA FAQ usage tracking
+fn load_ea_weekly_usage() -> HashMap<u64, Vec<u64>> {
+    let path = std::path::Path::new("ea_weekly_usage.json");
+    if let Ok(file) = std::fs::File::open(path) {
+        if let Ok(mut data) = serde_json::from_reader::<_, HashMap<u64, Vec<u64>>>(file) {
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cutoff = now_unix.saturating_sub(ONE_WEEK_SECS);
+            for history in data.values_mut() {
+                history.retain(|&t| t > cutoff);
+            }
+            return data;
+        }
+    }
+    HashMap::new()
+}
+
+fn save_ea_weekly_usage(usage: &HashMap<u64, Vec<u64>>) {
+    let path = std::path::Path::new("ea_weekly_usage.json");
+    if let Ok(json) = serde_json::to_string(usage) {
+        let _ = std::fs::write(path, json);
+    }
+}
 
 struct Handler {
     http_client: reqwest::Client,
@@ -782,6 +835,7 @@ struct Handler {
     config: Arc<ConfigStore>,
     warn_cooldowns: Arc<RwLock<HashMap<u64, Instant>>>,
     ea_cooldowns: Arc<RwLock<HashMap<u64, Instant>>>,
+    ea_weekly_usage: Arc<RwLock<HashMap<u64, Vec<u64>>>>,
 }
 
 #[async_trait]
@@ -809,6 +863,106 @@ impl EventHandler for Handler {
             Vec::new()
         };
 
+        // ── 0.0 EARLY ACCESS FAQ AUTO-REPLY ──
+        if let Some(guild_id) = msg.guild_id {
+            if AiModerator::is_early_access_query(&msg.content) {
+                // Must have role 1278403962181255273 or 1133172641960833235 as their HIGHEST role (or be creator for testing)
+                let is_eligible = is_creator(msg.author.id)
+                    || is_highest_role_one_of(&ctx, guild_id, &member_roles, &EA_ALLOWED_ROLES);
+
+                if !is_eligible {
+                    println!("   🛡️ [EARLY ACCESS FAQ] User {} does not have allowed EA role as highest role -> Skipping.", msg.author.name);
+                    return;
+                }
+
+                let channel_id = msg.channel_id.get();
+                let user_id = msg.author.id.get();
+                let now_unix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Weekly limit check (max 3 times in 7 days per user)
+                let weekly_ok = {
+                    let mut usage = self.ea_weekly_usage.write().unwrap();
+                    let history = usage.entry(user_id).or_default();
+                    let cutoff = now_unix.saturating_sub(ONE_WEEK_SECS);
+                    history.retain(|&t| t > cutoff);
+                    if is_creator(msg.author.id) {
+                        true
+                    } else {
+                        history.len() < EA_WEEKLY_LIMIT
+                    }
+                };
+
+                if !weekly_ok {
+                    println!(
+                        "   ⏳ [EARLY ACCESS FAQ] User {} ({}) reached weekly limit ({}/{} this week) -> Skipping.",
+                        msg.author.name, msg.author.id, EA_WEEKLY_LIMIT, EA_WEEKLY_LIMIT
+                    );
+                    return;
+                }
+
+                let should_send = {
+                    let mut cooldowns = self.ea_cooldowns.write().unwrap();
+                    let now = Instant::now();
+                    let cd_duration = if is_creator(msg.author.id) {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_secs(180)
+                    };
+
+                    let channel_last = cooldowns.get(&channel_id).copied();
+                    let user_last = cooldowns.get(&user_id).copied();
+
+                    // 3-minute global cooldown (180s) across the entire channel + per-user to prevent spam
+                    let is_channel_on_cd = channel_last.map(|t| now.duration_since(t) < Duration::from_secs(180)).unwrap_or(false);
+                    let is_user_on_cd = user_last.map(|t| now.duration_since(t) < cd_duration).unwrap_or(false);
+
+                    if !is_channel_on_cd && !is_user_on_cd {
+                        cooldowns.insert(channel_id, now);
+                        cooldowns.insert(user_id, now);
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if should_send {
+                    // Record successful trigger towards weekly limit
+                    {
+                        let mut usage = self.ea_weekly_usage.write().unwrap();
+                        let history = usage.entry(user_id).or_default();
+                        history.push(now_unix);
+                        save_ea_weekly_usage(&usage);
+                    }
+
+                    println!(
+                        "\n🎮 [EARLY ACCESS FAQ] Triggered by {} ({}) in channel {}",
+                        msg.author.name, msg.author.id, msg.channel_id
+                    );
+                    let ea_response = "**__How to obtain EA (Early Access), as of right now:__**\n\n• **Win an event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**\n• **Apply for Content Creator** in <#1389403842843508796>\n  └ *Requirements: YouTube (5k subs / 2.5k avg views) • TikTok (5k followers / 10k avg views) • Streamer (15 avg viewers)*\n• **DM Decay to make an offer**\n  └ *Official purchasing is not available; you can only DM a private offer (2 years ago the price was $35, so expect it to be significantly higher now)*\n\nℹ️ *EA testing runs from October 4th – 11th (October 3rd – 10th depending on your timezone). During Early Access, you will be able to encounter many popular content creators!*";
+                    let sent_result = match msg.reply(&ctx.http, ea_response).await {
+                        Ok(m) => Ok(m),
+                        Err(_) => msg.channel_id.say(&ctx.http, ea_response).await,
+                    };
+
+                    if let Ok(bot_msg) = sent_result {
+                        let http = ctx.http.clone();
+                        let channel_id = msg.channel_id;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(22)).await;
+                            let _ = channel_id.delete_message(&http, bot_msg.id).await;
+                        });
+                    }
+                    return;
+                } else {
+                    println!("   ⏳ [EARLY ACCESS FAQ] Cooldown active -> Skipping duplicate reply.");
+                    return;
+                }
+            }
+        }
+
         let is_admin = is_creator(msg.author.id) || if let Some(gid) = msg.guild_id {
             is_administrator(&ctx, gid, &member_roles, msg.author.id)
         } else {
@@ -818,67 +972,6 @@ impl EventHandler for Handler {
         // Guaranteed immunity — server creator (Sasageyo) & admins
         if is_admin {
             return;
-        }
-
-        // ── 0.0 EARLY ACCESS FAQ AUTO-REPLY ──
-        if let Some(guild_id) = msg.guild_id {
-            if AiModerator::is_early_access_query(&msg.content) {
-                if is_member_below_role(&ctx, guild_id, &member_roles, msg.author.id, EA_ROLE_THRESHOLD) {
-                    let channel_id = msg.channel_id.get();
-                    let user_id = msg.author.id.get();
-                    let should_send = {
-                        let mut cooldowns = self.ea_cooldowns.write().unwrap();
-                        let now = Instant::now();
-                        let cd_duration = if is_creator(msg.author.id) {
-                            Duration::from_secs(5)
-                        } else {
-                            Duration::from_secs(180)
-                        };
-
-                        let channel_last = cooldowns.get(&channel_id).copied();
-                        let user_last = cooldowns.get(&user_id).copied();
-
-                        // 3-minute global cooldown (180s) across the entire channel + per-user to prevent spam
-                        let is_channel_on_cd = channel_last.map(|t| now.duration_since(t) < Duration::from_secs(180)).unwrap_or(false);
-                        let is_user_on_cd = user_last.map(|t| now.duration_since(t) < cd_duration).unwrap_or(false);
-
-                        if !is_channel_on_cd && !is_user_on_cd {
-                            cooldowns.insert(channel_id, now);
-                            cooldowns.insert(user_id, now);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-
-                    if should_send {
-                        println!(
-                            "\n🎮 [EARLY ACCESS FAQ] Triggered by {} ({}) in channel {}",
-                            msg.author.name, msg.author.id, msg.channel_id
-                        );
-                        let ea_response = "**__How to obtain EA (Early Access), as of right now:__**\n\n• **Win an event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**\n• **Apply for Content Creator** in <#1389403842843508796>\n  └ *Requirements: YouTube (5k subs / 2.5k avg views) • TikTok (5k followers / 10k avg views) • Streamer (15 avg viewers)*\n• **DM Decay to make an offer**\n  └ *Official purchasing is not available; you can only DM a private offer (2 years ago the price was $35, so expect it to be significantly higher now)*\n\nℹ️ *EA testing runs from October 4th – 11th (October 3rd – 10th depending on your timezone). During Early Access, you will be able to encounter many popular content creators!*";
-                        let sent_result = match msg.reply(&ctx.http, ea_response).await {
-                            Ok(m) => Ok(m),
-                            Err(_) => msg.channel_id.say(&ctx.http, ea_response).await,
-                        };
-
-                        if let Ok(bot_msg) = sent_result {
-                            let http = ctx.http.clone();
-                            let channel_id = msg.channel_id;
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(22)).await;
-                                let _ = channel_id.delete_message(&http, bot_msg.id).await;
-                            });
-                        }
-                        return;
-                    } else {
-                        println!("   ⏳ [EARLY ACCESS FAQ] Cooldown active -> Skipping duplicate reply.");
-                        return;
-                    }
-                } else {
-                    println!("   🛡️ [EARLY ACCESS FAQ] User {} has EA role ({}) or higher -> Skipping.", msg.author.name, EA_ROLE_THRESHOLD);
-                }
-            }
         }
 
         // ── 0. AI TEXT MODERATION (Runs before / in parallel to image scan) ──
@@ -1703,6 +1796,7 @@ async fn main() {
         config,
         warn_cooldowns: Arc::new(RwLock::new(HashMap::new())),
         ea_cooldowns: Arc::new(RwLock::new(HashMap::new())),
+        ea_weekly_usage: Arc::new(RwLock::new(load_ea_weekly_usage())),
     };
 
     // Discord Gateway intents
@@ -1733,6 +1827,55 @@ mod tests {
         assert!(is_creator(UserId::new(SASAGEYO_ID)));
         assert!(is_creator(UserId::new(314781447037747200)));
         assert!(!is_creator(UserId::new(123456789012345678)));
+    }
+
+    #[test]
+    fn test_ea_allowed_roles() {
+        assert!(EA_ALLOWED_ROLES.contains(&1278403962181255273));
+        assert!(EA_ALLOWED_ROLES.contains(&1133172641960833235));
+        assert!(!EA_ALLOWED_ROLES.contains(&999999999999999999));
+    }
+
+    #[test]
+    fn test_weekly_limit_filtering() {
+        let now: u64 = 1_000_000_000;
+        let cutoff = now.saturating_sub(ONE_WEEK_SECS);
+        let mut history = vec![
+            now - ONE_WEEK_SECS - 100, // expired (> 7 days ago)
+            now - 3600,                // 1 hour ago
+            now - 1800,                // 30 min ago
+        ];
+        history.retain(|&t| t > cutoff);
+        assert_eq!(history.len(), 2);
+        assert!(history.len() < EA_WEEKLY_LIMIT);
+
+        history.push(now);
+        assert_eq!(history.len(), 3);
+        assert!(!(history.len() < EA_WEEKLY_LIMIT)); // Limit reached (3/3)
+    }
+
+    #[test]
+    fn test_highest_role_selection() {
+        #[derive(Clone)]
+        struct MockRole {
+            id: u64,
+            pos: i16,
+        }
+        let roles = vec![
+            MockRole { id: 111, pos: 2 },
+            MockRole { id: 1278403962181255273, pos: 5 },
+            MockRole { id: 222, pos: 1 },
+        ];
+        let highest = roles.iter().max_by_key(|r| r.pos).unwrap();
+        assert_eq!(highest.id, 1278403962181255273);
+        assert!(EA_ALLOWED_ROLES.contains(&highest.id));
+
+        // If member also has a higher role (e.g. pos: 10)
+        let mut roles_with_higher = roles.clone();
+        roles_with_higher.push(MockRole { id: 999, pos: 10 });
+        let highest2 = roles_with_higher.iter().max_by_key(|r| r.pos).unwrap();
+        assert_eq!(highest2.id, 999);
+        assert!(!EA_ALLOWED_ROLES.contains(&highest2.id));
     }
 }
 
