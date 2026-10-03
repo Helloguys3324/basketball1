@@ -891,8 +891,18 @@ impl EventHandler for Handler {
                             msg.author.name, msg.author.id, msg.channel_id
                         );
                         let ea_response = "**__How to obtain EA (Early Access), as of right now.__**\n\n• **Win a event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**";
-                        if let Err(_) = msg.reply(&ctx.http, ea_response).await {
-                            let _ = msg.channel_id.say(&ctx.http, ea_response).await;
+                        let sent_result = match msg.reply(&ctx.http, ea_response).await {
+                            Ok(m) => Ok(m),
+                            Err(_) => msg.channel_id.say(&ctx.http, ea_response).await,
+                        };
+
+                        if let Ok(bot_msg) = sent_result {
+                            let http = ctx.http.clone();
+                            let channel_id = msg.channel_id;
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                let _ = channel_id.delete_message(&http, bot_msg.id).await;
+                            });
                         }
                         return;
                     } else {
