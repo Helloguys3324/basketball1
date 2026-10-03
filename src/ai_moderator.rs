@@ -1527,7 +1527,7 @@ impl AiModerator {
                 // English desires & requests & pleas
                 r"w+a+n+t+[a-z]*|w+a+n+n+a+|n+e+e+d+[a-z]*|g+i+v+e+[a-z]*|g+i+m+m+e+|p+l+e+a*s+e*|p+l+[sz]+|",
                 // English acquisition verbs
-                r"g+e+t+[a-z]*|o+b+t+a+i+n+[a-z]*|a+c+q+u+i+r+e+[a-z]*|j+o+i+n+[a-z]*|e+n+t+e+r+[a-z]*|u+n+l+o+c+k+[a-z]*|b+e+c+o+m+e+|b+e+c+o+m+i+n+g+|",
+                r"g+e+t+[a-z]*|o+b+t+a+i+n+[a-z]*|a+c+q+u+i+r+e+[a-z]*|j+o+i+n+[a-z]*|e+n+t+e+r+[a-z]*|u+n+l+o+c+k+[a-z]*|b+e+c+o+m+e+|b+e+c+o+m+i+n+g+|b+u+y+[a-z]*|p+u+r+c+h+a+s+e+[a-z]*|",
                 // English credentials/keys
                 r"k+e+y+s*|p+a+s+s+[a-z]*|c+o+d+e+s*|d+r+o+p+s*|i+n+v+i+t+e+[a-z]*|r+o+l+e+s*|",
                 // Russian question words
@@ -1538,7 +1538,7 @@ impl AiModerator {
                 r"х+о+ч+[уа-я]*|н+у+ж+[а-я]*|н+а+д+о+|",
                 r"д+а+й+|д+а+й+т+[еe]+|с+к+и+н+ь+[а-я]*|п+о+д+е+л+и+с+ь+|п+о+ж+а+л+у+й+с+т+а+|п+ж+[а-я]*|п+ж+л+с+т+|",
                 // Russian acquisition verbs
-                r"п+о+л+у+ч+[а-я]*|д+о+с+т+а+[а-я]*|в+з+я+т+ь+|п+о+п+а+с+т+ь+|з+а+й+т+и+|с+т+а+т+ь+|о+т+к+р+ы+т+ь+|",
+                r"п+о+л+у+ч+[а-я]*|д+о+с+т+а+[а-я]*|в+з+я+т+ь+|п+о+п+а+с+т+ь+|з+а+й+т+и+|с+т+а+т+ь+|о+т+к+р+ы+т+ь+|к+у+п+[илюа-я]*|",
                 // Russian credentials/keys
                 r"к+л+ю+ч+[а-я]*|к+о+д+[а-я]*|р+о+л+[а-я]*|п+р+о+п+у+с+к+[а-я]*|и+н+в+а+й+т+[а-я]*|т+е+с+т+е+р+к+[а-я]*",
                 r")\b"
@@ -5072,6 +5072,9 @@ mod tests {
         assert!(AiModerator::is_early_access_query("how to get e.a"));
         assert!(AiModerator::is_early_access_query("can i get e-a"));
         assert!(AiModerator::is_early_access_query("plzzz ea"));
+        assert!(AiModerator::is_early_access_query("can i buy ea"));
+        assert!(AiModerator::is_early_access_query("buy early access"));
+        assert!(AiModerator::is_early_access_query("купить ea"));
 
         // Negative cases (must NOT trigger)
         assert!(!AiModerator::is_early_access_query("i have ea"));

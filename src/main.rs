@@ -890,7 +890,7 @@ impl EventHandler for Handler {
                             "\n🎮 [EARLY ACCESS FAQ] Triggered by {} ({}) in channel {}",
                             msg.author.name, msg.author.id, msg.channel_id
                         );
-                        let ea_response = "**__How to obtain EA (Early Access), as of right now.__**\n\n• **Win a event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**";
+                        let ea_response = "**__How to obtain EA (Early Access), as of right now.__**\n\n• **Win a event**\n• **Win a giveaway**\n• **Get handpicked by Decay for activity**\n• **You can also try to buy it for 200$**";
                         let sent_result = match msg.reply(&ctx.http, ea_response).await {
                             Ok(m) => Ok(m),
                             Err(_) => msg.channel_id.say(&ctx.http, ea_response).await,
